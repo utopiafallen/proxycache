@@ -31,12 +31,13 @@ No tests, no linter, no typechecker configured.
 
 ## Key env vars
 
-`LLAMA_URL` / `N_SLOTS` / `PORT` / `BACKENDS` (JSON) / `META_DIR` / `BIG_THRESHOLD_WORDS` / `WORDS_PER_BLOCK` / `LCP_TH` / `CACHE_DIR` / `CACHE_MAX_AGE_HOURS` / `CACHE_MAX_SIZE_GB` / `CACHE_CLEANUP_INTERVAL_MINUTES` / `REQUEST_TIMEOUT` / `MODEL_ID` / `LOG_LEVEL`
+`LLAMA_URL` / `N_SLOTS` / `PORT` / `BACKENDS` (JSON) / `META_DIR` / `BIG_THRESHOLD_WORDS` / `WORDS_PER_BLOCK` / `LCP_TH` / `CACHE_DIR` / `CACHE_MAX_AGE_HOURS` / `CACHE_MAX_SIZE_GB` / `CACHE_CLEANUP_INTERVAL_MINUTES` / `REQUEST_TIMEOUT` / `MODEL_ID` / `LOG_LEVEL` / `BACKEND_MODE`
 
 See `config.py` for defaults.
 
 ## Conventions & quirks
 
+- **Backend Requirement**: `llama.cpp` MUST be started with `--slot-save-path <dir>` for cache save/restore to function.
 - **Cache key**: `sha256(model_id + "\n" + raw_prefix)` where `raw_prefix` concatenates message content (no roles) with double newlines
 - **LCP blocks**: text split into N-word blocks (default 100), each SHA256-hashed; matching is longest-common-prefix of block hash sequences
 - **Small requests** (below `BIG_THRESHOLD_WORDS`, default 500) skip cache save/restore entirely, routed to any free/oldest slot
