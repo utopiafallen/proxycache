@@ -16,6 +16,7 @@ import logging
 from typing import List, Tuple, Dict, Optional
 
 from config import BACKENDS
+import hashing as hs
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class SlotManager:
     ) -> Tuple[GSlot, asyncio.Lock, Optional[bool]]:
         g, lock = self._get_free_or_oldest()
         await lock.acquire()
+        self._last_used[g] = time.time()
         restored: Optional[bool] = None
         if restore_key:
             client = self.backends[g[0]]["client"]
@@ -82,6 +84,8 @@ class SlotManager:
                 (restore_key[:16] if restore_key else None),
                 restored,
             )
+            if restored:
+                hs.update_last_read(restore_key)
         return g, lock, restored
 
     async def save_after(self, g: GSlot, key: str, model_id: Optional[str] = None) -> bool:
@@ -92,3 +96,4 @@ class SlotManager:
     def release(self, g: GSlot):
         if self._locks[g].locked():
             self._locks[g].release()
+            self._last_used[g] = 0.0

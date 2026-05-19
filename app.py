@@ -65,6 +65,12 @@ async def startup():
     app.state.clients = clients
     app.state.sm = sm
     log.info("app_start n_backends=%d port=%d", len(BACKENDS), PORT)
+    
+    # Reconcile meta files on startup (remove corrupted/orphaned entries)
+    reconciled = hs.reconcile_meta(META_DIR, CACHE_DIR)
+    if reconciled > 0:
+        log.info("Cleaned up %d orphaned/corrupted meta files at startup", reconciled)
+    
     if CACHE_DIR:
         asyncio.create_task(periodic_cleanup())
 

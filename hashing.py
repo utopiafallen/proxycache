@@ -129,6 +129,11 @@ def find_best_restore_candidate(
     return (best_key, best_ratio) if best_key else None
 
 
+def human_readable_time(timestamp: float) -> str:
+    """Converts a Unix timestamp to a human-readable format."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
 def write_meta(
     key: str,
     prefix_text: str,
@@ -145,11 +150,77 @@ def write_meta(
         "prefix_len": len(prefix_text),
         "wpb": wpb,
         "blocks": blocks,
-        "timestamp": time.time(),
+        "last_written": time.time(),
     }
     path = os.path.join(META_DIR, f"{key}.meta.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
+    log.info("Saved cache for key %s (model: %s, %d blocks)", key[:16], model_id, len(blocks))
+
+
+def update_last_read(key: str) -> bool:
+    """
+    Updates the last_read timestamp in the meta file for a given key.
+    Returns True on success, False if the file is missing or corrupted.
+    """
+    path = os.path.join(META_DIR, f"{key}.meta.json")
+    try:
+        with open(path, "r+", encoding="utf-8") as f:
+            try:
+                meta = json.load(f)
+            except json.JSONDecodeError as e:
+                log.warning("update_last_read failed: corrupted meta file %s: %s", key[:16], e)
+                return False
+            meta["last_read"] = time.time()
+            f.seek(0)
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+            f.truncate()
+        log.info("Updated last read time for cache key %s", key[:16])
+        return True
+    except FileNotFoundError:
+        log.warning("update_last_read failed: meta file not found for key %s", key[:16])
+        return False
+    except Exception as e:
+        log.warning("update_last_read failed for key %s: %s", key[:16], e)
+        return False
+
+
+def reconcile_meta(meta_dir: str, cache_dir: str) -> int:
+    """
+    Scans all meta files and removes corrupted ones or orphans (meta files with no matching cache).
+    Returns the count of files deleted.
+    """
+    deleted = 0
+    meta_files = sorted(glob.glob(os.path.join(meta_dir, "*.meta.json")))
+
+    for meta_path in meta_files:
+        basename = os.path.splitext(os.path.basename(meta_path))[0]
+
+        # Check for corrupted meta files
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                json.load(f)
+        except (json.JSONDecodeError, Exception) as e:
+            log.warning("Removed corrupted meta file: %s.json", basename[:16])
+            try:
+                os.remove(meta_path)
+                deleted += 1
+            except OSError:
+                pass
+            continue
+
+        # Check for orphaned meta files (no matching cache on disk)
+        if cache_dir and os.path.isdir(cache_dir):
+            cache_path = os.path.join(cache_dir, basename)
+            if not os.path.exists(cache_path):
+                log.info("Removed orphan meta file (no matching cache): %s.json", basename[:16])
+                try:
+                    os.remove(meta_path)
+                    deleted += 1
+                except OSError:
+                    pass
+
+    return deleted
 
 
 def touch_meta(key: str) -> None:
@@ -174,47 +245,83 @@ def touch_meta(key: str) -> None:
     except Exception as e:
         log.warning("touch_meta_fail key=%s: %s", key[:16], e)
 
+def _get_last_used_time(basename: str, meta_dir: str, cache_dir: str) -> float:
+    """
+    Determines the last-used timestamp for a cache file.
+    Priority: last_read -> last_written -> timestamp -> mtime (filesystem fallback).
+    """
+    meta_path = os.path.join(meta_dir, f"{basename}.meta.json")
+    
+    # Try to load from meta file
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            
+            # Priority order for last-used timestamp
+            for field in ("last_read", "last_written", "timestamp"):
+                if field in meta:
+                    return meta[field]
+        except (json.JSONDecodeError, Exception):
+            pass  # Corrupted meta, fall through to mtime
+    
+    # Fallback to filesystem mtime
+    if cache_dir:
+        cache_path = os.path.join(cache_dir, basename)
+        if os.path.exists(cache_path):
+            return os.path.getmtime(cache_path)
+    
+    return time.time()  # Ultimate fallback
+
+
 def cleanup_old_cache(
     cache_dir: str,
     meta_dir: str,
     max_age_hours: int = 168,
-    max_size_gb: float = 50.0,
+    max_size_gb: float = 25.0,
 ) -> Dict[str, int]:
     """
     Cleanup old cache files based on age and total size.
+    Uses last_read/last_written timestamps from meta files for LRU ordering.
     Returns stats: {"deleted_by_age": N, "deleted_by_size": N, "total_freed_bytes": N}
     """
-    import time
-    
     stats = {"deleted_by_age": 0, "deleted_by_size": 0, "total_freed_bytes": 0}
     
     if not cache_dir or not os.path.isdir(cache_dir):
-        log.warning("cleanup_skip: cache_dir not set or doesn't exist: %s", cache_dir)
+        log.warning("Cache cleanup skipped: no cache directory configured")
         return stats
+    
+    # First pass: reconcile meta files (remove corrupted/orphaned)
+    reconciled = reconcile_meta(meta_dir, cache_dir)
+    if reconciled > 0:
+        log.info("Reconciled meta files: removed %d orphaned/corrupted entries", reconciled)
     
     now = time.time()
     max_age_seconds = max_age_hours * 3600 if max_age_hours > 0 else float('inf')
     max_size_bytes = max_size_gb * 1024 * 1024 * 1024
     
-    # Get all cache files with their stats
+    # Get all cache files with their last-used timestamps
     cache_files = []
     for f in os.listdir(cache_dir):
         filepath = os.path.join(cache_dir, f)
         if os.path.isfile(filepath):
             try:
                 stat = os.stat(filepath)
+                last_used = _get_last_used_time(f, meta_dir, cache_dir)
                 cache_files.append({
                     "path": filepath,
                     "basename": f,
                     "size": stat.st_size,
                     "mtime": stat.st_mtime,
+                    "last_used": last_used,
                 })
             except OSError:
                 continue
     
-    # Delete by age
+    # Delete by age (using last_used timestamp)
     for cf in cache_files[:]:
-        if now - cf["mtime"] > max_age_seconds:
+        age_hours = (now - cf["last_used"]) / 3600
+        if now - cf["last_used"] > max_age_seconds:
             try:
                 os.remove(cf["path"])
                 stats["deleted_by_age"] += 1
@@ -224,18 +331,17 @@ def cleanup_old_cache(
                 meta_path = os.path.join(meta_dir, f"{cf['basename']}.meta.json")
                 if os.path.exists(meta_path):
                     os.remove(meta_path)
-                log.info("cleanup_age: deleted %s (age: %.1f hours)", 
-                        cf["basename"][:16], (now - cf["mtime"]) / 3600)
+                log.info("Deleted cache %s (age: %.1f hours, last used: %s)", 
+                        cf["basename"][:16], age_hours, human_readable_time(cf["last_used"]))
             except OSError as e:
-                log.warning("cleanup_age_fail: %s: %s", cf["basename"][:16], e)
+                log.warning("Failed to delete cache %s by age: %s", cf["basename"][:16], e)
     
     # Calculate current total size
     total_size = sum(cf["size"] for cf in cache_files)
     
-    # Delete by size (oldest first) until under limit
+    # Delete by size (oldest last_used first) until under limit
     if total_size > max_size_bytes:
-        # Sort by mtime (oldest first)
-        cache_files.sort(key=lambda x: x["mtime"])
+        cache_files.sort(key=lambda x: x["last_used"])
         
         for cf in cache_files:
             if total_size <= max_size_bytes:
@@ -249,12 +355,12 @@ def cleanup_old_cache(
                 meta_path = os.path.join(meta_dir, f"{cf['basename']}.meta.json")
                 if os.path.exists(meta_path):
                     os.remove(meta_path)
-                log.info("cleanup_size: deleted %s (freed: %.1f MB)", 
-                        cf["basename"][:16], cf["size"] / 1024 / 1024)
+                log.info("Deleted cache %s (freed: %.1f MB, last used: %s)", 
+                        cf["basename"][:16], cf["size"] / 1024 / 1024, human_readable_time(cf["last_used"]))
             except OSError as e:
-                log.warning("cleanup_size_fail: %s: %s", cf["basename"][:16], e)
+                log.warning("Failed to delete cache %s by size: %s", cf["basename"][:16], e)
     
-    log.info("cleanup_done: deleted_by_age=%d deleted_by_size=%d freed=%.1f MB",
+    log.info("Cleanup complete: %d by age, %d by size, freed %.1f MB total",
              stats["deleted_by_age"], stats["deleted_by_size"], 
              stats["total_freed_bytes"] / 1024 / 1024)
     
