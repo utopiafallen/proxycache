@@ -194,14 +194,18 @@ def reconcile_meta(meta_dir: str, cache_dir: str) -> int:
     meta_files = sorted(glob.glob(os.path.join(meta_dir, "*.meta.json")))
 
     for meta_path in meta_files:
-        basename = os.path.splitext(os.path.basename(meta_path))[0]
+        basename = os.path.basename(meta_path);
+        #log.info("Checking meta file: %s", basename)
+        
+        cachename = basename.removesuffix(".meta.json")
+        #log.info("Cache filename: %s", cachename)
 
         # Check for corrupted meta files
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 json.load(f)
         except (json.JSONDecodeError, Exception) as e:
-            log.warning("Removed corrupted meta file: %s.json", basename[:16])
+            log.warning("Removed corrupted meta file: %s", basename)
             try:
                 os.remove(meta_path)
                 deleted += 1
@@ -211,15 +215,16 @@ def reconcile_meta(meta_dir: str, cache_dir: str) -> int:
 
         # Check for orphaned meta files (no matching cache on disk)
         if cache_dir and os.path.isdir(cache_dir):
-            cache_path = os.path.join(cache_dir, basename)
+            cache_path = os.path.join(cache_dir, cachename)
+            #log.info("Looking for cache file: %s", cache_path)
             if not os.path.exists(cache_path):
-                log.info("Removed orphan meta file (no matching cache): %s.json", basename[:16])
+                log.info("Removed orphan meta file (no matching cache): %s", basename)
                 try:
                     os.remove(meta_path)
                     deleted += 1
                 except OSError:
                     pass
-
+    log.info("Finished reconciling meta state with llama cache dir state")
     return deleted
 
 
