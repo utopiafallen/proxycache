@@ -99,6 +99,7 @@ async def start_stream_task(
     prefix: str,
     blocks: List[str],
     sm: SlotManager,
+    restore_key: Optional[str] = None,
 ) -> AsyncGenerator[bytes, None]:
     queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
 
@@ -129,7 +130,9 @@ async def start_stream_task(
                 pass
             ok = False
             try:
-                ok, _ = await sm.save_after(model_name, backend_id, slot_id, key, model_name)
+                ok, _ = await sm.save_after(
+                    model_name, backend_id, slot_id, key, model_name, blocks,
+                )
             except asyncio.CancelledError:
                 log.warning("save_after_cancelled model=%s be=%d slot=%d",
                             model_name, backend_id, slot_id)
@@ -228,7 +231,11 @@ async def chat(req: Request):
 
     try:
         g, lock, restored = await asyncio.wait_for(
-            sm.acquire_for_request(backend_model_id, restore_key if is_big else None),
+            sm.acquire_for_request(
+                backend_model_id,
+                restore_key if is_big else None,
+                blocks if is_big else None,
+            ),
             timeout=ACQUIRE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -296,6 +303,7 @@ async def chat(req: Request):
                 prefix,
                 blocks,
                 sm,
+                restore_key,
             )
 
             headers = {
@@ -324,7 +332,9 @@ async def chat(req: Request):
             ok = False
             try:
                 if is_big:
-                    ok, _ = await sm.save_after(model_name, be_id, slot_id, key, backend_model_id)
+                    ok, _ = await sm.save_after(
+                        model_name, be_id, slot_id, key, backend_model_id, blocks,
+                    )
                     if ok:
                         hs.write_meta(
                             key,

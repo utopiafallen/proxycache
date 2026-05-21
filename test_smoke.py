@@ -597,6 +597,160 @@ def test_ring_buffer_no_eviction_under_limit():
     print("PASS: test_ring_buffer_no_eviction_under_limit")
 
 
+# ── KV cache skip tests ──────────────────────────────────────────────
+
+def test_should_skip_restore_no_tracked_state():
+    """_should_skip_restore should return False when no state tracked for slot."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm._slot_kv_state.clear()
+
+    g = ("ModelA", 0, 0)
+    blocks = ["a", "b", "c", "d", "e"]
+
+    assert sm._should_skip_restore(g, blocks) is False
+    print("PASS: test_should_skip_restore_no_tracked_state")
+
+
+def test_should_skip_restore_perfect_match():
+    """_should_skip_restore should return True for perfect block match."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    g = ("ModelA", 0, 0)
+    kv_blocks = ["a", "b", "c", "d", "e"]
+    sm._slot_kv_state[g] = kv_blocks
+
+    req_blocks = ["a", "b", "c", "d", "e"]
+    assert sm._should_skip_restore(g, req_blocks) is True
+    print("PASS: test_should_skip_restore_perfect_match")
+
+
+def test_should_skip_restore_high_overlap():
+    """_should_skip_restore should return True when overlap >= 0.9."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    g = ("ModelA", 0, 0)
+    kv_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+    sm._slot_kv_state[g] = kv_blocks
+
+    # 9 out of 10 blocks match LCP → ratio = 9/10 = 0.9
+    req_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "x"]
+    assert sm._should_skip_restore(g, req_blocks) is True
+    print("PASS: test_should_skip_restore_high_overlap")
+
+
+def test_should_skip_restore_low_overlap():
+    """_should_skip_restore should return False when overlap < 0.9."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    g = ("ModelA", 0, 0)
+    kv_blocks = ["a", "b", "c", "d", "e"]
+    sm._slot_kv_state[g] = kv_blocks
+
+    # Only 4 out of 5 blocks match LCP → ratio = 4/5 = 0.8
+    req_blocks = ["a", "b", "c", "d", "x"]
+    assert sm._should_skip_restore(g, req_blocks) is False
+    print("PASS: test_should_skip_restore_low_overlap")
+
+
+def test_should_skip_restore_zero_lcp():
+    """_should_skip_restore should return False when no LCP overlap."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    g = ("ModelA", 0, 0)
+    kv_blocks = ["a", "b", "c"]
+    sm._slot_kv_state[g] = kv_blocks
+
+    req_blocks = ["x", "y", "z"]
+    assert sm._should_skip_restore(g, req_blocks) is False
+    print("PASS: test_should_skip_restore_zero_lcp")
+
+
+def test_should_skip_restore_shorter_kv_cache():
+    """_should_skip_restore should handle shorter KV cache than request."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    g = ("ModelA", 0, 0)
+    kv_blocks = ["a", "b", "c"]
+    sm._slot_kv_state[g] = kv_blocks
+
+    # KV cache has 3 blocks, request has 10. LCP = 3. ratio = 3/3 = 1.0
+    req_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+    assert sm._should_skip_restore(g, req_blocks) is True
+    print("PASS: test_should_skip_restore_shorter_kv_cache")
+
+
+def test_should_skip_restore_longer_kv_cache():
+    """_should_skip_restore should handle longer KV cache than request."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    g = ("ModelA", 0, 0)
+    kv_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+    sm._slot_kv_state[g] = kv_blocks
+
+    # Request has 3 blocks, KV cache has 10. LCP = 3. ratio = 3/3 = 1.0
+    req_blocks = ["a", "b", "c"]
+    assert sm._should_skip_restore(g, req_blocks) is True
+    print("PASS: test_should_skip_restore_longer_kv_cache")
+
+
+def test_save_after_updates_slot_kv_state():
+    """save_after should update _slot_kv_state when blocks are provided."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+
+    mock_client = AsyncMock()
+    mock_client.save_slot = AsyncMock(return_value=(True, 1024))
+    sm.backends[0]["client"] = mock_client
+
+    blocks = ["blk_a", "blk_b", "blk_c"]
+
+    async def _run():
+        ok, size = await sm.save_after(
+            "ModelA", 0, 0, "test_key", "ModelA", blocks,
+        )
+        return ok
+
+    asyncio.run(_run())
+
+    assert mock_client.save_slot.call_count == 1
+    assert ("ModelA", 0, 0) in sm._slot_kv_state
+    assert sm._slot_kv_state[("ModelA", 0, 0)] == blocks
+    print("PASS: test_save_after_updates_slot_kv_state")
+
+
+def test_save_after_no_blocks_no_state_update():
+    """save_after should not update _slot_kv_state when blocks are None."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+
+    mock_client = AsyncMock()
+    mock_client.save_slot = AsyncMock(return_value=(True, 1024))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        ok, size = await sm.save_after(
+            "ModelA", 0, 0, "test_key", "ModelA", None,
+        )
+        return ok
+
+    asyncio.run(_run())
+
+    assert ("ModelA", 0, 0) not in sm._slot_kv_state
+    print("PASS: test_save_after_no_blocks_no_state_update")
+
+
 if __name__ == "__main__":
     test_reconcile_meta_removes_orphans()
     test_hashing_imports()
@@ -619,4 +773,16 @@ if __name__ == "__main__":
     test_ring_buffer_age_eviction()
     test_ring_buffer_lru_eviction()
     test_ring_buffer_no_eviction_under_limit()
+
+    # KV cache skip tests
+    test_should_skip_restore_no_tracked_state()
+    test_should_skip_restore_perfect_match()
+    test_should_skip_restore_high_overlap()
+    test_should_skip_restore_low_overlap()
+    test_should_skip_restore_zero_lcp()
+    test_should_skip_restore_shorter_kv_cache()
+    test_should_skip_restore_longer_kv_cache()
+    test_save_after_updates_slot_kv_state()
+    test_save_after_no_blocks_no_state_update()
+
     print("\nAll smoke tests passed.")

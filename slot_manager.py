@@ -13,6 +13,7 @@ SlotManager: per-model slot pools with lazy discovery and refresh cooldown.
 """
 
 import os
+import json
 import time
 import asyncio
 import logging
@@ -20,7 +21,7 @@ from collections import deque
 from typing import List, Tuple, Dict, Optional
 
 from config import (BACKENDS, META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS,
-                    CACHE_MAX_SIZE_GB)
+                    CACHE_MAX_SIZE_GB, KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK)
 import hashing as hs
 
 log = logging.getLogger(__name__)
@@ -43,6 +44,9 @@ class SlotManager:
         self._cache_ring: deque = deque()  # (key, size_bytes, last_used_time)
         self._total_bytes: int = 0
         self._max_age_seconds: float = CACHE_MAX_AGE_HOURS * 3600
+
+        # Per-slot KV cache block state — tracks hash blocks currently in each slot
+        self._slot_kv_state: Dict[GSlot, List[str]] = {}
 
         log.info("slot_manager n_backends=%d max_age_hours=%d",
                  len(self.backends), CACHE_MAX_AGE_HOURS)
@@ -261,10 +265,30 @@ class SlotManager:
                 self._register_backend_for_model(model_name, first_be)
                 self._ensure_pool(model_name, first_be, 1)
 
+    def _should_skip_restore(self, g: GSlot, req_blocks: List[str]) -> bool:
+        """Check if the slot's current KV cache already matches the request well enough.
+
+        Returns True if the slot's tracked KV cache blocks overlap >= KV_CACHE_SKIP_THRESHOLD
+        with the request blocks, meaning no restore is needed.
+        """
+        kv_blocks = self._slot_kv_state.get(g)
+        if not kv_blocks:
+            return False
+
+        lcp = hs.lcp_blocks(req_blocks, kv_blocks)
+        denom = max(1, min(len(req_blocks), len(kv_blocks)))
+        ratio = lcp / denom
+        log.debug(
+            "_should_skip_restore model=%s be=%d slot=%d ratio=%.3f",
+            g[0], g[1], g[2], ratio,
+        )
+        return ratio >= KV_CACHE_SKIP_THRESHOLD
+
     async def acquire_for_request(
         self,
         model_name: str,
         restore_key: Optional[str] = None,
+        blocks: Optional[List[str]] = None,
     ) -> Tuple[GSlot, asyncio.Lock, Optional[bool]]:
         # Refresh before selecting (with cooldown)
         await self.refresh_slots(model_name)
@@ -274,9 +298,69 @@ class SlotManager:
         await lock.acquire()
         self._last_used[(model_name_out, backend_id, slot_id)] = time.time()
 
+        g = (model_name_out, backend_id, slot_id)
+
         # Restore if needed
         restored: Optional[bool] = None
-        if restore_key:
+        if blocks:
+            # Skip restore if slot's KV cache already matches well
+            if self._should_skip_restore(g, blocks):
+                log.info(
+                    "skip_restore_slot_cached model=%s be=%d slot=%d",
+                    model_name, backend_id, slot_id,
+                )
+                restored = False
+            elif restore_key:
+                # Restore from pre-computed candidate
+                client = self.backends[backend_id]["client"]
+                restored = await client.restore_slot(slot_id, restore_key, model_name)
+                log.info(
+                    "restore_before_chat model=%s be=%d slot=%d ok=%s",
+                    model_name, backend_id, slot_id, restored,
+                )
+                if restored:
+                    self._touch_ring(restore_key)
+                    # Update tracked KV state with restored candidate blocks
+                    try:
+                        meta_path = os.path.join(META_DIR, f"{restore_key}{hs.META_SUFFIX}")
+                        if os.path.exists(meta_path):
+                            with open(meta_path, "r", encoding="utf-8") as mf:
+                                meta = json.load(mf)
+                            self._slot_kv_state[g] = meta.get("blocks", [])
+                    except Exception as e:
+                        log.warning("restore_meta_load_fail key=%s: %s", restore_key[:16], e)
+            else:
+                # No pre-computed candidate and KV cache doesn't match —
+                # find best meta file to restore from
+                client = self.backends[backend_id]["client"]
+                cand = hs.find_best_restore_candidate(
+                    blocks, WORDS_PER_BLOCK, LCP_TH, model_name,
+                )
+                if cand:
+                    cand_key, cand_ratio = cand
+                    restored = await client.restore_slot(slot_id, cand_key, model_name)
+                    log.info(
+                        "restore_dynamic model=%s be=%d slot=%d key=%s ratio=%.3f ok=%s",
+                        model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
+                    )
+                    if restored:
+                        try:
+                            meta_path = os.path.join(META_DIR, f"{cand_key}{hs.META_SUFFIX}")
+                            if os.path.exists(meta_path):
+                                with open(meta_path, "r", encoding="utf-8") as mf:
+                                    meta = json.load(mf)
+                                self._slot_kv_state[g] = meta.get("blocks", [])
+                        except Exception as e:
+                            log.warning("restore_meta_load_fail key=%s: %s", cand_key[:16], e)
+                else:
+                    log.info(
+                        "restore_dynamic_none model=%s be=%d slot=%d",
+                        model_name, backend_id, slot_id,
+                    )
+                    restored = False
+
+        elif restore_key:
+            # Legacy path: no blocks passed but restore_key provided
             client = self.backends[backend_id]["client"]
             restored = await client.restore_slot(slot_id, restore_key, model_name)
             log.info(
@@ -286,7 +370,7 @@ class SlotManager:
             if restored:
                 self._touch_ring(restore_key)
 
-        return (model_name_out, backend_id, slot_id), lock, restored
+        return g, lock, restored
 
     async def save_after(
         self,
@@ -295,6 +379,7 @@ class SlotManager:
         slot_id: int,
         key: str,
         model_id: Optional[str] = None,
+        blocks: Optional[List[str]] = None,
     ) -> Tuple[bool, int]:
         client = self.backends[backend_id]["client"]
         ok, size = await client.save_slot(slot_id, key, model_id)
@@ -302,6 +387,15 @@ class SlotManager:
         if ok and size > 0:
             self._cache_ring.append((key, size, time.time()))
             self._total_bytes += size
+
+            # Update tracked KV state for this slot
+            if blocks:
+                g = (model_name, backend_id, slot_id)
+                self._slot_kv_state[g] = blocks
+                log.debug(
+                    "update_slot_kv_state model=%s be=%d slot=%d n_blocks=%d",
+                    model_name, backend_id, slot_id, len(blocks),
+                )
 
             # Ring buffer eviction: age-first, then LRU
             max_bytes = CACHE_MAX_SIZE_GB * 1024**3
