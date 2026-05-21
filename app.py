@@ -136,10 +136,11 @@ async def start_stream_task(
             except Exception as e:
                 log.warning("save_after_exception model=%s be=%d slot=%d: %s",
                             model_name, backend_id, slot_id, e)
-            try:
-                hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_name)
-            except Exception as e:
-                log.warning("write_meta_exception key=%s: %s", key[:16], e)
+            if ok:
+                try:
+                    hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_name)
+                except Exception as e:
+                    log.warning("write_meta_exception key=%s: %s", key[:16], e)
             sm.release(model_name, backend_id, slot_id)
             log.info("stream_reader_done model=%s be=%d slot=%d key=%s saved=%s",
                      model_name, backend_id, slot_id, key[:16], ok)
@@ -324,13 +325,14 @@ async def chat(req: Request):
             try:
                 if is_big:
                     ok, _ = await sm.save_after(model_name, be_id, slot_id, key, backend_model_id)
-                    hs.write_meta(
-                        key,
-                        prefix,
-                        blocks,
-                        WORDS_PER_BLOCK,
-                        backend_model_id,
-                    )
+                    if ok:
+                        hs.write_meta(
+                            key,
+                            prefix,
+                            blocks,
+                            WORDS_PER_BLOCK,
+                            backend_model_id,
+                        )
             finally:
                 sm.release(model_name, be_id, slot_id)
 
