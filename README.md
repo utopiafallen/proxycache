@@ -1,33 +1,45 @@
-<img width="1000"  alt="image_" src="https://github.com/user-attachments/assets/0d966dde-f1d8-432f-bad0-aa79a5ccf396" />
-
 # proxycache
 
 OpenAI-compatible proxy for `llama.cpp` that manages KV cache slots with disk save/restore and automatic cache cleanup. Compatible with `llama-swap` for multi-model routing.
 
 ## Why it's needed
 
-`llama.cpp` provides all the primitives: per-slot KV cache, `/slots/{id}?action=save|restore` API, and LRU eviction. proxycache automates their management so you don't have to — it persists caches to disk, matches prompts against historical caches, assigns slots intelligently, and cleans up old files, all without modifying `llama.cpp`.
+`llama.cpp` provides the primitives — per-slot KV cache, `/slots/{id}?action=save|restore` API, and in-memory LRU eviction — but leaves cache lifecycle management to the operator. proxycache automates this:
+
+- **Disk persistence** — saves KV state to disk so caches survive restarts and idle periods.
+- **Cross-session matching** — scans `.meta.json` files on disk to find the best previously cached prompt, with a tunable `LCP_TH` threshold (vs. llama.cpp's hardcoded 50%).
+- **Smart slot assignment** — picks an unused slot first, then falls back to LRU, protecting cached contexts from accidental overwrites.
+- **Automatic cleanup** — ring buffer evicts expired entries (age-first) then LRU when total cache exceeds `CACHE_MAX_SIZE_GB`. Orphaned/corrupted metadata is reconciled on startup.
+- **KV cache skip** — if a slot's current KV cache already matches the incoming prompt (LCP ratio >= `KV_CACHE_SKIP_THRESHOLD`, default 0.9), the restore is skipped entirely and llama.cpp appends to the existing cache.
+
+Small requests (`< BIG_THRESHOLD_WORDS`, default 500 words) skip cache I/O entirely — the overhead of hashing, scanning meta files, and disk reads/writes exceeds any prefill savings.
 
 ## How it works
 
-`llama.cpp` provides in-memory KV cache with per-slot prefix matching (50% threshold) and LRU eviction. proxycache sits between clients and `llama.cpp` and adds:
+```
+Client → proxycache (:8081) → llama.cpp (:8000)
+```
 
-- **Disk persistence** — calls `llama.cpp`'s `/slots/{id}?action=save|restore` to persist KV state to disk so caches survive restarts and idle periods.
-- **Configurable prefix matching** — `llama.cpp`'s 50% similarity threshold is hardcoded. proxycache uses tunable `LCP_TH` and scans `.meta.json` files on disk, so it can match against any previously cached prompt — not just ones currently held in active slots.
-- **Per-model slot pools** — slots are keyed by model name, not backend. Each model gets its own pool with independent LRU tracking. Multiple backends can serve the same model.
-- **Router mode support** — when `llama.cpp` runs in router mode (`--models-preset`), slot counts are discovered via `GET /models` + child `/slots` endpoints. Falls back to `GET /slots` for non-router mode.
-- **Smart slot assignment** — picks an unused slot first, then falls back to least-recently-used, protecting cached contexts from accidental overwrites.
-- **Automatic cleanup** — ring buffer evicts expired entries (age-first) then LRU entries when total cache exceeds `CACHE_MAX_SIZE_GB`. Reconciliation of orphaned/corrupted metadata runs on startup. `llama.cpp` has no cache eviction.
-- **Multi-backend routing** — supports multiple backends and `llama-swap` mode for model routing. `llama.cpp` is a single server.
+1. **Request arrives** at `POST /v1/chat/completions`. The proxy strips message roles, concatenates content with `\n\n`, and hashes it into word-blocks (SHA256 per block, default 100 words/block).
 
-Small requests (< `BIG_THRESHOLD_WORDS`) skip cache I/O entirely — the overhead of hashing, scanning meta files, and disk reads/writes exceeds any prefill savings on short prompts.
+2. **Cache lookup** (big requests only): `find_best_restore_candidate()` scans all `.meta.json` files matching the model, computes LCP ratio between request blocks and each cached entry, and picks the best match above `LCP_TH`.
+
+3. **Slot acquisition**: `SlotManager` discovers available slots on-demand (lazy, with 300s cooldown per model/backend pair), then picks a free slot or the least-recently-used one. If the slot's tracked KV cache already matches the request (>= `KV_CACHE_SKIP_THRESHOLD`), no disk restore happens.
+
+4. **Dispatch**: the proxy forwards the request to llama.cpp with `cache_prompt=true`, `n_keep=-1`, and the slot pinned via three fields (`slot_id`, `id_slot`, `_slot_id` in root, `options`, and query params).
+
+5. **Response**:
+   - **Streaming**: a background `reader` task reads raw SSE bytes → `asyncio.Queue` → `StreamingResponse`. The reader's `finally` always calls `save_after` + `write_meta` + `release`.
+   - **Non-streaming**: the proxy waits for the full response, saves the slot to disk, writes the meta file, then releases the slot.
+
+6. **Save** happens *after* the response completes, never before. Small requests skip save entirely.
 
 ## Quick Start
 
 ### 1. Start `llama.cpp`
 
 ```bash
-llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 --port 8080 --swa-full
+llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 --port 8000 --swa-full
 ```
 
 ### 2. Run the proxy
@@ -42,25 +54,40 @@ Point clients at the proxy's `/v1/chat/completions` endpoint.
 
 ## Configuration
 
-All config via environment variables (defaults in `config.py`):
+All config via environment variables (defaults in `config.py`). No `.env` file support.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLAMA_URL` | `http://127.0.0.1:8000` | Backend URL |
+| `LLAMA_URL` | `http://127.0.0.1:8000` | Backend URL (used when `BACKENDS` is empty) |
 | `PORT` | `8081` | Proxy listen port |
-| `BACKENDS` | — | JSON array `[{"url":"..."}]` — multi-backend support |
+| `BACKENDS` | `[]` | JSON array `[{"url":"..."}]` — multi-backend support |
 | `BACKEND_MODE` | `llama-cpp` | `llama-cpp` or `llama-swap` (changes `/slots` URL paths) |
 | `META_DIR` | `./kv_meta` | Local metadata directory |
 | `BIG_THRESHOLD_WORDS` | `500` | Min words to trigger cache restore/save |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
-| `LCP_TH` | `0.6` | LCP similarity threshold (0–1) |
-| `REQUEST_TIMEOUT` | `600` | HTTP timeout (seconds) |
+| `LCP_TH` | `0.6` | LCP similarity threshold for cache match (0–1) |
+| `KV_CACHE_SKIP_THRESHOLD` | `0.9` | Skip restore if slot KV cache matches >= this ratio |
+| `REQUEST_TIMEOUT` | `600` | HTTP timeout to backend (seconds) |
 | `MODEL_ID` | `llama.cpp` | Default model ID |
 | `CACHE_DIR` | — | `llama.cpp` `--slot-save-path` dir (required for cleanup) |
-| `CACHE_MAX_AGE_HOURS` | `168` | Delete files older than this (0=disabled) |
-| `CACHE_MAX_SIZE_GB` | `25` | Max total cache size |
+| `CACHE_MAX_AGE_HOURS` | `168` | Delete cache files older than this (0=disabled) |
+| `CACHE_MAX_SIZE_GB` | `25` | Max total cache size in GB |
+| `LOG_LEVEL` | `INFO` | Python logging level |
 
-Slot counts are discovered on-demand via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode), with a 10s cooldown per (model, backend) pair. Falls back to 1 slot if discovery fails.
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/chat/completions` | Main chat endpoint (proxied to backend) |
+| `GET` | `/v1/models` | Proxied to first backend |
+
+Slot counts are discovered on-demand via `GET /slots` (non-router mode) or `GET /models` + child `/slots` (router mode), with a 300s cooldown per (model, backend) pair. Falls back to 1 slot if discovery fails.
+
+## Router mode
+
+When `llama.cpp` runs in router mode (`--models-preset`), proxycache auto-detects it: if `GET /slots` returns HTTP 400, it falls back to `GET /models` to find loaded child-process models, then queries `/slots` on each child's port. Slots are tagged with `_router_model` and filtered by model name.
+
+No explicit router-mode flag is needed — detection is automatic.
 
 ## llama-swap setup
 
@@ -68,7 +95,7 @@ Slot counts are discovered on-demand via `GET /slots` (non-router) or `GET /mode
 Client → proxycache (:8081) → llama-swap (:9292) → llama-server (:PORT)
 ```
 
-Ensure `llama-swap` model configs include `--slot-save-path`:
+Set `BACKEND_MODE=llama-swap` and ensure `llama-swap` model configs include `--slot-save-path`:
 
 ```yaml
 models:
@@ -102,3 +129,15 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload && systemctl --user enable --now proxycache
 ```
+
+## Architecture
+
+| File | Role |
+|------|------|
+| `proxycache.py` | 13-line uvicorn entry point — **not** where main logic lives |
+| `app.py` | FastAPI app, routes, streaming pipeline, request handling |
+| `config.py` | All config via env vars (no .env file) |
+| `hashing.py` | Text → word-block hashing, LCP matching, meta I/O |
+| `llama_client.py` | httpx client to llama.cpp; slot save/restore, router mode slot discovery |
+| `slot_manager.py` | Per-model slot pools, ring buffer eviction, KV cache skip logic |
+| `kv_meta/` | Per-cache `.meta.json` files (gitignored) |
