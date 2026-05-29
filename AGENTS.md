@@ -2,13 +2,17 @@
 
 OpenAI-compatible proxy for llama.cpp that manages KV cache slots with disk save/restore and automatic cache cleanup. Compatible with `llama-swap` for multi-model routing.
 
+## Environment
+
+**Running inside WSL2** — use `uv` from Windows for package management. Do NOT install Python packages via pip/apt inside WSL2 as it pollutes the system Python. Use `uv pip` or `uv run` from the Windows side or WSL2 with `uv`'s venv support.
+
 ## Commands
 
 ```bash
-pip install -r requirements.txt
-python proxycache.py                         # run (default env vars from config.py)
-uvicorn app:app --host 0.0.0.0 --port 8081   # or via uvicorn directly
-python test_smoke.py                          # smoke tests (no framework, uses unittest.mock)
+uv sync                                        # install deps (uses pyproject.toml)
+python proxycache.py                           # run (default env vars from config.py)
+uvicorn app:app --host 0.0.0.0 --port 8081     # or via uvicorn directly
+python test_smoke.py                           # smoke tests (no framework, uses unittest.mock)
 ```
 
 **No linter, no typechecker, no test framework.**
