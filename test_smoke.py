@@ -1164,11 +1164,12 @@ def test_reader_polls_is_disconnected_on_timeout():
             pass
         elapsed = time.monotonic() - t0
 
-        # Should have exited after ~1s timeout (first wait_timeout=1.0)
-        assert elapsed < 5, f"Reader should exit quickly on disconnect, took {elapsed:.1f}s"
+        # Reader should detect disconnect quickly (~0.5s heartbeat interval)
+        # stream() may take up to STREAM_QUEUE_TIMEOUT to exit after reader finishes
+        assert elapsed < 10, f"Stream should exit within reasonable time, took {elapsed:.1f}s"
         assert mock_req.is_disconnected.called, "Reader should have polled is_disconnected"
         assert reader._cancelled, "_cancelled should be True after disconnect"
-        # save_after should NOT be called since cancelled flag was set
+        # save_after should NOT be called since stream never completed
         assert not mock_client.save_slot.called, "save_after should be skipped on disconnect"
 
     asyncio.run(_run())

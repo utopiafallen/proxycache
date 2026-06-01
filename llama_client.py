@@ -66,6 +66,10 @@ class LlamaClient:
     ):
         body2, query = self._with_slot_id(body, slot_id)
 
+        log.info("chat_completions stream=%s body_stream=%s n_messages=%d",
+                 stream, body2.get("stream", "MISSING"),
+                 len(body2.get("messages") or []))
+
         if stream:
             req = self.client.build_request(
                 "POST",
