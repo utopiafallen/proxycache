@@ -124,12 +124,12 @@ When backends are on remote hosts, proxycache needs a way to delete cache files 
 ./build-cache-agent.sh
 ```
 
-Requires Go 1.21+. Produces a `cache-agent` binary in the project root.
+Requires Go 1.21+. Produces a `cache-agent.exe` binary in the project root.
 
 ### Running
 
 ```bash
-CACHE_DIR=/var/kvcache AGENT_PORT=8082 ./cache-agent
+CACHE_DIR=/var/kvcache AGENT_PORT=8082 ./cache-agent.exe
 ```
 
 ### Configuration

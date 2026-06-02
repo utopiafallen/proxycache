@@ -3,4 +3,4 @@ venv/
 __pycache__/
 run-proxycache.ps1
 uv.lock
-cache-agent
+cache-agent.exe
