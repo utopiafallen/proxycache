@@ -24,6 +24,7 @@ from config import (BACKENDS, META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS,
                     CACHE_MAX_SIZE_GB, KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK,
                     SLOT_TIMEOUT)
 import hashing as hs
+from cache_agent_client import CacheAgentClient
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +43,8 @@ class SlotManager:
         self._last_refresh: Dict[Tuple[str, int], Tuple[float, bool]] = {}
 
         # Ring buffer for cache size tracking
-        self._cache_ring: deque = deque()  # (key, size_bytes, last_used_time)
+        # (key, size_bytes, last_used_time, backend_id)
+        self._cache_ring: deque = deque()
         self._total_bytes: int = 0
         self._max_age_seconds: float = CACHE_MAX_AGE_HOURS * 3600
 
@@ -55,8 +57,56 @@ class SlotManager:
     def set_clients(self, clients: List):
         self.backends = []
         for i, client in enumerate(clients):
-            self.backends.append({"id": i, "client": client, "n_slots": 0})
+            be = {"id": i, "client": client, "n_slots": 0}
+            # Derive agent URL from backend URL if agent_port is configured
+            be_url = client.base_url.rstrip("/")
+            if i < len(BACKENDS) and "agent_port" in BACKENDS[i]:
+                # Replace host:port with host:agent_port
+                host = be_url.split("://")[-1].rsplit(":", 1)[0]
+                agent_port = BACKENDS[i]["agent_port"]
+                be["agent_client"] = CacheAgentClient(f"http://{host}:{agent_port}")
+            self.backends.append(be)
         log.info("set_clients n_backends=%d", len(self.backends))
+
+    def _get_agent(self, backend_id: int):
+        """Get the cache agent client for a backend, or None."""
+        be = self.backends[backend_id]
+        return be.get("agent_client")
+
+    async def _evict_cache_file(self, key: str, backend_id: int, log_msg: str, log_extra: str):
+        """Delete a cache file via agent or local fallback.
+
+        Args:
+            key: Cache file basename
+            backend_id: Backend ID (-1 for unknown/local)
+            log_msg: Log message template prefix (e.g. "ring_evict_expired")
+            log_extra: Extra info for log message
+        """
+        if backend_id >= 0:
+            agent = self._get_agent(backend_id)
+            if agent:
+                ok = await agent.delete(key)
+                if ok:
+                    log.info("%s: %s %s", log_msg, key[:16], log_extra)
+                else:
+                    log.warning("%s_agent_fail: %s", log_msg, key[:16])
+                return
+        cache_path = CACHE_DIR + "/" + key if CACHE_DIR else None
+        if cache_path and os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+                log.info("%s: %s %s", log_msg, key[:16], log_extra)
+            except OSError:
+                pass
+
+    def _evict_meta_file(self, key: str):
+        """Delete the meta file for a cache entry."""
+        meta_path = os.path.join(META_DIR, f"{key}{hs.META_SUFFIX}")
+        if os.path.exists(meta_path):
+            try:
+                os.remove(meta_path)
+            except OSError:
+                pass
 
     def init_from_disk(self, cache_dir: str):
         """Populate ring buffer from existing cache files on disk."""
@@ -68,7 +118,7 @@ class SlotManager:
                 try:
                     size = os.stat(filepath).st_size
                     last_used = hs._get_last_used_time(f, META_DIR, cache_dir)
-                    self._cache_ring.append((f, size, last_used))
+                    self._cache_ring.append((f, size, last_used, -1))  # -1 = unknown backend
                     self._total_bytes += size
                 except OSError:
                     continue
@@ -405,7 +455,7 @@ class SlotManager:
         ok, size = await client.save_slot(slot_id, key, model_id)
 
         if ok and size > 0:
-            self._cache_ring.append((key, size, time.time()))
+            self._cache_ring.append((key, size, time.time(), backend_id))
             self._total_bytes += size
 
             # Update tracked KV state for this slot
@@ -425,24 +475,13 @@ class SlotManager:
                 evicted_expired = False
                 for entry in self._cache_ring:
                     if now - entry[2] > self._max_age_seconds:
-                        evict_key, evict_size, _ = entry
+                        evict_key, evict_size, _, entry_be_id = entry
                         self._cache_ring.remove(entry)
                         self._total_bytes -= evict_size
-                        cache_path = os.path.join(CACHE_DIR, evict_key) if CACHE_DIR else None
-                        if cache_path and os.path.exists(cache_path):
-                            try:
-                                os.remove(cache_path)
-                                log.info("ring_evict_expired: %s (%d bytes, age=%.1fh)",
-                                         evict_key[:16], evict_size,
-                                         (now - entry[2]) / 3600)
-                            except OSError:
-                                pass
-                        meta_path = os.path.join(META_DIR, f"{evict_key}{hs.META_SUFFIX}")
-                        if os.path.exists(meta_path):
-                            try:
-                                os.remove(meta_path)
-                            except OSError:
-                                pass
+                        age_hours = (now - entry[2]) / 3600
+                        await self._evict_cache_file(evict_key, entry_be_id, "ring_evict_expired",
+                                                     "(%d bytes, age=%.1fh)" % (evict_size, age_hours))
+                        self._evict_meta_file(evict_key)
                         evicted_expired = True
                         break
                 if evicted_expired:
@@ -455,23 +494,12 @@ class SlotManager:
                     if self._cache_ring[i][2] < lru_ts:
                         lru_ts = self._cache_ring[i][2]
                         lru_idx = i
-                evict_key, evict_size, _ = self._cache_ring[lru_idx]
+                evict_key, evict_size, _, entry_be_id = self._cache_ring[lru_idx]
                 self._cache_ring.remove(self._cache_ring[lru_idx])
                 self._total_bytes -= evict_size
-                cache_path = os.path.join(CACHE_DIR, evict_key) if CACHE_DIR else None
-                if cache_path and os.path.exists(cache_path):
-                    try:
-                        os.remove(cache_path)
-                        log.info("ring_evict_lru: %s (%d bytes, last_used=%.0f)",
-                                 evict_key[:16], evict_size, lru_ts)
-                    except OSError:
-                        pass
-                meta_path = os.path.join(META_DIR, f"{evict_key}{hs.META_SUFFIX}")
-                if os.path.exists(meta_path):
-                    try:
-                        os.remove(meta_path)
-                    except OSError:
-                        pass
+                await self._evict_cache_file(evict_key, entry_be_id, "ring_evict_lru",
+                                             "(%d bytes, last_used=%.0f)" % (evict_size, lru_ts))
+                self._evict_meta_file(evict_key)
 
         return ok, size
 

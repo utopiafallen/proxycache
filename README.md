@@ -24,12 +24,12 @@ Client → proxycache (:8081) → llama.cpp (:8000)
 
 2. **Cache lookup** (big requests only): `find_best_restore_candidate()` scans all `.meta.json` files matching the model, computes LCP ratio between request blocks and each cached entry, and picks the best match above `LCP_TH`.
 
-3. **Slot acquisition**: `SlotManager` discovers available slots on-demand (lazy, with 300s cooldown per model/backend pair), then picks a free slot or the least-recently-used one. If the slot's tracked KV cache already matches the request (>= `KV_CACHE_SKIP_THRESHOLD`), no disk restore happens.
+3. **Slot acquisition**: `SlotManager` discovers available slots on-demand (lazy, with 300s cooldown per model/backend pair on success, 30s on failure), then picks a free slot or the least-recently-used one. If the slot's tracked KV cache already matches the request (>= `KV_CACHE_SKIP_THRESHOLD`), no disk restore happens. Returns 503 if no slot is acquired within 60s.
 
-4. **Dispatch**: the proxy forwards the request to llama.cpp with `cache_prompt=true`, `n_keep=-1`, and the slot pinned via three fields (`slot_id`, `id_slot`, `_slot_id` in root, `options`, and query params).
+4. **Dispatch**: the proxy forwards the request to llama.cpp with `cache_prompt=true`, `n_keep=-1`, and the slot pinned via three fields (`slot_id`, `id_slot`, `_slot_id` in root body, `options` dict, and query params).
 
 5. **Response**:
-   - **Streaming**: a background `reader` task races socket reads against a disconnect event, pushing SSE bytes into an `asyncio.Queue`. A heartbeat task checks `is_disconnected()` every 0.5s. When the stream completes, `stream()`'s `finally` calls `_cleanup()` which saves the slot (if the stream finished normally), releases it, and puts a sentinel in the queue.
+   - **Streaming**: a background `reader` task races socket reads against a disconnect event, pushing SSE bytes into an `asyncio.Queue`. A heartbeat task checks `is_disconnected()` every 0.5s. When the stream completes, `stream()`'s `finally` calls `_cleanup()` which saves the slot (only if the stream finished normally — not if cancelled mid-stream), releases it, and puts a sentinel in the queue.
    - **Non-streaming**: the proxy waits for the full response, saves the slot to disk, writes the meta file, then releases the slot.
 
 6. **Save** happens *after* the response completes, never before. Small requests skip save entirely.
@@ -45,8 +45,8 @@ llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 
 ### 2. Run the proxy
 
 ```bash
-pip install -r requirements.txt
-python proxycache.py
+uv sync
+uv run python proxycache.py
 # or: uvicorn app:app --host 0.0.0.0 --port 8081
 ```
 
@@ -60,13 +60,14 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 |----------|---------|-------------|
 | `LLAMA_URL` | `http://127.0.0.1:8000` | Backend URL (used when `BACKENDS` is empty) |
 | `PORT` | `8081` | Proxy listen port |
-| `BACKENDS` | `[]` | JSON array `[{"url":"..."}]` — multi-backend support |
+| `BACKENDS` | `[]` | JSON array `[{"url":"..."}]` — multi-backend support. Each entry can optionally include `"agent_port"` for remote cache deletion (see [Cache Agent](#cache-agent)). |
 | `BACKEND_MODE` | `llama-cpp` | `llama-cpp` or `llama-swap` (changes `/slots` URL paths) |
 | `META_DIR` | `./kv_meta` | Local metadata directory |
 | `BIG_THRESHOLD_WORDS` | `500` | Min words to trigger cache restore/save |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
-| `LCP_TH` | `0.6` | LCP similarity threshold for cache match (0–1) |
+| `LCP_TH` | `0.2` | LCP similarity threshold for cache match (0–1) |
 | `KV_CACHE_SKIP_THRESHOLD` | `0.9` | Skip restore if slot KV cache matches >= this ratio |
+| `SLOT_TIMEOUT` | `30` | Timeout for slot save/restore operations (seconds) |
 | `REQUEST_TIMEOUT` | `600` | HTTP timeout to backend (seconds) |
 | `MODEL_ID` | `llama.cpp` | Default model ID |
 | `CACHE_DIR` | — | `llama.cpp` `--slot-save-path` dir (required for cleanup) |
@@ -103,6 +104,44 @@ models:
     cmd: "llama-server -m model.gguf --slot-save-path /path/to/kv-cache ..."
 ```
 
+## Multi-backend
+
+Configure multiple backends via the `BACKENDS` env var:
+
+```bash
+BACKENDS='[{"url":"http://10.0.0.1:8000"},{"url":"http://10.0.0.2:8000"}]'
+```
+
+Slots are discovered per-backend and assigned per-model. Each backend can optionally specify an `agent_port` for remote cache file deletion (see [Cache Agent](#cache-agent)).
+
+## Cache Agent
+
+When backends are on remote hosts, proxycache needs a way to delete cache files for eviction. The cache agent is a lightweight Go HTTP server that runs alongside each `llama.cpp` instance and exposes a `POST /cache/delete?key=<basename>` endpoint.
+
+### Building
+
+```bash
+./build-cache-agent.sh
+```
+
+Requires Go 1.21+. Produces a `cache-agent` binary in the project root.
+
+### Running
+
+```bash
+CACHE_DIR=/var/kvcache AGENT_PORT=8082 ./cache-agent
+```
+
+### Configuration
+
+Add `agent_port` to the backend config in `BACKENDS`:
+
+```bash
+BACKENDS='[{"url":"http://10.0.0.1:8000","agent_port":8082}]'
+```
+
+When `agent_port` is set, eviction uses the agent's HTTP API instead of local filesystem deletion.
+
 ## Systemd service
 
 `~/.config/systemd/user/proxycache.service`:
@@ -137,7 +176,9 @@ systemctl --user daemon-reload && systemctl --user enable --now proxycache
 | `proxycache.py` | 13-line uvicorn entry point — **not** where main logic lives |
 | `app.py` | FastAPI app, routes, streaming pipeline, request handling |
 | `config.py` | All config via env vars (no .env file) |
-| `hashing.py` | Text → word-block hashing, LCP matching, meta I/O |
+| `hashing.py` | Text → word-block hashing, LCP matching, meta I/O, reconciliation |
 | `llama_client.py` | httpx client to llama.cpp; slot save/restore, router mode slot discovery |
-| `slot_manager.py` | Per-model slot pools, ring buffer eviction, KV cache skip logic |
+| `slot_manager.py` | Per-model slot pools, ring buffer eviction, KV cache skip logic, cache agent integration |
+| `cache_agent_client.py` | HTTP client for remote cache file deletion |
+| `cache-agent/` | Go cache agent (lightweight HTTP server for remote cache deletion) |
 | `kv_meta/` | Per-cache `.meta.json` files (gitignored) |

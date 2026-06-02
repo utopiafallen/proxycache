@@ -62,6 +62,74 @@ def test_hashing_imports():
     print("PASS: test_hashing_imports")
 
 
+async def _mock_cache_agent_success(key: str):
+    """Mock response for successful cache agent delete."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"ok": True}
+    return mock_response
+
+
+async def _mock_cache_agent_failure(key: str):
+    """Mock response for failed cache agent delete (file not found)."""
+    mock_response = MagicMock()
+    mock_response.status_code = 404
+    mock_response.text = '{"ok": false, "error": "file not found"}'
+    return mock_response
+
+
+def test_cache_agent_client_delete_success():
+    """CacheAgentClient.delete returns True on 200 OK response."""
+    from unittest.mock import AsyncMock, patch
+    from cache_agent_client import CacheAgentClient
+
+    async def run():
+        client = CacheAgentClient("http://10.0.0.1:8082")
+        mock_resp = await _mock_cache_agent_success("test_key")
+        with patch.object(client._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+            result = await client.delete("test_key")
+            assert result is True, f"Expected True, got {result}"
+        await client.close()
+
+    asyncio.run(run())
+    print("PASS: test_cache_agent_client_delete_success")
+
+
+def test_cache_agent_client_delete_failure():
+    """CacheAgentClient.delete returns False on non-200 response."""
+    from unittest.mock import AsyncMock, patch
+    from cache_agent_client import CacheAgentClient
+
+    async def run():
+        client = CacheAgentClient("http://10.0.0.1:8082")
+        mock_resp = await _mock_cache_agent_failure("test_key")
+        with patch.object(client._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+            result = await client.delete("test_key")
+            assert result is False, f"Expected False, got {result}"
+        await client.close()
+
+    asyncio.run(run())
+    print("PASS: test_cache_agent_client_delete_failure")
+
+
+def test_cache_agent_client_connect_error():
+    """CacheAgentClient.delete returns False on connection error."""
+    from unittest.mock import AsyncMock, patch
+    from cache_agent_client import CacheAgentClient
+    import httpx
+
+    async def run():
+        client = CacheAgentClient("http://10.0.0.1:9999")
+        with patch.object(client._client, "post", new_callable=AsyncMock,
+                          side_effect=httpx.ConnectError("connection refused")):
+            result = await client.delete("test_key")
+            assert result is False, f"Expected False, got {result}"
+        await client.close()
+
+    asyncio.run(run())
+    print("PASS: test_cache_agent_client_connect_error")
+
+
 def test_save_slot_response_parsing():
     """save_slot must extract n_written from the llama.cpp save response."""
     mock_response_json = {
@@ -1287,5 +1355,10 @@ if __name__ == "__main__":
     test_streaming_release_not_in_outer_finally()
     test_reader_polls_is_disconnected_on_timeout()
     test_streaming_completion_releases_slot()
+
+    # Cache agent client tests
+    test_cache_agent_client_delete_success()
+    test_cache_agent_client_delete_failure()
+    test_cache_agent_client_connect_error()
 
     print("\nAll smoke tests passed.")
