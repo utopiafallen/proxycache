@@ -2,22 +2,23 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"log"
 	"net/http"
 	"os"
 )
 
 var cacheDir string
+var port string
 
 func main() {
-	cacheDir = os.Getenv("CACHE_DIR")
-	if cacheDir == "" {
-		log.Fatal("CACHE_DIR environment variable is required")
-	}
+	flag.StringVar(&cacheDir, "cache-dir", "", "Path to llama.cpp slot-save-directory")
+	flag.StringVar(&port, "port", "8082", "HTTP listen port")
+	flag.Parse()
 
-	port := os.Getenv("AGENT_PORT")
-	if port == "" {
-		port = "8082"
+	if cacheDir == "" {
+		flag.Usage()
+		os.Exit(1)
 	}
 
 	mux := http.NewServeMux()

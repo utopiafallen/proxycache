@@ -129,7 +129,7 @@ Requires Go 1.21+. Produces a `cache-agent.exe` binary in the project root.
 ### Running
 
 ```bash
-CACHE_DIR=/var/kvcache AGENT_PORT=8082 ./cache-agent.exe
+./cache-agent.exe -cache-dir /var/kvcache -port 8082
 ```
 
 ### Configuration
