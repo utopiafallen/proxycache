@@ -74,6 +74,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `CACHE_MAX_AGE_HOURS` | `168` | Delete cache files older than this (0=disabled) |
 | `CACHE_MAX_SIZE_GB` | `25` | Max total cache size in GB |
 | `LOG_LEVEL` | `INFO` | Python logging level |
+| `REFRESH_COOLDOWN_SECONDS` | `300` | Cooldown between slot refreshes per (model, backend) pair on success (30s on failure) |
 
 ## Endpoints
 
@@ -112,7 +113,7 @@ Configure multiple backends via the `BACKENDS` env var:
 BACKENDS='[{"url":"http://10.0.0.1:8000"},{"url":"http://10.0.0.2:8000"}]'
 ```
 
-Slots are discovered per-backend and assigned per-model. Each backend can optionally specify an `agent_port` for remote cache file deletion (see [Cache Agent](#cache-agent)).
+Each backend is identified by a stable `host:port` key (e.g. `"10.0.0.1:8000"`) derived from its URL, so keys persist across restarts and reconfigurations. Slots are discovered per-backend and assigned per-model. Each backend can optionally specify an `agent_port` for remote cache file deletion (see [Cache Agent](#cache-agent)).
 
 ## Cache Agent
 
@@ -175,6 +176,7 @@ systemctl --user daemon-reload && systemctl --user enable --now proxycache
 |------|------|
 | `proxycache.py` | 13-line uvicorn entry point — **not** where main logic lives |
 | `app.py` | FastAPI app, routes, streaming pipeline, request handling |
+| `backend_manager.py` | Singleton managing backend registry, LlamaClient/CacheAgentClient instances, model-to-backend mapping, and refresh cooldowns |
 | `config.py` | All config via env vars (no .env file) |
 | `hashing.py` | Text → word-block hashing, LCP matching, meta I/O, reconciliation |
 | `llama_client.py` | httpx client to llama.cpp; slot save/restore, router mode slot discovery |
