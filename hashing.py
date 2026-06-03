@@ -222,7 +222,7 @@ def write_meta(
     log.info("Saved cache for key %s (model: %s, backend: %s, %d blocks)", key[:16], model_id, backend_key, len(blocks))
 
 
-def reconcile_meta(meta_base: str, cache_dir: str, backend_keys: Optional[List[str]] = None, backend_agents: Optional[Dict[str, str]] = None) -> int:
+async def reconcile_meta(meta_base: str, cache_dir: str, backend_keys: Optional[List[str]] = None, backend_agents: Optional[Dict[str, str]] = None) -> int:
     """
     Scans meta files organized by backend and removes corrupted ones or orphans.
     Uses cache agent API for remote file size lookups when available.
@@ -266,7 +266,7 @@ def reconcile_meta(meta_base: str, cache_dir: str, backend_keys: Optional[List[s
                 if agent_url:
                     try:
                         from cache_agent_client import get_file_size
-                        result = get_file_size(agent_url, cachename)
+                        result = await get_file_size(agent_url, cachename)
                         if result and result.get("exists", False):
                             cache_exists = True
                     except Exception as e:

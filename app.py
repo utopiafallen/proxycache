@@ -68,7 +68,7 @@ async def startup():
     backend_keys = list(backend_manager._backends.keys())
     backend_agents = {k: v.agent_client.base_url if v.agent_client else None for k, v in backend_manager._backends.items()}
     backend_agents = {k: v for k, v in backend_agents.items() if v is not None}
-    reconciled = hs.reconcile_meta(META_DIR, CACHE_DIR, backend_keys, backend_agents)
+    reconciled = await hs.reconcile_meta(META_DIR, CACHE_DIR, backend_keys, backend_agents)
     if reconciled > 0:
         log.info("Cleaned up %d orphaned/corrupted meta files at startup", reconciled)
 
