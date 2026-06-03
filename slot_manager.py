@@ -20,30 +20,24 @@ import logging
 from collections import deque
 from typing import List, Tuple, Dict, Optional
 
-from config import (BACKENDS, META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS,
-                    CACHE_MAX_SIZE_GB, KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK,
-                    SLOT_TIMEOUT)
+from config import META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, \
+    KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK, SLOT_TIMEOUT
 import hashing as hs
-from cache_agent_client import CacheAgentClient
+from backend_manager import backend_manager
 
 log = logging.getLogger(__name__)
 
-GSlot = Tuple[str, int, int]  # (model_name, backend_id, slot_id)
-
-REFRESH_COOLDOWN_SECONDS = 300
+GSlot = Tuple[str, str, int]  # (model_name, backend_key, slot_id)
 
 
 class SlotManager:
     def __init__(self):
-        self.backends: List[Dict] = []
-        self._model_to_backends: Dict[str, List[int]] = {}
-        self._slot_pools: Dict[str, Dict[int, set]] = {}
-        self._last_used: Dict[Tuple[str, int, int], float] = {}
-        self._locks: Dict[Tuple[str, int, int], asyncio.Lock] = {}
-        self._last_refresh: Dict[Tuple[str, int], Tuple[float, bool]] = {}
+        self._slot_pools: Dict[str, Dict[str, set]] = {}
+        self._last_used: Dict[Tuple[str, str, int], float] = {}
+        self._locks: Dict[Tuple[str, str, int], asyncio.Lock] = {}
 
         # Ring buffer for cache size tracking
-        # (key, size_bytes, last_used_time, backend_id)
+        # (key, size_bytes, last_used_time, backend_key)
         self._cache_ring: deque = deque()
         self._total_bytes: int = 0
         self._max_age_seconds: float = CACHE_MAX_AGE_HOURS * 3600
@@ -51,39 +45,19 @@ class SlotManager:
         # Per-slot KV cache block state — tracks hash blocks currently in each slot
         self._slot_kv_state: Dict[GSlot, List[str]] = {}
 
-        log.info("slot_manager n_backends=%d max_age_hours=%d",
-                 len(self.backends), CACHE_MAX_AGE_HOURS)
+        log.info("slot_manager max_age_hours=%d", CACHE_MAX_AGE_HOURS)
 
-    def set_clients(self, clients: List):
-        self.backends = []
-        for i, client in enumerate(clients):
-            be = {"id": i, "client": client, "n_slots": 0}
-            # Derive agent URL from backend URL if agent_port is configured
-            be_url = client.base_url.rstrip("/")
-            if i < len(BACKENDS) and "agent_port" in BACKENDS[i]:
-                # Replace host:port with host:agent_port
-                host = be_url.split("://")[-1].rsplit(":", 1)[0]
-                agent_port = BACKENDS[i]["agent_port"]
-                be["agent_client"] = CacheAgentClient(f"http://{host}:{agent_port}")
-            self.backends.append(be)
-        log.info("set_clients n_backends=%d", len(self.backends))
-
-    def _get_agent(self, backend_id: int):
-        """Get the cache agent client for a backend, or None."""
-        be = self.backends[backend_id]
-        return be.get("agent_client")
-
-    async def _evict_cache_file(self, key: str, backend_id: int, log_msg: str, log_extra: str):
+    async def _evict_cache_file(self, key: str, backend_id: str, log_msg: str, log_extra: str):
         """Delete a cache file via agent or local fallback.
 
         Args:
             key: Cache file basename
-            backend_id: Backend ID (-1 for unknown/local)
+            backend_id: Backend key (str) or None for unknown/local
             log_msg: Log message template prefix (e.g. "ring_evict_expired")
             log_extra: Extra info for log message
         """
-        if backend_id >= 0:
-            agent = self._get_agent(backend_id)
+        if backend_id is not None:
+            agent = backend_manager.get_agent(backend_id)
             if agent:
                 ok = await agent.delete(key)
                 if ok:
@@ -118,18 +92,18 @@ class SlotManager:
                 try:
                     size = os.stat(filepath).st_size
                     last_used = hs._get_last_used_time(f, META_DIR, cache_dir)
-                    self._cache_ring.append((f, size, last_used, -1))  # -1 = unknown backend
+                    self._cache_ring.append((f, size, last_used, None))  # None = unknown backend
                     self._total_bytes += size
                 except OSError:
                     continue
         log.info("init_from_disk: %d cache files, %.1f GB total",
                   len(self._cache_ring), self._total_bytes / 1024**3)
 
-    def _is_free(self, model_name: str, backend_id: int, slot_id: int) -> bool:
+    def _is_free(self, model_name: str, backend_id: str, slot_id: int) -> bool:
         return self._last_used.get((model_name, backend_id, slot_id), 0.0) == 0.0
 
     def _get_free_or_oldest_from_pool(
-        self, model_name: str, backend_id: int
+        self, model_name: str, backend_id: str
     ) -> Tuple[int, asyncio.Lock]:
         """Pick free slot or oldest (LRU) from a single backend's pool for a model."""
         pool = self._slot_pools.get(model_name, {}).get(backend_id)
@@ -143,12 +117,12 @@ class SlotManager:
         oldest = min(pool, key=lambda s: self._last_used.get((model_name, backend_id, s), 0.0))
         return oldest, self._locks[(model_name, backend_id, oldest)]
 
-    def _select_from_pool(self, model_name: str) -> Tuple[str, int, int, asyncio.Lock]:
+    def _select_from_pool(self, model_name: str) -> Tuple[str, str, int, asyncio.Lock]:
         """Pick the best backend + slot for a model (free or oldest LRU)."""
-        best: Optional[Tuple[str, int, int, asyncio.Lock]] = None
+        best: Optional[Tuple[str, str, int, asyncio.Lock]] = None
         best_ts = -1.0
 
-        backend_ids = self._model_to_backends.get(model_name, [])
+        backend_ids = backend_manager.get_backends_for_model(model_name)
         for backend_id in backend_ids:
             try:
                 slot_id, lock = self._get_free_or_oldest_from_pool(model_name, backend_id)
@@ -181,8 +155,8 @@ class SlotManager:
 
         return best
 
-    def _ensure_pool(self, model_name: str, backend_id: int, n_slots: int):
-        """Create or update a slot pool for (model_name, backend_id)."""
+    def _ensure_pool(self, model_name: str, backend_id: str, n_slots: int):
+        """Create or update a slot pool for (model_name, backend_key)."""
         if model_name not in self._slot_pools:
             self._slot_pools[model_name] = {}
         if backend_id not in self._slot_pools[model_name]:
@@ -196,7 +170,7 @@ class SlotManager:
                     self._locks[g] = asyncio.Lock()
             self._slot_pools[model_name][backend_id] = new_pool
             log.info(
-                "ensure_pool model=%s be=%d slots=%d",
+                "ensure_pool model=%s be=%s slots=%d",
                 model_name, backend_id, n_slots,
             )
         else:
@@ -216,106 +190,26 @@ class SlotManager:
                     self._locks.pop((model_name, backend_id, s), None)
             self._slot_pools[model_name][backend_id] = new_pool
             log.info(
-                "update_pool model=%s be=%d slots %d->%d",
+                "update_pool model=%s be=%s slots %d->%d",
                 model_name, backend_id, old_count, n_slots,
             )
-
-    def _register_backend_for_model(self, model_name: str, backend_id: int):
-        """Register a backend as serving a model."""
-        if model_name not in self._model_to_backends:
-            self._model_to_backends[model_name] = []
-        if backend_id not in self._model_to_backends[model_name]:
-            self._model_to_backends[model_name].append(backend_id)
 
     async def refresh_slots(self, model_name: str):
         """Refresh slot counts for a model across all backends.
 
-        Uses get_slots_info() which already handles both router and non-router modes.
-        Skips backends refreshed within REFRESH_COOLDOWN_SECONDS.
+        Uses backend_manager.refresh_models() which handles both router and non-router modes.
         Falls back to 1 slot if discovery fails (model not loaded yet).
         """
-        backend_ids = list(range(len(self.backends)))
-        log.info(
-            "refresh_slots model=%s n_backends=%d known_backends=%s",
-            model_name, len(backend_ids),
-            list(self._model_to_backends.get(model_name, [])),
-        )
+        slot_counts = await backend_manager.refresh_models(model_name)
 
-        if not backend_ids:
-            log.error(
-                "refresh_slots_no_backends model=%s — no backends configured, cannot serve request",
-                model_name,
-            )
-            raise RuntimeError(f"No backends configured for model={model_name}")
+        # Update pools for backends that returned slot info
+        for backend_key, n_slots in slot_counts.items():
+            self._ensure_pool(model_name, backend_key, n_slots)
 
-        refreshed_any = False
-        for backend_id in backend_ids:
-            be = self.backends[backend_id]
-            client = be.get("client")
-            if not client:
-                log.debug("refresh_slots_skip_no_client model=%s be=%d", model_name, backend_id)
-                continue
-
-            # Check cooldown — 30s after failure, 300s after success
-            refresh_key = (model_name, backend_id)
-            now = time.time()
-            last_ts, last_success = self._last_refresh.get(refresh_key, (0.0, True))
-            cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
-            if now - last_ts < cooldown:
-                log.debug("refresh_slots_cooldown model=%s be=%d last=%.1f", model_name, backend_id, last_ts)
-                continue
-
-            # get_slots_info() handles both router and non-router modes internally
-            try:
-                slots = await client.get_slots_info(model_name)
-            except Exception as e:
-                log.warning(
-                    "refresh_slots_get_slots_info_fail model=%s be=%d err=%s",
-                    model_name, backend_id, e,
-                )
-                slots = None
-
-            if slots and isinstance(slots, list):
-                # Filter by model name if router mode (slots have _router_model field)
-                if slots and isinstance(slots[0], dict) and "_router_model" in slots[0]:
-                    model_slots = [s for s in slots if s.get("_router_model") == model_name]
-                    n_slots = len(model_slots)
-                    log.info(
-                        "refresh_slots model=%s be=%d slots=%d (router)",
-                        model_name, backend_id, n_slots,
-                    )
-                else:
-                    # Non-router mode: all slots belong to this model
-                    n_slots = len(slots)
-                    log.info(
-                        "refresh_slots model=%s be=%d slots=%d (non-router)",
-                        model_name, backend_id, n_slots,
-                    )
-                self._register_backend_for_model(model_name, backend_id)
-                self._ensure_pool(model_name, backend_id, n_slots)
-                self._last_refresh[refresh_key] = (now, True)
-                refreshed_any = True
-            else:
-                # Slots unavailable (model not loaded yet or discovery failed)
-                log.warning(
-                    "refresh_slots_model_not_loaded model=%s be=%d — 1 slot fallback",
-                    model_name, backend_id,
-                )
-                self._register_backend_for_model(model_name, backend_id)
-                self._ensure_pool(model_name, backend_id, 1)
-                self._last_refresh[refresh_key] = (now, False)
-                refreshed_any = True
-
-        if not refreshed_any:
-            log.warning(
-                "refresh_slots_nothing_done model=%s — all backends skipped (cooldown or no client)",
-                model_name,
-            )
-            # Ensure at least 1 slot exists so the request can proceed
-            if model_name not in self._model_to_backends and backend_ids:
-                first_be = backend_ids[0]
-                self._register_backend_for_model(model_name, first_be)
-                self._ensure_pool(model_name, first_be, 1)
+        # Fallback: if model has no registered backends, use first backend with 1 slot
+        if not backend_manager.get_backends_for_model(model_name):
+            first_key = backend_manager.first_key()
+            self._ensure_pool(model_name, first_key, 1)
 
     def _should_skip_restore(self, g: GSlot, req_blocks: List[str]) -> bool:
         """Check if the slot's current KV cache already matches the request well enough.
@@ -331,7 +225,7 @@ class SlotManager:
         denom = max(1, min(len(req_blocks), len(kv_blocks)))
         ratio = lcp / denom
         log.debug(
-            "_should_skip_restore model=%s be=%d slot=%d ratio=%.3f",
+            "_should_skip_restore model=%s be=%s slot=%d ratio=%.3f",
             g[0], g[1], g[2], ratio,
         )
         return ratio >= KV_CACHE_SKIP_THRESHOLD
@@ -353,7 +247,7 @@ class SlotManager:
             await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
         except asyncio.TimeoutError:
             log.warning(
-                "acquire_lock_timeout model=%s be=%d slot=%d after %ds",
+                "acquire_lock_timeout model=%s be=%s slot=%d after %ds",
                 model_name, backend_id, slot_id, lock_timeout,
             )
             raise
@@ -368,16 +262,16 @@ class SlotManager:
                 # Skip restore if slot's KV cache already matches well
                 if self._should_skip_restore(g, blocks):
                     log.info(
-                        "skip_restore_slot_cached model=%s be=%d slot=%d",
+                        "skip_restore_slot_cached model=%s be=%s slot=%d",
                         model_name, backend_id, slot_id,
                     )
                     restored = False
                 elif restore_key:
                     # Restore from pre-computed candidate
-                    client = self.backends[backend_id]["client"]
+                    client = backend_manager.get_client(backend_id)
                     restored = await client.restore_slot(slot_id, restore_key, model_name)
                     log.info(
-                        "restore_before_chat model=%s be=%d slot=%d ok=%s",
+                        "restore_before_chat model=%s be=%s slot=%d ok=%s",
                         model_name, backend_id, slot_id, restored,
                     )
                     if restored:
@@ -394,7 +288,7 @@ class SlotManager:
                 else:
                     # No pre-computed candidate and KV cache doesn't match —
                     # find best meta file to restore from
-                    client = self.backends[backend_id]["client"]
+                    client = backend_manager.get_client(backend_id)
                     cand = hs.find_best_restore_candidate(
                         blocks, WORDS_PER_BLOCK, LCP_TH, model_name,
                     )
@@ -402,7 +296,7 @@ class SlotManager:
                         cand_key, cand_ratio = cand
                         restored = await client.restore_slot(slot_id, cand_key, model_name)
                         log.info(
-                            "restore_dynamic model=%s be=%d slot=%d key=%s ratio=%.3f ok=%s",
+                            "restore_dynamic model=%s be=%s slot=%d key=%s ratio=%.3f ok=%s",
                             model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
                         )
                         if restored:
@@ -416,17 +310,17 @@ class SlotManager:
                                 log.warning("restore_meta_load_fail key=%s: %s", cand_key[:16], e)
                     else:
                         log.info(
-                            "restore_dynamic_none model=%s be=%d slot=%d",
+                            "restore_dynamic_none model=%s be=%s slot=%d",
                             model_name, backend_id, slot_id,
                         )
                         restored = False
 
             elif restore_key:
                 # Legacy path: no blocks passed but restore_key provided
-                client = self.backends[backend_id]["client"]
+                client = backend_manager.get_client(backend_id)
                 restored = await client.restore_slot(slot_id, restore_key, model_name)
                 log.info(
-                    "restore_before_chat model=%s be=%d slot=%d ok=%s",
+                    "restore_before_chat model=%s be=%s slot=%d ok=%s",
                     model_name, backend_id, slot_id, restored,
                 )
                 if restored:
@@ -445,13 +339,13 @@ class SlotManager:
     async def save_after(
         self,
         model_name: str,
-        backend_id: int,
+        backend_id: str,
         slot_id: int,
         key: str,
         model_id: Optional[str] = None,
         blocks: Optional[List[str]] = None,
     ) -> Tuple[bool, int]:
-        client = self.backends[backend_id]["client"]
+        client = backend_manager.get_client(backend_id)
         ok, size = await client.save_slot(slot_id, key, model_id)
 
         if ok and size > 0:
@@ -463,7 +357,7 @@ class SlotManager:
                 g = (model_name, backend_id, slot_id)
                 self._slot_kv_state[g] = blocks
                 log.debug(
-                    "update_slot_kv_state model=%s be=%d slot=%d n_blocks=%d",
+                    "update_slot_kv_state model=%s be=%s slot=%d n_blocks=%d",
                     model_name, backend_id, slot_id, len(blocks),
                 )
 
@@ -503,7 +397,7 @@ class SlotManager:
 
         return ok, size
 
-    def release(self, model_name: str, backend_id: int, slot_id: int):
+    def release(self, model_name: str, backend_id: str, slot_id: int):
         g = (model_name, backend_id, slot_id)
         lock = self._locks.get(g)
         if lock and lock.locked():
@@ -514,5 +408,5 @@ class SlotManager:
         """Update the last_used timestamp for a cache entry in the ring buffer."""
         for i in range(len(self._cache_ring)):
             if self._cache_ring[i][0] == key:
-                self._cache_ring[i] = (key, self._cache_ring[i][1], time.time())
+                self._cache_ring[i] = (key, self._cache_ring[i][1], time.time(), self._cache_ring[i][3])
                 break

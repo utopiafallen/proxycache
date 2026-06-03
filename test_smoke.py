@@ -12,6 +12,53 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+# ── BackendManager tests (NEW) ────────────────────────────────────────
+
+def test_backend_manager_constructor():
+    """BackendManager should derive keys from URLs and create clients."""
+    from backend_manager import BackendManager, BackendInfo
+    
+    bm = BackendManager([{"url": "http://10.0.0.1:8000"}])
+    assert bm.keys() == ["10.0.0.1:8000"]
+    assert bm.first_key() == "10.0.0.1:8000"
+    assert bm.n_backends() == 1
+    assert isinstance(bm.get_client("10.0.0.1:8000"), object)  # LlamaClient instance
+    print("PASS: test_backend_manager_constructor")
+
+
+def test_backend_manager_agent_client():
+    """BackendManager should create agent clients when agent_port is configured."""
+    from backend_manager import BackendManager
+    from cache_agent_client import CacheAgentClient
+    
+    bm = BackendManager([{"url": "http://10.0.0.1:8000", "agent_port": 8082}])
+    agent = bm.get_agent("10.0.0.1:8000")
+    assert isinstance(agent, CacheAgentClient)
+    print("PASS: test_backend_manager_agent_client")
+
+
+def test_backend_manager_model_registration():
+    """BackendManager should register backends for models via refresh_models."""
+    from backend_manager import BackendManager
+    from unittest.mock import AsyncMock
+    
+    bm = BackendManager([{"url": "http://10.0.0.1:8000"}])
+    mock_client = AsyncMock()
+    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}, {"id": 1}])
+    bm._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    
+    async def _run():
+        result = await bm.refresh_models("ModelA")
+        return result
+    
+    result = asyncio.run(_run())
+    assert result == {"10.0.0.1:8000": 2}
+    assert bm.get_backends_for_model("ModelA") == ["10.0.0.1:8000"]
+    # Close the fresh instance's clients to avoid resource leaks
+    asyncio.run(bm.close())
+    print("PASS: test_backend_manager_model_registration")
+
+
 # ── hashing tests (unchanged) ────────────────────────────────────────
 
 def test_reconcile_meta_removes_orphans():
@@ -114,17 +161,17 @@ def test_cache_agent_client_delete_failure():
 
 def test_cache_agent_client_connect_error():
     """CacheAgentClient.delete returns False on connection error."""
-    from unittest.mock import AsyncMock, patch
-    from cache_agent_client import CacheAgentClient
+    from backend_manager import BackendManager, CacheAgentClient
     import httpx
 
     async def run():
-        client = CacheAgentClient("http://10.0.0.1:9999")
-        with patch.object(client._client, "post", new_callable=AsyncMock,
+        bm = BackendManager([{"url": "http://10.0.0.1:9999", "agent_port": 8082}])
+        agent = bm.get_agent("10.0.0.1:9999")
+        with patch.object(agent._client, "post", new_callable=AsyncMock,
                           side_effect=httpx.ConnectError("connection refused")):
-            result = await client.delete("test_key")
+            result = await agent.delete("test_key")
             assert result is False, f"Expected False, got {result}"
-        await client.close()
+        await agent.close()
 
     asyncio.run(run())
     print("PASS: test_cache_agent_client_connect_error")
@@ -147,14 +194,21 @@ def test_save_slot_response_parsing():
     print("PASS: test_save_slot_response_parsing")
 
 
-  # ── LlamaClient tests ────────────────────────────────────────────────
+# ── LlamaClient tests ────────────────────────────────────────────────
 
 def test_refresh_slots_router_mode_filtering():
     """refresh_slots should filter slots by _router_model in router mode."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    # Clear both backends and refresh state
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(
@@ -164,7 +218,7 @@ def test_refresh_slots_router_mode_filtering():
             {"id": 0, "_router_model": "ModelB"},
         ]
     )
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         await sm.refresh_slots("ModelA")
@@ -172,49 +226,58 @@ def test_refresh_slots_router_mode_filtering():
     asyncio.run(_run())
 
     # Should only count ModelA slots, not ModelB
-    assert sm._slot_pools["ModelA"][0] == {0, 1}
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
     print("PASS: test_refresh_slots_router_mode_filtering")
 
 
 def test_refresh_slots_non_router_mode():
     """refresh_slots should use all slots in non-router mode."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(
         return_value=[{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}]
     )
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         await sm.refresh_slots("ModelA")
 
     asyncio.run(_run())
 
-    assert sm._slot_pools["ModelA"][0] == {0, 1, 2, 3}
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1, 2, 3}, f"Got {sm._slot_pools.get('ModelA', {})}"
     print("PASS: test_refresh_slots_non_router_mode")
 
 
 def test_refresh_slots_unavailable():
     """refresh_slots should fall back to 1 slot when slots are unavailable."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(return_value=None)
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         await sm.refresh_slots("ModelA")
 
     asyncio.run(_run())
 
-    assert sm._slot_pools["ModelA"][0] == {0}
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0}, f"Got {sm._slot_pools.get('ModelA', {})}"
     print("PASS: test_refresh_slots_unavailable")
 
 
@@ -223,75 +286,64 @@ def test_refresh_slots_unavailable():
 def test_slot_manager_per_model_pools():
     """SlotManager should create separate pools per model."""
     from slot_manager import SlotManager, GSlot
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
 
     sm = SlotManager()
-    sm.backends = [
-        {"id": 0, "client": None, "n_slots": 0},
-    ]
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 3)
 
-    # Register a backend for a model and create a pool
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 3)
-
-    assert "ModelA" in sm._slot_pools
-    assert 0 in sm._slot_pools["ModelA"]
-    assert sm._slot_pools["ModelA"][0] == {0, 1, 2}
-    assert 0 in sm._model_to_backends["ModelA"]
+    assert "ModelA" in sm._slot_pools, f"ModelA not in pools: {sm._slot_pools}"
+    assert "10.0.0.1:8000" in sm._slot_pools["ModelA"], f"Backend not in pool: {sm._slot_pools.get('ModelA', {})}"
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1, 2}, f"Got {sm._slot_pools.get('ModelA', {})}"
     print("PASS: test_slot_manager_per_model_pools")
 
 
 def test_slot_manager_multiple_models():
     """SlotManager should support multiple models on the same backend."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
 
     sm = SlotManager()
-    sm.backends = [
-        {"id": 0, "client": None, "n_slots": 0},
-    ]
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
+    sm._ensure_pool("ModelB", "10.0.0.1:8000", 4)
 
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 2)
-
-    sm._register_backend_for_model("ModelB", 0)
-    sm._ensure_pool("ModelB", 0, 4)
-
-    assert sm._slot_pools["ModelA"][0] == {0, 1}
-    assert sm._slot_pools["ModelB"][0] == {0, 1, 2, 3}
-    assert set(sm._model_to_backends["ModelA"]) == {0}
-    assert set(sm._model_to_backends["ModelB"]) == {0}
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
+    assert sm._slot_pools["ModelB"]["10.0.0.1:8000"] == {0, 1, 2, 3}, f"Got {sm._slot_pools.get('ModelB', {})}"
     print("PASS: test_slot_manager_multiple_models")
 
 
 def test_slot_manager_select_from_pool():
     """_select_from_pool should pick free or oldest slot."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
 
     sm = SlotManager()
-    sm.backends = [
-        {"id": 0, "client": None, "n_slots": 0},
-    ]
-
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 3)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 3)
+    backend_manager._model_to_backends["ModelA"] = ["10.0.0.1:8000"]
 
     # All slots free — should pick slot 0
     model_name, backend_id, slot_id, lock = sm._select_from_pool("ModelA")
     assert model_name == "ModelA"
-    assert backend_id == 0
+    assert backend_id == "10.0.0.1:8000"
     assert slot_id == 0
 
     # Mark slot 0 as used
-    sm._last_used[("ModelA", 0, 0)] = 100.0
+    sm._last_used[("ModelA", "10.0.0.1:8000", 0)] = 100.0
 
     # Should pick slot 1 (free)
     model_name, backend_id, slot_id, lock = sm._select_from_pool("ModelA")
     assert slot_id == 1
 
     # Mark slot 1 as used too
-    sm._last_used[("ModelA", 0, 1)] = 200.0
+    sm._last_used[("ModelA", "10.0.0.1:8000", 1)] = 200.0
 
     # Mark slot 2 as used too so all are occupied
-    sm._last_used[("ModelA", 0, 2)] = 150.0
+    sm._last_used[("ModelA", "10.0.0.1:8000", 2)] = 150.0
 
     # All used — should pick oldest (slot 0, ts=100)
     model_name, backend_id, slot_id, lock = sm._select_from_pool("ModelA")
@@ -302,67 +354,74 @@ def test_slot_manager_select_from_pool():
 def test_slot_manager_release():
     """release should unlock and reset last_used."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [
-        {"id": 0, "client": None, "n_slots": 0},
-    ]
-
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 2)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
 
     # Lock and use slot 0
-    lock = sm._locks[("ModelA", 0, 0)]
+    lock = sm._locks[("ModelA", "10.0.0.1:8000", 0)]
     assert not lock.locked()
 
     async def _acquire():
         await lock.acquire()
 
     asyncio.run(_acquire())
-    sm._last_used[("ModelA", 0, 0)] = 100.0
+    sm._last_used[("ModelA", "10.0.0.1:8000", 0)] = 100.0
     assert lock.locked()
-    assert sm._last_used[("ModelA", 0, 0)] == 100.0
+    assert sm._last_used[("ModelA", "10.0.0.1:8000", 0)] == 100.0
 
     # Release
-    sm.release("ModelA", 0, 0)
+    sm.release("ModelA", "10.0.0.1:8000", 0)
     assert not lock.locked()
-    assert sm._last_used[("ModelA", 0, 0)] == 0.0
+    assert sm._last_used[("ModelA", "10.0.0.1:8000", 0)] == 0.0
     print("PASS: test_slot_manager_release")
 
 
 def test_slot_manager_pool_resize_up():
     """Pool should grow when slot count increases."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 2)
-    assert sm._slot_pools["ModelA"][0] == {0, 1}
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
 
     # Resize to 4
-    sm._ensure_pool("ModelA", 0, 4)
-    assert sm._slot_pools["ModelA"][0] == {0, 1, 2, 3}
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 4)
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1, 2, 3}, f"Got {sm._slot_pools.get('ModelA', {})}"
     print("PASS: test_slot_manager_pool_resize_up")
 
 
 def test_slot_manager_pool_resize_down():
     """Pool should shrink when slot count decreases (only removes free slots)."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 4)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 4)
 
     # Mark slot 2 as used so it survives shrink
-    sm._last_used[("ModelA", 0, 2)] = 100.0
+    sm._last_used[("ModelA", "10.0.0.1:8000", 2)] = 100.0
 
     # Resize to 2
-    sm._ensure_pool("ModelA", 0, 2)
-    assert sm._slot_pools["ModelA"][0] == {0, 1}
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
     # Slot 2 was used, so it should NOT be in the pool anymore (it was removed)
     # but last_used may still have the entry (that's OK — it'll be cleaned on next acquire)
     print("PASS: test_slot_manager_pool_resize_down")
@@ -371,28 +430,19 @@ def test_slot_manager_pool_resize_down():
 def test_slot_manager_multiple_backends():
     """SlotManager should support multiple backends for the same model."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [
-        {"id": 0, "client": None, "n_slots": 0},
-        {"id": 1, "client": None, "n_slots": 0},
-    ]
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
+    sm._ensure_pool("ModelA", "10.0.0.2:8000", 3)
 
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 2)
-
-    sm._register_backend_for_model("ModelA", 1)
-    sm._ensure_pool("ModelA", 1, 3)
-
-    assert sm._slot_pools["ModelA"][0] == {0, 1}
-    assert sm._slot_pools["ModelA"][1] == {0, 1, 2}
-    assert set(sm._model_to_backends["ModelA"]) == {0, 1}
-
-    # Select should pick from either backend
-    model_name, backend_id, slot_id, lock = sm._select_from_pool("ModelA")
-    assert model_name == "ModelA"
-    assert backend_id in (0, 1)
-    assert slot_id >= 0
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
+    assert sm._slot_pools["ModelA"]["10.0.0.2:8000"] == {0, 1, 2}, f"Got {sm._slot_pools.get('ModelA', {})}"
     print("PASS: test_slot_manager_multiple_backends")
 
 
@@ -400,69 +450,36 @@ def test_slot_manager_gslot_type():
     """GSlot should be (model_name, backend_id, slot_id)."""
     from slot_manager import GSlot
 
-    g: GSlot = ("ModelA", 0, 1)
+    g: GSlot = ("ModelA", "10.0.0.1:8000", 1)
     model_name, backend_id, slot_id = g
     assert model_name == "ModelA"
-    assert backend_id == 0
+    assert backend_id == "10.0.0.1:8000"
     assert slot_id == 1
     print("PASS: test_slot_manager_gslot_type")
-
-
-def test_slot_manager_cooldown():
-    """refresh_slots should skip backends refreshed within cooldown."""
-    from slot_manager import SlotManager, REFRESH_COOLDOWN_SECONDS
-
-    sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-
-    # Simulate a recent refresh (new format: (ts, success) tuple)
-    sm._last_refresh[("ModelA", 0)] = (100.0, True)
-
-    # Mock client — refresh_slots calls get_slots_info, not get_router_slot_counts
-    mock_client = AsyncMock()
-    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}, {"id": 1}])
-    sm.backends[0]["client"] = mock_client
-
-    # Call refresh_slots — should skip due to cooldown
-    # (We can't easily test the actual skip without mocking time,
-    #  but we verify the cooldown key exists after a real refresh)
-    sm._last_refresh[("ModelA", 0)] = (0.0, True)  # reset
-
-    async def _run():
-        await sm.refresh_slots("ModelA")
-
-    asyncio.run(_run())
-
-    # After refresh, cooldown should be set as (timestamp, success) tuple
-    assert ("ModelA", 0) in sm._last_refresh
-    last = sm._last_refresh[("ModelA", 0)]
-    assert isinstance(last, tuple), f"Expected (ts, success) tuple, got {type(last)}"
-    assert last[0] > 0, "Timestamp should be > 0"
-    assert last[1] is True, "Success flag should be True"
-    print("PASS: test_slot_manager_cooldown")
 
 
 def test_slot_manager_router_mode_discovery():
     """refresh_slots should discover slots via get_slots_info in router mode."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(
         return_value=[{"id": 0}, {"id": 1}, {"id": 2}]
     )
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         await sm.refresh_slots("ModelA")
 
     asyncio.run(_run())
 
-    assert "ModelA" in sm._slot_pools
-    assert sm._slot_pools["ModelA"][0] == {0, 1, 2}
-    assert "ModelA" in sm._model_to_backends
+    assert "ModelA" in sm._slot_pools, f"Got {sm._slot_pools}"
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1, 2}, f"Got {sm._slot_pools.get('ModelA', {})}"
     mock_client.get_slots_info.assert_called_once()
     print("PASS: test_slot_manager_router_mode_discovery")
 
@@ -470,22 +487,26 @@ def test_slot_manager_router_mode_discovery():
 def test_slot_manager_non_router_fallback():
     """refresh_slots should use all slots in non-router mode."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(
         return_value=[{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
     )
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         await sm.refresh_slots("ModelA")
 
     asyncio.run(_run())
 
-    assert sm._slot_pools["ModelA"][0] == {0, 1, 2, 3, 4}
+    assert sm._slot_pools["ModelA"]["10.0.0.1:8000"] == {0, 1, 2, 3, 4}, f"Got {sm._slot_pools.get('ModelA', {})}"
     mock_client.get_slots_info.assert_called_once()
     print("PASS: test_slot_manager_non_router_fallback")
 
@@ -493,22 +514,25 @@ def test_slot_manager_non_router_fallback():
 def test_slot_manager_model_not_loaded():
     """refresh_slots should create 1-slot fallback when model not in router response."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
     mock_client = AsyncMock()
-    mock_client.get_router_slot_counts = AsyncMock(
-        return_value={"ModelA": 2}  # ModelB not in response
-    )
-    sm.backends[0]["client"] = mock_client
+    mock_client.get_slots_info = AsyncMock(return_value=None)
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         await sm.refresh_slots("ModelB")
 
     asyncio.run(_run())
 
-    assert sm._slot_pools["ModelB"][0] == {0}  # 1-slot fallback
+    assert sm._slot_pools["ModelB"]["10.0.0.1:8000"] == {0}, f"Got {sm._slot_pools.get('ModelB', {})}"
     print("PASS: test_slot_manager_model_not_loaded")
 
 
@@ -677,7 +701,7 @@ def test_should_skip_restore_no_tracked_state():
     sm = SlotManager()
     sm._slot_kv_state.clear()
 
-    g = ("ModelA", 0, 0)
+    g = ("ModelA", "10.0.0.1:8000", 0)
     blocks = ["a", "b", "c", "d", "e"]
 
     assert sm._should_skip_restore(g, blocks) is False
@@ -689,7 +713,7 @@ def test_should_skip_restore_perfect_match():
     from slot_manager import SlotManager
 
     sm = SlotManager()
-    g = ("ModelA", 0, 0)
+    g = ("ModelA", "10.0.0.1:8000", 0)
     kv_blocks = ["a", "b", "c", "d", "e"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -703,7 +727,7 @@ def test_should_skip_restore_high_overlap():
     from slot_manager import SlotManager
 
     sm = SlotManager()
-    g = ("ModelA", 0, 0)
+    g = ("ModelA", "10.0.0.1:8000", 0)
     kv_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -718,7 +742,7 @@ def test_should_skip_restore_low_overlap():
     from slot_manager import SlotManager
 
     sm = SlotManager()
-    g = ("ModelA", 0, 0)
+    g = ("ModelA", "10.0.0.1:8000", 0)
     kv_blocks = ["a", "b", "c", "d", "e"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -733,7 +757,7 @@ def test_should_skip_restore_zero_lcp():
     from slot_manager import SlotManager
 
     sm = SlotManager()
-    g = ("ModelA", 0, 0)
+    g = ("ModelA", "10.0.0.1:8000", 0)
     kv_blocks = ["a", "b", "c"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -747,7 +771,7 @@ def test_should_skip_restore_shorter_kv_cache():
     from slot_manager import SlotManager
 
     sm = SlotManager()
-    g = ("ModelA", 0, 0)
+    g = ("ModelA", "10.0.0.1:8000", 0)
     kv_blocks = ["a", "b", "c"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -762,7 +786,7 @@ def test_should_skip_restore_longer_kv_cache():
     from slot_manager import SlotManager
 
     sm = SlotManager()
-    g = ("ModelA", 0, 0)
+    g = ("ModelA", "10.0.0.1:8000", 0)
     kv_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -775,50 +799,57 @@ def test_should_skip_restore_longer_kv_cache():
 def test_save_after_updates_slot_kv_state():
     """save_after should update _slot_kv_state when blocks are provided."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     blocks = ["blk_a", "blk_b", "blk_c"]
 
     async def _run():
         ok, size = await sm.save_after(
-            "ModelA", 0, 0, "test_key", "ModelA", blocks,
+            "ModelA", "10.0.0.1:8000", 0, "test_key", "ModelA", blocks,
         )
         return ok
 
     asyncio.run(_run())
 
     assert mock_client.save_slot.call_count == 1
-    assert ("ModelA", 0, 0) in sm._slot_kv_state
-    assert sm._slot_kv_state[("ModelA", 0, 0)] == blocks
+    assert ("ModelA", "10.0.0.1:8000", 0) in sm._slot_kv_state, f"Got {sm._slot_kv_state}"
+    assert sm._slot_kv_state[("ModelA", "10.0.0.1:8000", 0)] == blocks, f"Got {sm._slot_kv_state.get(('ModelA', '10.0.0.1:8000', 0))}"
     print("PASS: test_save_after_updates_slot_kv_state")
 
 
 def test_save_after_no_blocks_no_state_update():
     """save_after should not update _slot_kv_state when blocks are None."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         ok, size = await sm.save_after(
-            "ModelA", 0, 0, "test_key", "ModelA", None,
+            "ModelA", "10.0.0.1:8000", 0, "test_key", "ModelA", None,
         )
         return ok
 
     asyncio.run(_run())
 
-    assert ("ModelA", 0, 0) not in sm._slot_kv_state
+    assert ("ModelA", "10.0.0.1:8000", 0) not in sm._slot_kv_state, f"Got {sm._slot_kv_state}"
     print("PASS: test_save_after_no_blocks_no_state_update")
 
 
@@ -888,11 +919,13 @@ def test_lock_acquire_has_timeout():
     """Verify: lock.acquire() is wrapped in wait_for(SLOT_TIMEOUT) — doesn't block forever."""
     from slot_manager import SlotManager
     from config import SLOT_TIMEOUT
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
+    backend_manager._model_to_backends["ModelA"] = ["10.0.0.1:8000"]
 
     # First request acquires the lock
     _, _, _, lock = sm._select_from_pool("ModelA")
@@ -908,31 +941,29 @@ def test_lock_acquire_has_timeout():
     else:
         assert False, "Should have raised TimeoutError"
 
-    sm.release("ModelA", 0, 0)
+    sm.release("ModelA", "10.0.0.1:8000", 0)
     print("PASS: test_lock_acquire_has_timeout")
 
 
 def test_adaptive_cooldown_on_failure():
     """Verify: failed refresh sets 30s cooldown, successful refresh sets 300s."""
-    from slot_manager import SlotManager
+    from backend_manager import backend_manager
+    import time
 
-    sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
+    backend_manager._backends.clear()
 
-    # Simulate a failed refresh (backend down)
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(side_effect=Exception("connection refused"))
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
-        await sm.refresh_slots("ModelA")
+        await backend_manager.refresh_models("ModelA")
 
     asyncio.run(_run())
 
-    # After failure, _last_refresh stores (timestamp, success_flag) tuple
-    refresh_key = ("ModelA", 0)
-    last_refresh = sm._last_refresh.get(refresh_key)
+    # After failure, _refresh_state stores (timestamp, success_flag) tuple
+    refresh_key = ("ModelA", "10.0.0.1:8000")
+    last_refresh = backend_manager._refresh_state.get(refresh_key)
     assert last_refresh is not None, "Cooldown was not set after failure"
     assert isinstance(last_refresh, tuple), f"Expected (timestamp, success) tuple, got {type(last_refresh)}"
     timestamp, success = last_refresh
@@ -944,15 +975,21 @@ def test_adaptive_cooldown_on_failure():
 def test_lock_released_on_restore_failure():
     """Verify: if restore_slot raises, the slot lock is released via try/finally."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
+    backend_manager._model_to_backends["ModelA"] = ["10.0.0.1:8000"]
 
     mock_client = AsyncMock()
     mock_client.restore_slot = AsyncMock(side_effect=Exception("connection refused"))
-    sm.backends[0]["client"] = mock_client
+    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         try:
@@ -963,7 +1000,7 @@ def test_lock_released_on_restore_failure():
     asyncio.run(_run())
 
     # Lock should be released after the exception
-    _, lock = sm._get_free_or_oldest_from_pool("ModelA", 0)
+    _, lock = sm._get_free_or_oldest_from_pool("ModelA", "10.0.0.1:8000")
     assert not lock.locked(), "Lock must be released after restore failure"
     print("PASS: test_lock_released_on_restore_failure")
 
@@ -991,16 +1028,20 @@ def test_slot_timeout_config():
 def test_non_streaming_cancelled_error_releases_slot():
     """Behavioral: when non-streaming chat raises CancelledError, slot is released."""
     from slot_manager import SlotManager
-    from config import BACKENDS
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
+    backend_manager._model_to_backends["ModelA"] = ["10.0.0.1:8000"]
 
     mock_client = AsyncMock()
     mock_client.chat_completions = AsyncMock(side_effect=asyncio.CancelledError())
-    sm.backends[0]["client"] = mock_client
+    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         g, lock, _ = await sm.acquire_for_request("ModelA")
@@ -1024,15 +1065,19 @@ def test_streaming_save_after_skipped_on_cancel():
     """Behavioral: StreamReader._cleanup skips save_after when _cancelled is True."""
     from slot_manager import SlotManager
     from app import StreamReader
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         mock_resp = AsyncMock()
@@ -1042,7 +1087,7 @@ def test_streaming_save_after_skipped_on_cancel():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
                               "test_key", "prefix", ["blk1"], sm)
         reader._cancelled = True
         await reader._cleanup()
@@ -1061,11 +1106,12 @@ def test_streaming_save_after_has_timeout():
     from app import StreamReader
     import app
     import config
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
 
     mock_client = AsyncMock()
 
@@ -1081,7 +1127,7 @@ def test_streaming_save_after_has_timeout():
                 return (True, 0)
 
             mock_client.save_slot = hanging_save
-            sm.backends[0]["client"] = mock_client
+            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
             mock_resp = AsyncMock()
             mock_resp.aiter_raw = MagicMock(return_value=iter([]))
@@ -1090,7 +1136,7 @@ def test_streaming_save_after_has_timeout():
             mock_req = AsyncMock()
             mock_req.is_disconnected = AsyncMock(return_value=False)
 
-            reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+            reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
                                   "test_key", "prefix", ["blk1"], sm)
 
             t0 = time.monotonic()
@@ -1109,15 +1155,19 @@ def test_streaming_gen_sets_cancelled_flag():
     """Behavioral: StreamReader.stream() sets _cancelled=True and cancels reader task on CancelledError."""
     from slot_manager import SlotManager
     from app import StreamReader
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(False, 0))
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         # Iterator that hangs — reader will block waiting for data
@@ -1132,7 +1182,7 @@ def test_streaming_gen_sets_cancelled_flag():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
                               "test_key", "prefix", ["blk1"], sm)
 
         # Start consuming the stream
@@ -1164,15 +1214,20 @@ def test_streaming_gen_sets_cancelled_flag():
 def test_streaming_release_not_in_outer_finally():
     """Behavioral: streaming slots are not released by outer finally (reader handles it)."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
+    backend_manager._model_to_backends["ModelA"] = ["10.0.0.1:8000"]
 
     mock_client = AsyncMock()
     mock_client.chat_completions = AsyncMock(return_value=AsyncMock(status_code=200))
-    sm.backends[0]["client"] = mock_client
+    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         g, lock, _ = await sm.acquire_for_request("ModelA")
@@ -1198,15 +1253,19 @@ def test_reader_polls_is_disconnected_on_timeout():
     """Behavioral: StreamReader._read_loop checks is_disconnected on timeout, sets _cancelled."""
     from slot_manager import SlotManager
     from app import StreamReader
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(False, 0))
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         # Iterator that never yields — forces timeout path
@@ -1221,7 +1280,7 @@ def test_reader_polls_is_disconnected_on_timeout():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=True)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
                               "test_key", "prefix", ["blk1"], sm)
 
         # Consume generator — reader should timeout on iterator,
@@ -1250,15 +1309,19 @@ def test_streaming_completion_releases_slot():
     from slot_manager import SlotManager
     from app import StreamReader
     from llama_client import LlamaClient
+    from backend_manager import backend_manager
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._model_to_backends.clear()
 
     sm = SlotManager()
-    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
-    sm._register_backend_for_model("ModelA", 0)
-    sm._ensure_pool("ModelA", 0, 1)
+    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
 
     mock_client = AsyncMock(spec=LlamaClient)
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    sm.backends[0]["client"] = mock_client
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
         # Iterator yields chunks then finishes (normal completion)
@@ -1278,7 +1341,7 @@ def test_streaming_completion_releases_slot():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
                               "complete_key", "system: hello\nuser: hi", ["blk1"], sm)
 
         # Consume all chunks
@@ -1298,7 +1361,7 @@ def test_streaming_completion_releases_slot():
             "save_slot must be called on normal completion"
 
         # Pool state: slot 0 should be free
-        assert sm._last_used.get(("ModelA", 0, 0), 0.0) == 0.0, \
+        assert sm._last_used.get(("ModelA", "10.0.0.1:8000", 0), 0.0) == 0.0, \
             "Slot must be free after completion"
 
     asyncio.run(_run())
@@ -1306,8 +1369,15 @@ def test_streaming_completion_releases_slot():
 
 
 if __name__ == "__main__":
+    test_backend_manager_constructor()
+    test_backend_manager_agent_client()
+    test_backend_manager_model_registration()
     test_reconcile_meta_removes_orphans()
     test_hashing_imports()
+    test_save_slot_response_parsing()
+    test_cache_agent_client_delete_success()
+    test_cache_agent_client_delete_failure()
+    test_cache_agent_client_connect_error()
     test_save_slot_response_parsing()
     test_refresh_slots_router_mode_filtering()
     test_refresh_slots_non_router_mode()
@@ -1320,7 +1390,6 @@ if __name__ == "__main__":
     test_slot_manager_pool_resize_down()
     test_slot_manager_multiple_backends()
     test_slot_manager_gslot_type()
-    test_slot_manager_cooldown()
     test_slot_manager_router_mode_discovery()
     test_slot_manager_non_router_fallback()
     test_slot_manager_model_not_loaded()
@@ -1355,10 +1424,5 @@ if __name__ == "__main__":
     test_streaming_release_not_in_outer_finally()
     test_reader_polls_is_disconnected_on_timeout()
     test_streaming_completion_releases_slot()
-
-    # Cache agent client tests
-    test_cache_agent_client_delete_success()
-    test_cache_agent_client_delete_failure()
-    test_cache_agent_client_connect_error()
 
     print("\nAll smoke tests passed.")

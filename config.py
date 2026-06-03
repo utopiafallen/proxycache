@@ -60,6 +60,9 @@ KV_CACHE_SKIP_THRESHOLD = float(os.getenv("KV_CACHE_SKIP_THRESHOLD", "0.9"))
 # because chat completions can take minutes, but slot operations should fail fast
 SLOT_TIMEOUT = float(os.getenv("SLOT_TIMEOUT", "30"))
 
+# Cooldown between slot refresh attempts (seconds) — 300s success, 30s failure
+REFRESH_COOLDOWN_SECONDS = int(os.getenv("REFRESH_COOLDOWN_SECONDS", "300"))
+
 # Logs
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(

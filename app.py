@@ -41,10 +41,11 @@ from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS,
                     SLOT_TIMEOUT)
 
 import hashing as hs
-from llama_client import LlamaClient
-from slot_manager import SlotManager, GSlot
+from slot_manager import SlotManager
 
 log = logging.getLogger(__name__)
+
+from backend_manager import backend_manager
 
 ACQUIRE_TIMEOUT = 60.0
 STREAM_QUEUE_SIZE = 16
@@ -55,13 +56,9 @@ app = FastAPI(title="Simple KV Proxy")
 
 @app.on_event("startup")
 async def startup():
-    clients = [LlamaClient(be["url"]) for be in BACKENDS]
-
     sm = SlotManager()
-    sm.set_clients(clients)
     sm.init_from_disk(CACHE_DIR)
 
-    app.state.clients = clients
     app.state.sm = sm
     app.state.executor = ThreadPoolExecutor(max_workers=2)
     log.info("app_start n_backends=%d port=%d backends=%s", len(BACKENDS), PORT,
@@ -81,23 +78,21 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    clients: List[LlamaClient] = getattr(app.state, "clients", [])
     executor = getattr(app.state, "executor", None)
-    if clients:
-        await asyncio.gather(*(c.close() for c in clients))
+    await backend_manager.close()
     if executor:
         executor.shutdown(wait=False)
 
 
 @app.get("/v1/models")
 async def models():
-    resp = await app.state.clients[0].client.get("/v1/models")
+    resp = await backend_manager.get_client(backend_manager.first_key()).client.get("/v1/models")
     return resp.json()
 
 
 class StreamReader:
     def __init__(self, resp: httpx.Response, req: Request,
-                 model_name: str, backend_id: int, slot_id: int,
+                 model_name: str, backend_id: str, slot_id: int,
                  key: str, prefix: str, blocks: List[str],
                  sm: SlotManager):
         self.resp = resp
@@ -131,10 +126,10 @@ class StreamReader:
 
     async def _read_loop(self):
         status, headers = self._log_response_info()
-        log.info("stream_reader_start model=%s be=%d slot=%d key=%s status=%s",
+        log.info("stream_reader_start model=%s be=%s slot=%d key=%s status=%s",
                  self.model_name, self.backend_id, self.slot_id, self.key_short,
                  status)
-        log.info("stream_reader_headers model=%s be=%d slot=%d key=%s headers=%s",
+        log.info("stream_reader_headers model=%s be=%s slot=%d key=%s headers=%s",
                  self.model_name, self.backend_id, self.slot_id, self.key_short,
                  headers)
         iterator = self.resp.aiter_raw()
@@ -150,7 +145,7 @@ class StreamReader:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if self._disconnect_event.is_set():
-                    log.warning("read_loop_client_disconnected model=%s be=%d slot=%d key=%s",
+                    log.warning("read_loop_client_disconnected model=%s be=%s slot=%d key=%s",
                                 self.model_name, self.backend_id, self.slot_id, self.key_short)
                     for t in pending:
                         t.cancel()
@@ -164,7 +159,7 @@ class StreamReader:
                         client_ip = self.req.client.host if self.req.client else "-"
                         status, headers = self._log_response_info()
                         log.info(
-                            "stream_complete client_ip=%s model=%s be=%d slot=%d key=%s status=%s headers=%s chunks=%d bytes=%d",
+                            "stream_complete client_ip=%s model=%s be=%s slot=%d key=%s status=%s headers=%s chunks=%d bytes=%d",
                             client_ip, self.model_name, self.backend_id, self.slot_id, self.key_short,
                             status, headers,
                             chunks_received, total_bytes,
@@ -179,7 +174,7 @@ class StreamReader:
                             self.queue.put_nowait(chunk)
                             chunks_received += 1
                         except asyncio.QueueFull:
-                            log.warning("stream_queue_full model=%s be=%d slot=%d key=%s",
+                            log.warning("stream_queue_full model=%s be=%s slot=%d key=%s",
                                         self.model_name, self.backend_id, self.slot_id, self.key_short)
                             self._cancelled = True
                             self._disconnect_event.set()
@@ -187,7 +182,7 @@ class StreamReader:
                                 t.cancel()
                             break
                         except asyncio.CancelledError:
-                            log.warning("stream_reader_cancelled_put model=%s be=%d slot=%d key=%s",
+                            log.warning("stream_reader_cancelled_put model=%s be=%s slot=%d key=%s",
                                         self.model_name, self.backend_id, self.slot_id, self.key_short)
                             raise
                 else:
@@ -208,7 +203,7 @@ class StreamReader:
             except Exception:
                 disconnected = False
             if disconnected:
-                log.warning("heartbeat_client_disconnected model=%s be=%d slot=%d key=%s",
+                log.warning("heartbeat_client_disconnected model=%s be=%s slot=%d key=%s",
                             self.model_name, self.backend_id, self.slot_id, self.key_short)
                 self._cancelled = True
                 self._disconnect_event.set()
@@ -230,13 +225,13 @@ class StreamReader:
                 timeout=SLOT_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            log.warning("save_after_timeout model=%s be=%d slot=%d",
+            log.warning("save_after_timeout model=%s be=%s slot=%d",
                         self.model_name, self.backend_id, self.slot_id)
         except asyncio.CancelledError:
-            log.warning("save_after_cancelled model=%s be=%d slot=%d",
+            log.warning("save_after_cancelled model=%s be=%s slot=%d",
                         self.model_name, self.backend_id, self.slot_id)
         except Exception as e:
-            log.warning("save_after_exception model=%s be=%d slot=%d: %s",
+            log.warning("save_after_exception model=%s be=%s slot=%d: %s",
                         self.model_name, self.backend_id, self.slot_id, e)
         if ok:
             try:
@@ -247,29 +242,29 @@ class StreamReader:
         return ok
 
     async def _cleanup(self):
-        log.info("cleanup_start model=%s be=%d slot=%d key=%s cancelled=%s stream_complete=%s",
+        log.info("cleanup_start model=%s be=%s slot=%d key=%s cancelled=%s stream_complete=%s",
                  self.model_name, self.backend_id, self.slot_id, self.key_short, self._cancelled, self._stream_complete)
         try:
             await self.resp.aclose()
-            log.info("cleanup_aclose_done model=%s be=%d slot=%d key=%s",
+            log.info("cleanup_aclose_done model=%s be=%s slot=%d key=%s",
                      self.model_name, self.backend_id, self.slot_id, self.key_short)
         except Exception as e:
-            log.info("cleanup_aclose_error model=%s be=%d slot=%d key=%s error=%s",
+            log.info("cleanup_aclose_error model=%s be=%s slot=%d key=%s error=%s",
                      self.model_name, self.backend_id, self.slot_id, self.key_short, e)
         ok = False
         if self._stream_complete:
-            log.info("cleanup_save_start model=%s be=%d slot=%d key=%s",
+            log.info("cleanup_save_start model=%s be=%s slot=%d key=%s",
                      self.model_name, self.backend_id, self.slot_id, self.key_short)
             ok = await self._save()
-            log.info("cleanup_save_done model=%s be=%d slot=%d key=%s ok=%s",
+            log.info("cleanup_save_done model=%s be=%s slot=%d key=%s ok=%s",
                      self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
         else:
-            log.info("cleanup_save_skipped model=%s be=%d slot=%d key=%s",
+            log.info("cleanup_save_skipped model=%s be=%s slot=%d key=%s",
                      self.model_name, self.backend_id, self.slot_id, self.key_short)
         self.sm.release(self.model_name, self.backend_id, self.slot_id)
-        log.info("cleanup_release_done model=%s be=%d slot=%d key=%s",
+        log.info("cleanup_release_done model=%s be=%s slot=%d key=%s",
                  self.model_name, self.backend_id, self.slot_id, self.key_short)
-        log.info("stream_reader_done model=%s be=%d slot=%d key=%s saved=%s",
+        log.info("stream_reader_done model=%s be=%s slot=%d key=%s saved=%s",
                  self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
 
     async def _reader(self):
@@ -277,10 +272,10 @@ class StreamReader:
             await self._read_loop()
             self.queue.put_nowait(None)
         except asyncio.CancelledError:
-            log.warning("stream_reader_cancelled model=%s be=%d slot=%d key=%s",
+            log.warning("stream_reader_cancelled model=%s be=%s slot=%d key=%s",
                         self.model_name, self.backend_id, self.slot_id, self.key_short)
         except Exception as e:
-            log.exception("stream_reader_error model=%s be=%d slot=%d key=%s: %s",
+            log.exception("stream_reader_error model=%s be=%s slot=%d key=%s: %s",
                           self.model_name, self.backend_id, self.slot_id, self.key_short, e)
 
     async def stream(self):
@@ -298,7 +293,7 @@ class StreamReader:
                     except Exception:
                         disconnected = False
                     if disconnected:
-                        log.warning("stream_client_disconnected model=%s be=%d slot=%d key=%s",
+                        log.warning("stream_client_disconnected model=%s be=%s slot=%d key=%s",
                                     self.model_name, self.backend_id, self.slot_id, self.key_short)
                         self._signal_done()
                         self._task.cancel()
@@ -328,7 +323,6 @@ class StreamReader:
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     sm: SlotManager = app.state.sm
-    clients: List[LlamaClient] = app.state.clients
 
     t0 = time.time()
     client_ip = req.client.host if req.client else "-"
@@ -398,10 +392,10 @@ async def chat(req: Request):
         )
 
     model_name, be_id, slot_id = g
-    client = clients[be_id]
+    client = backend_manager.get_client(be_id)
 
-    log.info("after_acquire client_ip=%s model=%s be=%d slot=%d restored=%s",
-              client_ip, model_name, be_id, slot_id, restored)
+    log.info("after_acquire client_ip=%s model=%s be=%s slot=%d restored=%s",
+             client_ip, model_name, be_id, slot_id, restored)
 
     body = dict(data)
     body["model"] = client_model
@@ -415,7 +409,7 @@ async def chat(req: Request):
     body["cache_prompt"] = True
 
     log.info(
-        "dispatch client_ip=%s model=%s be=%d slot=%d is_big=%s (restore_target=%s restored=%s)",
+        "dispatch client_ip=%s model=%s be=%s slot=%d is_big=%s (restore_target=%s restored=%s)",
         client_ip,
         model_name,
         be_id,
@@ -487,7 +481,7 @@ async def chat(req: Request):
                 json.dumps(out, indent=2, ensure_ascii=False),
             )
             log.info(
-                "json_done client_ip=%s model=%s be=%d slot=%d key=%s saved=%s is_big=%s dur_ms=%d",
+                "json_done client_ip=%s model=%s be=%s slot=%d key=%s saved=%s is_big=%s dur_ms=%d",
                 client_ip, model_name, be_id, slot_id,
                 key[:16],
                 ok,
@@ -497,7 +491,7 @@ async def chat(req: Request):
             return JSONResponse(content=out, status_code=200)
 
     except Exception as e:
-        log.exception("chat_error client_ip=%s model=%s be=%d slot=%d key=%s: %s",
+        log.exception("chat_error client_ip=%s model=%s be=%s slot=%d key=%s: %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
