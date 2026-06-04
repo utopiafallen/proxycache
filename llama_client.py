@@ -17,7 +17,7 @@ import logging
 from typing import Dict, Optional, Tuple
 from urllib.parse import quote
 
-from config import REQUEST_TIMEOUT, BACKEND_MODE, SLOT_TIMEOUT
+from config import REQUEST_TIMEOUT, BACKEND_MODE, SLOT_TIMEOUT, DEFAULT_N_CTX
 
 log = logging.getLogger(__name__)
 
@@ -117,10 +117,10 @@ class LlamaClient:
                 "raw": raw[:2048],
             }
 
-    async def save_slot(self, slot_id: int, basename: str, model_id: str = None) -> Tuple[bool, int]:
+    async def save_slot(self, slot_id: int, basename: str, model_name: str = None) -> Tuple[bool, int]:
         # JSON body: {"filename": "..."} — avoids 500 on some builds
-        if BACKEND_MODE == "llama-swap" and model_id:
-            path = f"/upstream/{quote(model_id, safe='')}/slots/{slot_id}"
+        if BACKEND_MODE == "llama-swap" and model_name:
+            path = f"/upstream/{quote(model_name, safe='')}/slots/{slot_id}"
         else:
             path = f"/slots/{slot_id}"
 
@@ -129,7 +129,7 @@ class LlamaClient:
                 self.client.post(
                     path,
                     params={"action": "save"},
-                    json={"filename": basename, "model": model_id},
+                    json={"filename": basename, "model": model_name},
                 ),
                 timeout=SLOT_TIMEOUT,
             )
@@ -156,9 +156,9 @@ class LlamaClient:
             n_written = 0
         return True, n_written
 
-    async def restore_slot(self, slot_id: int, basename: str, model_id: str = None) -> bool:
-        if BACKEND_MODE == "llama-swap" and model_id:
-            path = f"/upstream/{quote(model_id, safe='')}/slots/{slot_id}"
+    async def restore_slot(self, slot_id: int, basename: str, model_name: str = None) -> bool:
+        if BACKEND_MODE == "llama-swap" and model_name:
+            path = f"/upstream/{quote(model_name, safe='')}/slots/{slot_id}"
         else:
             path = f"/slots/{slot_id}"
 
@@ -167,7 +167,7 @@ class LlamaClient:
                 self.client.post(
                     path,
                     params={"action": "restore"},
-                    json={"filename": basename, "model": model_id},
+                    json={"filename": basename, "model": model_name},
                 ),
                 timeout=SLOT_TIMEOUT,
             )
@@ -234,7 +234,7 @@ class LlamaClient:
             log.warning("child_slots_fail url=%s err=%s", child_url, e)
             return None
 
-    async def get_slots_info(self, model_id: Optional[str] = None) -> Optional[list]:
+    async def get_slots_info(self, model_name: Optional[str] = None) -> Optional[list]:
         """GET /slots — returns list of slot dicts, or None on error.
 
         Fallback for router mode: when the main /slots endpoint returns
@@ -242,8 +242,8 @@ class LlamaClient:
         GET /models to find loaded child-process models, then call
         /slots on the relevant child's own port.
 
-        If model_id is provided, only queries that model's child process.
-        If model_id is None, queries all loaded child processes.
+        If model_name is provided, only queries that model's child process.
+        If model_name is None, queries all loaded child processes.
         """
         # Fast path: normal (non-router) mode
         try:
@@ -256,16 +256,16 @@ class LlamaClient:
                     "slots_400_router_mode base_url=%s — falling back to /models",
                     self.base_url,
                 )
-                return await self._get_slots_via_router_models(model_id)
+                return await self._get_slots_via_router_models(model_name)
             raise
         except Exception as e:
             log.warning("get_slots_info_fail base_url=%s err=%s", self.base_url, e)
             return None
 
-    async def _get_slots_via_router_models(self, model_id: Optional[str] = None) -> Optional[list]:
+    async def _get_slots_via_router_models(self, model_name: Optional[str] = None) -> Optional[list]:
         """Query slots from loaded child processes via GET /models.
 
-        If model_id is provided, only queries that model's child process.
+        If model_name is provided, only queries that model's child process.
         Otherwise queries all loaded child processes.
         """
         models = await self._parse_router_models()
@@ -274,12 +274,12 @@ class LlamaClient:
             return None
 
         # Filter to requested model if specified
-        if model_id:
-            models = [m for m in models if m["name"] == model_id]
+        if model_name:
+            models = [m for m in models if m["name"] == model_name]
             if not models:
                 log.warning(
                     "router_model_not_loaded model=%s available=%s",
-                    model_id, [m["name"] for m in models],
+                    model_name, [m["name"] for m in models],
                 )
                 return None
 
@@ -306,3 +306,53 @@ class LlamaClient:
             return all_slots
         log.warning("router_slots_empty base_url=%s", self.base_url)
         return None
+
+    async def discover_models(self) -> list[tuple[str, int]]:
+        """Discover models served by this backend. Returns [(name, n_ctx)]."""
+        # Router mode: GET /models
+        try:
+            resp = await self.client.get("/models")
+            data = resp.json()
+            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+                models = []
+                for entry in data["data"]:
+                    status = entry.get("status") or {}
+                    if status.get("value") != "loaded":
+                        continue
+                    name = entry.get("id", "")
+                    n_ctx = DEFAULT_N_CTX
+                    args = status.get("args") or []
+                    for i, arg in enumerate(args):
+                        if arg in ("-ctx", "-c", "--ctx-size") and i + 1 < len(args):
+                            try:
+                                n_ctx = int(args[i + 1])
+                                break
+                            except ValueError:
+                                pass
+                    if n_ctx == DEFAULT_N_CTX:
+                        loaded = status.get("loaded_info") or {}
+                        n_ctx = loaded.get("n_ctx") or loaded.get("n_ctx_train") or DEFAULT_N_CTX
+                    if name:
+                        models.append((name, int(n_ctx)))
+                if models:
+                    return models
+        except Exception:
+            pass
+
+        # Non-router mode: GET /v1/models
+        try:
+            resp = await self.client.get("/v1/models")
+            data = resp.json()
+            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+                for entry in data["data"]:
+                    meta = entry.get("meta")
+                    name = entry.get("id", "")
+                    n_ctx = DEFAULT_N_CTX
+                    if meta and isinstance(meta, dict):
+                        n_ctx = meta.get("n_ctx", DEFAULT_N_CTX)
+                    if name:
+                        return [(name, int(n_ctx))]
+        except Exception:
+            pass
+
+        return []

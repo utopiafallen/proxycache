@@ -38,7 +38,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
                     CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
-                    SLOT_TIMEOUT)
+                    SLOT_TIMEOUT, DEFAULT_N_CTX)
 
 import hashing as hs
 from slot_manager import SlotManager
@@ -78,9 +78,13 @@ async def startup():
         log.info("startup_sanity: %d meta files after reconcile, %d cache files on disk",
                  len(hs.scan_all_meta()), cache_files)
 
+    # Start liveness checker
+    await backend_manager.start_liveness_checker()
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    await backend_manager.stop_liveness_checker()
     executor = getattr(app.state, "executor", None)
     await backend_manager.close()
     if executor:
@@ -89,8 +93,13 @@ async def shutdown():
 
 @app.get("/v1/models")
 async def models():
-    resp = await backend_manager.get_client(backend_manager.first_key()).client.get("/v1/models")
-    return resp.json()
+    discovered = backend_manager._discovered_models
+    models_list = []
+    for name, info in discovered.items():
+        models_list.append({"id": name, "object": "model", "owned_by": "backend", "n_ctx": info.n_ctx})
+    min_ctx = min(m.n_ctx for m in discovered.values()) if discovered else DEFAULT_N_CTX
+    models_list.append({"id": "any", "object": "model", "owned_by": "proxycache", "n_ctx": min_ctx})
+    return {"data": models_list}
 
 
 class StreamReader:
@@ -223,7 +232,7 @@ class StreamReader:
             ok, _ = await asyncio.wait_for(
                 self.sm.save_after(
                     self.model_name, self.backend_id, self.slot_id,
-                    self.key, self.model_name, self.blocks,
+                    self.key, self.blocks,
                 ),
                 timeout=SLOT_TIMEOUT,
             )
@@ -334,72 +343,82 @@ async def chat(req: Request):
     messages: List[Dict] = data.get("messages") or []
     stream = bool(data.get("stream", False))
     client_model = data.get("model") or MODEL_ID
-    backend_model_id = client_model
-
-    prefix = hs.raw_prefix(messages)
-    full_for_key = backend_model_id + "\n" + prefix
-    key = hs.prefix_key_sha256(full_for_key)
-    blocks = hs.block_hashes_from_text(prefix, WORDS_PER_BLOCK)
-    n_words = len(hs.words_from_text(prefix))
-    is_big = n_words > BIG_THRESHOLD_WORDS
-
-    restore_key: Optional[str] = None
-    if is_big:
-        # Get the first backend for this model (will be refined during slot acquisition)
-        candidate_backends = backend_manager.get_backends_for_model(backend_model_id)
-        if candidate_backends:
-            first_backend = candidate_backends[0]
-            cand = hs.find_best_restore_candidate(
-                blocks,
-                WORDS_PER_BLOCK,
-                LCP_TH,
-                backend_model_id,
-                first_backend,
-            )
-        else:
-            cand = None
-        if cand:
-            restore_key, ratio = cand
-            log.info(
-                "restore_candidate basename=%s ratio=%.3f",
-                restore_key[:16],
-                ratio,
-            )
-        else:
-            log.info("restore_candidate none")
-    else:
-        log.info(
-            "small_request n_words=%d threshold=%d",
-            n_words,
-            BIG_THRESHOLD_WORDS,
-        )
-
-    log.info(
-        "chat_request client_ip=%s is_big=%s n_words=%d model=%s",
-        client_ip, is_big, n_words, backend_model_id,
-    )
 
     try:
+        # 1. Resolve model name
+        options = backend_manager.get_discovered_models(client_model)
+        if not options:
+            await backend_manager.discover_models()
+            options = backend_manager.get_discovered_models(client_model)
+            if not options:
+                return JSONResponse({"error": f"model '{client_model}' not found"}, status_code=400)
+
+        # 2. Validate prompt length (early reject with 400)
+        prefix = hs.raw_prefix(messages)
+        prompt_tokens = len(hs.words_from_text(prefix))
+        min_ctx = min(opt.n_ctx for opt in options)
+        if prompt_tokens >= min_ctx:
+            return JSONResponse(
+                {"error": f"prompt too long (tokens={prompt_tokens}, n_ctx={min_ctx})"},
+                status_code=400,
+            )
+
+        # 3. Hash prefix
+        blocks = hs.block_hashes_from_text(prefix, WORDS_PER_BLOCK)
+        is_big = prompt_tokens >= BIG_THRESHOLD_WORDS
+
+        # 4. Scan kv-meta across all backends for cache hits (cache-first)
+        restore_key = None
+        restore_backend = None
+        best_ratio = 0.0
+        canonical_name = None
+        key = None
+        if is_big:
+            for opt in options:
+                mk = hs.meta_key(opt.name, prefix)
+                for be_id in opt.backends:
+                    cand = hs.find_restore_candidate(mk, WORDS_PER_BLOCK, LCP_TH, blocks, be_id)
+                    if cand and cand[1] > best_ratio:
+                        best_ratio = cand[1]
+                        restore_key = mk
+                        restore_backend = be_id
+                        canonical_name = opt.name
+                        key = mk
+        # Fallback: use first option if no cache hit found
+        if canonical_name is None:
+            canonical_name = options[0].name
+            key = hs.meta_key(canonical_name, prefix)
+
+        log.info(
+            "chat_request client_ip=%s is_big=%s n_words=%d model=%s canonical=%s restore_key=%s restore_be=%s",
+            client_ip, is_big, prompt_tokens, client_model, canonical_name,
+            restore_key[:16] if restore_key else None,
+            restore_backend,
+        )
+
+        # 5. Build candidate backends list (fallback ONLY, cache backend excluded)
+        candidate_backends: list[tuple[str, str]] = []
+        if restore_backend:
+            for opt in options:
+                for be_id in opt.backends:
+                    if be_id != restore_backend:
+                        candidate_backends.append((be_id, opt.name))
+        else:
+            for opt in options:
+                for be_id in opt.backends:
+                    candidate_backends.append((be_id, opt.name))
+
+        # 6. Acquire slot (cache backend tried first via restore_info, then fallback)
+        restore_info: Optional[tuple[str, str]] = None
+        if restore_key and restore_backend:
+            restore_info = (restore_key, restore_backend)
         g, lock, restored = await asyncio.wait_for(
-            sm.acquire_for_request(
-                backend_model_id,
-                restore_key if is_big else None,
-                blocks if is_big else None,
-            ),
+            sm.acquire_for_request(candidate_backends, restore_info, blocks, prompt_tokens),
             timeout=ACQUIRE_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        log.error(
-            "acquire_timeout client_ip=%s is_big=%s restore_key=%s model=%s",
-            client_ip,
-            is_big,
-            restore_key[:16] if restore_key else None,
-            backend_model_id,
-        )
-        return JSONResponse(
-            {"error": "all slots busy, please retry later"},
-            status_code=503,
-        )
+        log.error("acquire_timeout client_ip=%s model=%s", client_ip, client_model)
+        return JSONResponse({"error": "all slots busy, please retry later"}, status_code=503)
 
     model_name, be_id, slot_id = g
     client = backend_manager.get_client(be_id)
@@ -407,8 +426,9 @@ async def chat(req: Request):
     log.info("after_acquire client_ip=%s model=%s be=%s slot=%d restored=%s",
              client_ip, model_name, be_id, slot_id, restored)
 
+    # Forward canonical name to backend
     body = dict(data)
-    body["model"] = client_model
+    body["model"] = canonical_name
     opts = dict(body.get("options") or {})
     opts["slot_id"] = slot_id
     opts["id_slot"] = slot_id
@@ -475,7 +495,7 @@ async def chat(req: Request):
             ok = False
             if is_big:
                 ok, _ = await sm.save_after(
-                    model_name, be_id, slot_id, key, backend_model_id, blocks,
+                    model_name, be_id, slot_id, key, blocks,
                 )
                 if ok:
                     hs.write_meta(
@@ -483,7 +503,7 @@ async def chat(req: Request):
                         prefix,
                         blocks,
                         WORDS_PER_BLOCK,
-                        backend_model_id,
+                        canonical_name,
                         be_id,
                     )
 

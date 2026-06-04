@@ -53,6 +53,9 @@ CACHE_DIR = os.getenv("CACHE_DIR", "")  # llama.cpp --slot-save-path directory
 CACHE_MAX_AGE_HOURS = int(os.getenv("CACHE_MAX_AGE_HOURS", "168"))  # 7 days default
 CACHE_MAX_SIZE_GB = float(os.getenv("CACHE_MAX_SIZE_GB", "25"))
 
+# Default context length used when backend doesn't report n_ctx
+DEFAULT_N_CTX = int(os.getenv("DEFAULT_N_CTX", "16384"))
+
 # KV cache skip threshold (0..1) — skip restore if slot KV cache matches >= this
 KV_CACHE_SKIP_THRESHOLD = float(os.getenv("KV_CACHE_SKIP_THRESHOLD", "0.9"))
 

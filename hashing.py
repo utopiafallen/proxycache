@@ -121,6 +121,40 @@ def prefix_key_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def meta_key(canonical_name: str, prefix: str) -> str:
+    """sha256(canonical_name + '\n' + prefix)"""
+    return prefix_key_sha256(canonical_name + "\n" + prefix)
+
+
+def find_restore_candidate(
+    meta_key_str: str,
+    wpb: int,
+    th: float,
+    req_blocks: List[str],
+    backend_key: str,
+) -> Optional[Tuple[str, float]]:
+    """Read meta file at {META_DIR}/{backend_key}/{meta_key_str}.meta.json,
+    compute LCP ratio, return (key, ratio) if >= threshold."""
+    path = meta_file_path(meta_key_str, backend_key)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        return None
+
+    cand_blocks = meta.get("blocks") or []
+    if int(meta.get("wpb") or 0) != wpb:
+        return None
+
+    lcp = lcp_blocks(req_blocks, cand_blocks)
+    denom = max(1, min(len(req_blocks), len(cand_blocks)))
+    ratio = lcp / denom
+
+    if ratio >= th:
+        return (meta_key_str, ratio)
+    return None
+
+
 def scan_all_meta(backend_key: Optional[str] = None) -> List[Dict]:
     if backend_key:
         search_dir = meta_dir(backend_key)

@@ -12,16 +12,26 @@ e.g. "http://10.0.0.1:8000" -> "10.0.0.1:8000"
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
-from config import BACKENDS, REFRESH_COOLDOWN_SECONDS
+from config import BACKENDS, REFRESH_COOLDOWN_SECONDS, DEFAULT_N_CTX
 from llama_client import LlamaClient
 from cache_agent_client import CacheAgentClient
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class DiscoveredModel:
+    name: str
+    n_ctx: int
+    backends: list[str]
+    total_slots: int
+    last_discovered: float
 
 
 @dataclass
@@ -43,8 +53,10 @@ class BackendManager:
     def __init__(self, backends_config: list[dict]):
         self._backends: dict[str, BackendInfo] = {}
         self._first_key: str | None = None
-        self._model_to_backends: dict[str, list[str]] = {}
         self._refresh_state: dict[tuple[str, str], tuple[float, bool]] = {}
+        self._discovered_models: dict[str, DiscoveredModel] = {}
+        self._backend_state: dict[str, bool] = {}
+        self._discovery_task: asyncio.Task | None = None
 
         for be in backends_config:
             url = be["url"].rstrip("/")
@@ -90,102 +102,174 @@ class BackendManager:
         for info in self._backends.values():
             await info.client.close()
 
-    # --- Model registration (internal) ---
+    # --- Model discovery ---
 
-    def _register_for_model(self, model_name: str, backend_key: str) -> None:
-        """Register a backend as serving a model (internal)."""
-        if model_name not in self._model_to_backends:
-            self._model_to_backends[model_name] = []
-        if backend_key not in self._model_to_backends[model_name]:
-            self._model_to_backends[model_name].append(backend_key)
+    async def discover_models(self) -> dict[str, DiscoveredModel]:
+        """Discover models across all backends. Returns merged registry.
+        Always performs fresh discovery. Result stored in _discovered_models.
+        """
+        all_discovered: dict[str, list[tuple[str, int]]] = {}
+        for backend_key in self.keys():
+            models = await self.get_client(backend_key).discover_models()
+            for name, n_ctx in models:
+                if name not in all_discovered:
+                    all_discovered[name] = []
+                all_discovered[name].append((backend_key, n_ctx))
 
-    def get_backends_for_model(self, model_name: str) -> list[str]:
-        return self._model_to_backends.get(model_name, [])
+        merged = {}
+        for name, entries in all_discovered.items():
+            backends = [be for be, _ in entries]
+            min_ctx = min(ctx for _, ctx in entries)
+            merged[name] = DiscoveredModel(
+                name=name, n_ctx=min_ctx, backends=backends,
+                total_slots=0,
+                last_discovered=time.time(),
+            )
+        self._discovered_models = merged
+        for name, info in merged.items():
+            log.info("discovered_model name=%s backends=%s n_ctx=%d",
+                     name, info.backends, info.n_ctx)
+        return merged
 
-    async def refresh_models(self, model_name: str) -> dict[str, int]:
-        """Query all backends for model slots.
+    def get_model_n_ctx(self, canonical_name: str) -> int:
+        if canonical_name in self._discovered_models:
+            return self._discovered_models[canonical_name].n_ctx
+        return DEFAULT_N_CTX
 
-        Returns {backend_key: n_slots} for backends that returned slot info.
-        Registers backends for the model on success (not on failure —
-        SlotManager handles the fallback).
+    def get_discovered_models(self, model_name: str) -> list[DiscoveredModel]:
+        """Resolve client model name to list of matching DiscoveredModel objects.
+        1. Exact match in _discovered_models
+        2. Substring match (case-insensitive)
+        3. 'any' -> all discovered models
+        """
+        if model_name == "any":
+            if not self._discovered_models:
+                return []
+            return list(self._discovered_models.values())
+
+        if model_name in self._discovered_models:
+            return [self._discovered_models[model_name]]
+
+        return [info for info in self._discovered_models.values()
+                if model_name.lower() in info.name.lower()]
+
+    async def refresh_slot_counts(self) -> dict[str, dict[str, int]]:
+        """Query all backends for slot counts. Returns {backend_key: {model_name: n_slots}}.
+        No longer registers models -- discover_models() handles that.
         Tracks cooldown per (model, backend): 300s after success, 30s after failure.
         """
         backend_keys = self.keys()
         log.info(
-            "refresh_models model=%s n_backends=%d known=%s",
-            model_name, len(backend_keys),
-            list(self._model_to_backends.get(model_name, [])),
+            "refresh_slot_counts n_backends=%d known_models=%d",
+            len(backend_keys), len(self._discovered_models),
         )
 
         if not backend_keys:
             log.error(
-                "refresh_models_no_backends model=%s — no backends configured",
-                model_name,
+                "refresh_slot_counts_no_backends — no backends configured",
             )
-            raise RuntimeError(f"No backends configured for model={model_name}")
+            raise RuntimeError("No backends configured")
 
-        slot_counts: dict[str, int] = {}
+        slot_counts: dict[str, dict[str, int]] = {}
         refreshed_any = False
 
         for backend_key in backend_keys:
             client = self.get_client(backend_key)
 
-            # Check cooldown — 30s after failure, 300s after success
-            refresh_key = (model_name, backend_key)
-            now = time.time()
-            last_ts, last_success = self._refresh_state.get(refresh_key, (0.0, True))
-            cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
-            if now - last_ts < cooldown:
-                log.debug("refresh_models_cooldown model=%s be=%s last=%.1f",
-                          model_name, backend_key, last_ts)
-                continue
+            # For each discovered model, check cooldown
+            for canonical_name in list(self._discovered_models.keys()):
+                refresh_key = (canonical_name, backend_key)
+                now = time.time()
+                last_ts, last_success = self._refresh_state.get(refresh_key, (0.0, True))
+                cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
+                if now - last_ts < cooldown:
+                    log.debug("refresh_slot_counts_cooldown model=%s be=%s last=%.1f",
+                              canonical_name, backend_key, last_ts)
+                    continue
 
-            # get_slots_info() handles both router and non-router modes internally
-            try:
-                slots = await client.get_slots_info(model_name)
-            except Exception as e:
-                log.warning(
-                    "refresh_models_get_slots_info_fail model=%s be=%s err=%s",
-                    model_name, backend_key, e,
-                )
-                slots = None
-
-            if slots and isinstance(slots, list):
-                # Filter by model name if router mode (slots have _router_model field)
-                if slots and isinstance(slots[0], dict) and "_router_model" in slots[0]:
-                    model_slots = [s for s in slots if s.get("_router_model") == model_name]
-                    n_slots = len(model_slots)
-                    log.info(
-                        "refresh_models model=%s be=%s slots=%d (router)",
-                        model_name, backend_key, n_slots,
+                try:
+                    slots = await client.get_slots_info(canonical_name)
+                except Exception as e:
+                    log.warning(
+                        "refresh_slot_counts_get_slots_info_fail model=%s be=%s err=%s",
+                        canonical_name, backend_key, e,
                     )
+                    slots = None
+
+                if slots and isinstance(slots, list):
+                    if slots and isinstance(slots[0], dict) and "_router_model" in slots[0]:
+                        model_slots = [s for s in slots if s.get("_router_model") == canonical_name]
+                        n_slots = len(model_slots)
+                        log.info(
+                            "refresh_slot_counts model=%s be=%s slots=%d (router)",
+                            canonical_name, backend_key, n_slots,
+                        )
+                    else:
+                        n_slots = len(slots)
+                        log.info(
+                            "refresh_slot_counts model=%s be=%s slots=%d (non-router)",
+                            canonical_name, backend_key, n_slots,
+                        )
+                    if backend_key not in slot_counts:
+                        slot_counts[backend_key] = {}
+                    slot_counts[backend_key][canonical_name] = n_slots
+                    self._refresh_state[refresh_key] = (now, True)
+                    refreshed_any = True
                 else:
-                    # Non-router mode: all slots belong to this model
-                    n_slots = len(slots)
-                    log.info(
-                        "refresh_models model=%s be=%s slots=%d (non-router)",
-                        model_name, backend_key, n_slots,
+                    log.warning(
+                        "refresh_slot_counts_model_not_loaded model=%s be=%s",
+                        canonical_name, backend_key,
                     )
-                self._register_for_model(model_name, backend_key)
-                slot_counts[backend_key] = n_slots
-                self._refresh_state[refresh_key] = (now, True)
-                refreshed_any = True
-            else:
-                # Slots unavailable (model not loaded yet or discovery failed)
-                log.warning(
-                    "refresh_models_model_not_loaded model=%s be=%s",
-                    model_name, backend_key,
-                )
-                self._refresh_state[refresh_key] = (now, False)
-                refreshed_any = True
+                    self._refresh_state[refresh_key] = (now, False)
+                    refreshed_any = True
 
         if not refreshed_any:
             log.warning(
-                "refresh_models_nothing_done model=%s — all backends skipped (cooldown or no client)",
-                model_name,
+                "refresh_slot_counts_nothing_done — all backends skipped (cooldown or no client)",
             )
 
+        # Update total_slots on each DiscoveredModel
+        for canonical_name, info in self._discovered_models.items():
+            total = sum(
+                slot_counts.get(be, {}).get(canonical_name, 0)
+                for be in info.backends
+            )
+            info.total_slots = total
+
         return slot_counts
+
+    # --- Liveness checker ---
+
+    async def start_liveness_checker(self):
+        self._discovery_task = asyncio.create_task(self._liveness_loop())
+
+    async def stop_liveness_checker(self):
+        if self._discovery_task:
+            self._discovery_task.cancel()
+            try:
+                await self._discovery_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _liveness_loop(self):
+        """Ping backends every 5s, trigger discovery on state change."""
+        while True:
+            await asyncio.sleep(5.0)
+            changed = False
+            for backend_key in self.keys():
+                client = self.get_client(backend_key)
+                is_up = False
+                try:
+                    await client.client.get("/health", timeout=2.0)
+                    is_up = True
+                except Exception:
+                    pass
+                old_state = self._backend_state.get(backend_key, False)
+                if is_up != old_state:
+                    self._backend_state[backend_key] = is_up
+                    changed = True
+            if changed:
+                await self.discover_models()
 
 
 # Module-level singleton
