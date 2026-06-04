@@ -70,7 +70,7 @@ class BackendManager:
             if self._first_key is None:
                 self._first_key = key
 
-        log.info("backend_manager n_backends=%d keys=%s",
+        log.info("Backend manager initialized with %d backends: %s",
                  len(self._backends), list(self._backends.keys()))
 
     # --- Accessors ---
@@ -127,7 +127,7 @@ class BackendManager:
             )
         self._discovered_models = merged
         for name, info in merged.items():
-            log.info("discovered_model name=%s backends=%s n_ctx=%d",
+            log.info("Discovered model '%s' on backends %s with n_ctx=%d",
                      name, info.backends, info.n_ctx)
         return merged
 
@@ -160,13 +160,13 @@ class BackendManager:
         """
         backend_keys = self.keys()
         log.info(
-            "refresh_slot_counts n_backends=%d known_models=%d",
+            "Refreshing slot counts: %d backends, %d known models",
             len(backend_keys), len(self._discovered_models),
         )
 
         if not backend_keys:
             log.error(
-                "refresh_slot_counts_no_backends — no backends configured",
+                "No backends configured — cannot refresh slot counts",
             )
             raise RuntimeError("No backends configured")
 
@@ -183,7 +183,7 @@ class BackendManager:
                 last_ts, last_success = self._refresh_state.get(refresh_key, (0.0, True))
                 cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
                 if now - last_ts < cooldown:
-                    log.debug("refresh_slot_counts_cooldown model=%s be=%s last=%.1f",
+                    log.debug("Skipping refresh for model '%s' on backend '%s': last refresh was %.1f seconds ago",
                               canonical_name, backend_key, last_ts)
                     continue
 
@@ -191,7 +191,7 @@ class BackendManager:
                     slots = await client.get_slots_info(canonical_name)
                 except Exception as e:
                     log.warning(
-                        "refresh_slot_counts_get_slots_info_fail model=%s be=%s err=%s",
+                        "Failed to get slot info for model '%s' on backend '%s': %s",
                         canonical_name, backend_key, e,
                     )
                     slots = None
@@ -201,13 +201,13 @@ class BackendManager:
                         model_slots = [s for s in slots if s.get("_router_model") == canonical_name]
                         n_slots = len(model_slots)
                         log.info(
-                            "refresh_slot_counts model=%s be=%s slots=%d (router)",
+                            "Model '%s' on backend '%s' has %d slots (router mode)",
                             canonical_name, backend_key, n_slots,
                         )
                     else:
                         n_slots = len(slots)
                         log.info(
-                            "refresh_slot_counts model=%s be=%s slots=%d (non-router)",
+                            "Model '%s' on backend '%s' has %d slots",
                             canonical_name, backend_key, n_slots,
                         )
                     if backend_key not in slot_counts:
@@ -217,7 +217,7 @@ class BackendManager:
                     refreshed_any = True
                 else:
                     log.warning(
-                        "refresh_slot_counts_model_not_loaded model=%s be=%s",
+                        "Model '%s' not loaded on backend '%s'",
                         canonical_name, backend_key,
                     )
                     self._refresh_state[refresh_key] = (now, False)
@@ -225,7 +225,7 @@ class BackendManager:
 
         if not refreshed_any:
             log.warning(
-                "refresh_slot_counts_nothing_done — all backends skipped (cooldown or no client)",
+                "No backends refreshed: all skipped due to cooldown or missing client",
             )
 
         # Update total_slots on each DiscoveredModel

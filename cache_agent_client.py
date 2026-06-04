@@ -43,12 +43,12 @@ class CacheAgentClient:
         try:
             resp = await self._client.post(url, params={"key": key})
         except Exception as e:
-            log.warning("cache_agent_error url=%s key=%s: %s",
+            log.warning("Cache agent error on %s for key %s: %s",
                         self.base_url, key[:16], e)
             return False
 
         if resp.status_code != 200:
-            log.warning("cache_agent_status=%d key=%s body=%s",
+            log.warning("Cache agent returned status %d for key %s: %s",
                         resp.status_code, key[:16], resp.text[:200])
             return False
 
@@ -70,14 +70,14 @@ class CacheAgentClient:
         try:
             resp = await self._client.get(url)
         except Exception as e:
-            log.warning("cache_agent_size_error url=%s key=%s: %s",
+            log.warning("Cache agent size check error on %s for key %s: %s",
                         self.base_url, key[:16], e)
             return None
 
         if resp.status_code == 404:
             return {"exists": False}
         if resp.status_code != 200:
-            log.warning("cache_agent_size_status=%d key=%s body=%s",
+            log.warning("Cache agent size check returned status %d for key %s: %s",
                         resp.status_code, key[:16], resp.text[:200])
             return None
 

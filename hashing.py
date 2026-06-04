@@ -87,7 +87,7 @@ def raw_prefix(messages: List[Dict]) -> str:
         if content:
             parts.append(content)
     text = "\n\n".join(parts).strip()
-    log.debug("raw_prefix len_chars=%d", len(text))
+    log.debug("Raw prefix: %d characters", len(text))
     return text
 
 
@@ -102,7 +102,7 @@ def block_hashes_from_text(text: str, wpb: int = WORDS_PER_BLOCK) -> List[str]:
         block = " ".join(words[i:i + wpb])
         h = hashlib.sha256(block.encode("utf-8")).hexdigest()
         hashes.append(h)
-    log.debug("block_hashes n_blocks=%d wpb=%d", len(hashes), wpb)
+    log.debug("Block hashes: %d blocks, %d words per block", len(hashes), wpb)
     return hashes
 
 
@@ -159,7 +159,7 @@ def scan_all_meta(backend_key: Optional[str] = None) -> List[Dict]:
     if backend_key:
         search_dir = meta_dir(backend_key)
         if not os.path.isdir(search_dir):
-            log.debug("scan_meta backend_dir_missing backend=%s", backend_key)
+            log.debug("Meta directory missing for backend '%s'", backend_key)
             return []
         files = sorted(
             glob.glob(os.path.join(search_dir, "*" + META_SUFFIX)),
@@ -179,8 +179,8 @@ def scan_all_meta(backend_key: Optional[str] = None) -> List[Dict]:
                 meta = json.load(fd)
                 metas.append(meta)
         except Exception as e:
-            log.warning("scan_meta_fail %s: %s", f, e)
-    log.debug("scan_meta n_found=%d", len(metas))
+            log.warning("Failed to read meta file %s: %s", f, e)
+    log.debug("Meta scan found %d entries", len(metas))
     return metas
 
 
@@ -304,7 +304,7 @@ async def reconcile_meta(meta_base: str, cache_dir: str, backend_keys: Optional[
                         if result and result.get("exists", False):
                             cache_exists = True
                     except Exception as e:
-                        log.warning("cache_agent_size_fail backend=%s key=%s: %s", backend_key, cachename, e)
+                        log.warning("Failed to check cache size via agent on backend '%s' for key %s: %s", backend_key, cachename, e)
                 elif cache_dir and os.path.isdir(cache_dir):
                     cache_path = os.path.join(cache_dir, cachename)
                     if os.path.exists(cache_path):
@@ -359,7 +359,7 @@ async def reconcile_meta(meta_base: str, cache_dir: str, backend_keys: Optional[
                     except OSError:
                         pass
 
-    log.info("Finished reconciling meta state with llama cache dir state")
+    log.info("Finished reconciling meta files with llama cache directory")
     return deleted
 
 

@@ -54,7 +54,7 @@ class SlotManager:
         # Per-slot KV cache block state — tracks hash blocks currently in each slot
         self._slot_kv_state: Dict[GSlot, List[str]] = {}
 
-        log.info("slot_manager max_age_hours=%d", CACHE_MAX_AGE_HOURS)
+        log.info("Cache entry expiry set to %d hours", CACHE_MAX_AGE_HOURS)
 
     async def _evict_cache_file(self, key: str, backend_id: str, log_msg: str, log_extra: str):
         """Delete a cache file via agent or local fallback.
@@ -116,8 +116,7 @@ class SlotManager:
                         continue
         total_files = sum(len(r) for r in self._cache_ring.values())
         total_bytes = sum(self._total_bytes.values())
-        log.info("init_from_disk: %d cache files, %.1f GB total",
-                  total_files, total_bytes / 1024**3)
+        log.info("Loaded %d cache files from disk, total %.1f GB", total_files, total_bytes / 1024**3)
 
     def _is_free(self, model_name: str, backend_id: str, slot_id: int) -> bool:
         return self._last_used.get((model_name, backend_id, slot_id), 0.0) == 0.0
@@ -151,7 +150,7 @@ class SlotManager:
                 self._locks[(model_name, backend_id, s)] = asyncio.Lock()
             self._slot_pools[key] = new_pool
             log.info(
-                "ensure_pool model=%s be=%s slots=%d",
+                "Created slot pool for model '%s' on backend '%s' with %d slots",
                 model_name, backend_id, n_slots,
             )
         else:
@@ -170,7 +169,7 @@ class SlotManager:
                     self._locks.pop((model_name, backend_id, s), None)
             self._slot_pools[key] = new_pool
             log.info(
-                "update_pool model=%s be=%s slots %d->%d",
+                "Updated slot pool for model '%s' on backend '%s': %d -> %d slots",
                 model_name, backend_id, old_count, n_slots,
             )
 
@@ -197,7 +196,7 @@ class SlotManager:
         denom = max(1, min(len(req_blocks), len(kv_blocks)))
         ratio = lcp / denom
         log.debug(
-            "_should_skip_restore model=%s be=%s slot=%d ratio=%.3f",
+            "Checking skip restore for model '%s' on backend '%s' slot %d: ratio=%.3f",
             g[0], g[1], g[2], ratio,
         )
         return ratio >= KV_CACHE_SKIP_THRESHOLD
@@ -237,7 +236,7 @@ class SlotManager:
                     await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
                 except asyncio.TimeoutError:
                     log.warning(
-                        "acquire_lock_timeout model=%s be=%s slot=%d after %ds, trying fallback backends",
+                        "Lock timed out after %ds for model '%s' on backend '%s' slot %d, trying fallback backends",
                         canonical_name, cache_backend, slot_id, lock_timeout,
                     )
                 else:
@@ -262,7 +261,7 @@ class SlotManager:
                 await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
             except asyncio.TimeoutError:
                 log.warning(
-                    "acquire_lock_timeout model=%s be=%s slot=%d after %ds, trying next backend",
+                    "Lock timed out after %ds for model '%s' on backend '%s' slot %d, trying next backend",
                     canonical_name, backend_id, slot_id, lock_timeout,
                 )
                 continue
@@ -291,7 +290,7 @@ class SlotManager:
         if blocks:
             if self._should_skip_restore(g, blocks):
                 log.info(
-                    "skip_restore_slot_cached model=%s be=%s slot=%d",
+                    "Skipping restore for model '%s' on backend '%s' slot %d: slot cache already matches",
                     model_name, backend_id, slot_id,
                 )
                 restored = False
@@ -299,7 +298,7 @@ class SlotManager:
                 client = backend_manager.get_client(backend_id)
                 restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
                 log.info(
-                    "restore_before_chat model=%s be=%s slot=%d ok=%s",
+                    "Restored cache for model '%s' on backend '%s' slot %d: ok=%s",
                     model_name, backend_id, slot_id, restored,
                 )
                 if restored:
@@ -316,7 +315,7 @@ class SlotManager:
                     cand_key, cand_ratio = cand
                     restored = await client.restore_slot(slot_id, cand_key, model_name)
                     log.info(
-                        "restore_dynamic model=%s be=%s slot=%d key=%s ratio=%.3f ok=%s",
+                        "Dynamically restored cache for model '%s' on backend '%s' slot %d (key %s, ratio %.3f): ok=%s",
                         model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
                     )
                     if restored:
@@ -325,7 +324,7 @@ class SlotManager:
                             self._slot_kv_state[g] = blocks
                 else:
                     log.info(
-                        "restore_dynamic_none model=%s be=%s slot=%d",
+                        "No dynamic restore candidate for model '%s' on backend '%s' slot %d",
                         model_name, backend_id, slot_id,
                     )
                     restored = False
@@ -334,7 +333,7 @@ class SlotManager:
             client = backend_manager.get_client(backend_id)
             restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
             log.info(
-                "restore_before_chat model=%s be=%s slot=%d ok=%s",
+                "Restored cache for model '%s' on backend '%s' slot %d: ok=%s",
                 model_name, backend_id, slot_id, restored,
             )
             if restored:
@@ -360,12 +359,12 @@ class SlotManager:
 
             # Update tracked KV state for this slot
             if blocks:
-                g = (model_name, backend_id, slot_id)
-                self._slot_kv_state[g] = blocks
-                log.debug(
-                    "update_slot_kv_state model=%s be=%s slot=%d n_blocks=%d",
-                    model_name, backend_id, slot_id, len(blocks),
-                )
+                    g = (model_name, backend_id, slot_id)
+                    self._slot_kv_state[g] = blocks
+                    log.debug(
+                        "Updated KV cache state for model '%s' on backend '%s' slot %d: %d blocks",
+                        model_name, backend_id, slot_id, len(blocks),
+                    )
 
             # Ring buffer eviction: age-first, then LRU (per backend)
             max_bytes = CACHE_MAX_SIZE_GB * 1024**3

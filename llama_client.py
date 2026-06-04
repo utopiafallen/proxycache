@@ -31,7 +31,7 @@ class LlamaClient:
             timeout=REQUEST_TIMEOUT,
             limits=limits,
         )
-        log.info("client_init url=%s httpx_version=%s", base_url, httpx.__version__)
+        log.info("Initialized HTTP client for %s (httpx %s)", base_url, httpx.__version__)
 
     async def close(self):
         await self.client.aclose()
@@ -66,7 +66,7 @@ class LlamaClient:
     ):
         body2, query = self._with_slot_id(body, slot_id)
 
-        log.info("chat_completions stream=%s body_stream=%s n_messages=%d",
+        log.info("Chat completions: stream=%s, body_stream=%s, %d messages",
                  stream, body2.get("stream", "MISSING"),
                  len(body2.get("messages") or []))
 
@@ -91,7 +91,7 @@ class LlamaClient:
         if "application/json" not in ctype:
             raw = resp.text or ""
             log.error(
-                "non_stream_non_json content_type=%s raw_len=%d",
+                "Non-JSON response from provider: content_type=%s, body length=%d",
                 ctype,
                 len(raw),
             )
@@ -106,7 +106,7 @@ class LlamaClient:
         except Exception as e:
             raw = resp.text or ""
             log.error(
-                "non_stream_json_parse_error status=%d raw_len=%d err=%s",
+                "Failed to parse JSON response: status=%d, body length=%d, error=%s",
                 resp.status_code,
                 len(raw),
                 e,
@@ -135,14 +135,14 @@ class LlamaClient:
             )
         except asyncio.TimeoutError:
             log.warning(
-                "save_slot_timeout slot=%d basename=%s after %ds",
-                slot_id, basename[:16], SLOT_TIMEOUT,
+                "Save slot timed out after %ds: slot=%d, file=%s",
+                SLOT_TIMEOUT, slot_id, basename[:16],
             )
             return False, 0
 
         if resp.status_code == 500:
             log.warning(
-                "save_slot_500 slot=%d basename=%s",
+                "Save slot returned 500: slot=%d, file=%s",
                 slot_id,
                 basename[:16],
             )
@@ -173,14 +173,14 @@ class LlamaClient:
             )
         except asyncio.TimeoutError:
             log.warning(
-                "restore_slot_timeout slot=%d basename=%s after %ds",
-                slot_id, basename[:16], SLOT_TIMEOUT,
+                "Restore slot timed out after %ds: slot=%d, file=%s",
+                SLOT_TIMEOUT, slot_id, basename[:16],
             )
             return False
 
         if resp.status_code != 200:
             log.warning(
-                "restore_slot_status=%d slot=%d basename=%s",
+                "Restore slot failed: status=%d, slot=%d, file=%s",
                 resp.status_code,
                 slot_id,
                 basename[:16],
@@ -200,7 +200,7 @@ class LlamaClient:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            log.warning("router_models_fail base_url=%s err=%s", self.base_url, e)
+            log.warning("Failed to parse router models from %s: %s", self.base_url, e)
             return []
 
         models_data = data.get("data") or []
@@ -219,7 +219,7 @@ class LlamaClient:
                         pass
                     break
             if port is None:
-                log.warning("router_models_no_port model=%s", m.get("id", "?"))
+                log.warning("Router model '%s' has no port in status args", m.get("id", "?"))
                 continue
             result.append({"name": m.get("id", ""), "port": port})
         return result
@@ -231,7 +231,7 @@ class LlamaClient:
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            log.warning("child_slots_fail url=%s err=%s", child_url, e)
+            log.warning("Failed to get slots from child process %s: %s", child_url, e)
             return None
 
     async def get_slots_info(self, model_name: Optional[str] = None) -> Optional[list]:
@@ -253,13 +253,13 @@ class LlamaClient:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 400:
                 log.info(
-                    "slots_400_router_mode base_url=%s — falling back to /models",
+                    "Got 400 from /slots on %s — falling back to /models for router mode",
                     self.base_url,
                 )
                 return await self._get_slots_via_router_models(model_name)
             raise
         except Exception as e:
-            log.warning("get_slots_info_fail base_url=%s err=%s", self.base_url, e)
+            log.warning("Failed to get slots info from %s: %s", self.base_url, e)
             return None
 
     async def _get_slots_via_router_models(self, model_name: Optional[str] = None) -> Optional[list]:
@@ -270,7 +270,7 @@ class LlamaClient:
         """
         models = await self._parse_router_models()
         if not models:
-            log.warning("router_models_empty base_url=%s", self.base_url)
+            log.warning("No loaded models returned from /models on %s", self.base_url)
             return None
 
         # Filter to requested model if specified
@@ -278,7 +278,7 @@ class LlamaClient:
             models = [m for m in models if m["name"] == model_name]
             if not models:
                 log.warning(
-                    "router_model_not_loaded model=%s available=%s",
+                    "Model '%s' not loaded, available models: %s",
                     model_name, [m["name"] for m in models],
                 )
                 return None
@@ -293,18 +293,18 @@ class LlamaClient:
                     s["_router_port"] = m["port"]
                 all_slots.extend(slots)
                 log.debug(
-                    "router_slots_child name=%s port=%d count=%d",
+                    "Child process %s:%d returned %d slots",
                     m["name"], m["port"], len(slots),
                 )
             else:
                 log.warning(
-                    "router_slots_child_empty name=%s port=%d",
+                    "Child process %s:%d returned no slots",
                     m["name"], m["port"],
                 )
 
         if all_slots:
             return all_slots
-        log.warning("router_slots_empty base_url=%s", self.base_url)
+        log.warning("No slots found from any child process on %s", self.base_url)
         return None
 
     async def discover_models(self) -> list[tuple[str, int]]:

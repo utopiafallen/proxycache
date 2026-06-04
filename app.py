@@ -61,8 +61,7 @@ async def startup():
 
     app.state.sm = sm
     app.state.executor = ThreadPoolExecutor(max_workers=2)
-    log.info("app_start n_backends=%d port=%d backends=%s", len(BACKENDS), PORT,
-             [be["url"] for be in BACKENDS])
+    log.info("Starting on port %d with %d backends: %s", PORT, len(BACKENDS), [be["url"] for be in BACKENDS])
 
     # Reconcile meta files on startup (remove corrupted/orphaned entries)
     backend_keys = list(backend_manager._backends.keys())
@@ -75,8 +74,7 @@ async def startup():
     # Log startup sanity summary
     if CACHE_DIR and os.path.isdir(CACHE_DIR):
         cache_files = len(os.listdir(CACHE_DIR))
-        log.info("startup_sanity: %d meta files after reconcile, %d cache files on disk",
-                 len(hs.scan_all_meta()), cache_files)
+        log.info("After startup reconcile: %d meta files, %d cache files on disk", len(hs.scan_all_meta()), cache_files)
 
     # Start liveness checker
     await backend_manager.start_liveness_checker()
@@ -139,12 +137,10 @@ class StreamReader:
 
     async def _read_loop(self):
         status, headers = self._log_response_info()
-        log.info("stream_reader_start model=%s be=%s slot=%d key=%s status=%s",
-                 self.model_name, self.backend_id, self.slot_id, self.key_short,
-                 status)
-        log.info("stream_reader_headers model=%s be=%s slot=%d key=%s headers=%s",
-                 self.model_name, self.backend_id, self.slot_id, self.key_short,
-                 headers)
+        log.info("Stream started for model '%s' on backend '%s' slot %d (key %s): status %s",
+                  self.model_name, self.backend_id, self.slot_id, self.key_short, status)
+        log.info("Stream response headers for model '%s' on backend '%s' slot %d (key %s): %s",
+                  self.model_name, self.backend_id, self.slot_id, self.key_short, headers)
         iterator = self.resp.aiter_raw()
         chunks_received = 0
         total_bytes = 0
@@ -158,7 +154,7 @@ class StreamReader:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if self._disconnect_event.is_set():
-                    log.warning("read_loop_client_disconnected model=%s be=%s slot=%d key=%s",
+                    log.warning("Client disconnected while reading from model '%s' on backend '%s' slot %d (key %s)",
                                 self.model_name, self.backend_id, self.slot_id, self.key_short)
                     for t in pending:
                         t.cancel()
@@ -172,10 +168,9 @@ class StreamReader:
                         client_ip = self.req.client.host if self.req.client else "-"
                         status, headers = self._log_response_info()
                         log.info(
-                            "stream_complete client_ip=%s model=%s be=%s slot=%d key=%s status=%s headers=%s chunks=%d bytes=%d",
+                            "Stream complete from client %s for model '%s' on backend '%s' slot %d (key %s): status %s, %d chunks, %d bytes",
                             client_ip, self.model_name, self.backend_id, self.slot_id, self.key_short,
-                            status, headers,
-                            chunks_received, total_bytes,
+                            status, chunks_received, total_bytes,
                         )
                         self._disconnect_event.set()
                         for t in pending:
@@ -187,7 +182,7 @@ class StreamReader:
                             self.queue.put_nowait(chunk)
                             chunks_received += 1
                         except asyncio.QueueFull:
-                            log.warning("stream_queue_full model=%s be=%s slot=%d key=%s",
+                            log.warning("Stream queue full for model '%s' on backend '%s' slot %d (key %s)",
                                         self.model_name, self.backend_id, self.slot_id, self.key_short)
                             self._cancelled = True
                             self._disconnect_event.set()
@@ -195,7 +190,7 @@ class StreamReader:
                                 t.cancel()
                             break
                         except asyncio.CancelledError:
-                            log.warning("stream_reader_cancelled_put model=%s be=%s slot=%d key=%s",
+                            log.warning("Stream reader cancelled while putting to queue for model '%s' on backend '%s' slot %d (key %s)",
                                         self.model_name, self.backend_id, self.slot_id, self.key_short)
                             raise
                 else:
@@ -216,7 +211,7 @@ class StreamReader:
             except Exception:
                 disconnected = False
             if disconnected:
-                log.warning("heartbeat_client_disconnected model=%s be=%s slot=%d key=%s",
+                log.warning("Client disconnected (heartbeat check) for model '%s' on backend '%s' slot %d (key %s)",
                             self.model_name, self.backend_id, self.slot_id, self.key_short)
                 self._cancelled = True
                 self._disconnect_event.set()
@@ -230,7 +225,7 @@ class StreamReader:
     async def _save(self) -> tuple:
         if self.best_ratio >= CACHE_SAVE_RATIO_THRESHOLD:
             log.info(
-                "save_skipped_ratio_ok model=%s be=%s slot=%d key=%s ratio=%.3f",
+                "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): restore ratio %.3f >= threshold",
                 self.model_name, self.backend_id, self.slot_id, self.key_short,
                 self.best_ratio,
             )
@@ -245,57 +240,57 @@ class StreamReader:
                 timeout=SLOT_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            log.warning("save_after_timeout model=%s be=%s slot=%d",
-                        self.model_name, self.backend_id, self.slot_id)
+            log.warning("Cache save timed out for model '%s' on backend '%s' slot %d after %ds",
+                        self.model_name, self.backend_id, self.slot_id, SLOT_TIMEOUT)
         except asyncio.CancelledError:
-            log.warning("save_after_cancelled model=%s be=%s slot=%d",
+            log.warning("Cache save cancelled for model '%s' on backend '%s' slot %d",
                         self.model_name, self.backend_id, self.slot_id)
         except Exception as e:
-            log.warning("save_after_exception model=%s be=%s slot=%d: %s",
+            log.warning("Cache save failed for model '%s' on backend '%s' slot %d: %s",
                         self.model_name, self.backend_id, self.slot_id, e)
         if ok:
             try:
                 hs.write_meta(self.key, self.prefix, self.blocks,
                               WORDS_PER_BLOCK, self.model_name, self.backend_id)
             except Exception as e:
-                log.warning("write_meta_exception key=%s: %s", self.key_short, e)
+                log.warning("Failed to write meta file %s: %s", self.key_short, e)
         return ok
 
     async def _cleanup(self):
-        log.info("cleanup_start model=%s be=%s slot=%d key=%s cancelled=%s stream_complete=%s",
-                 self.model_name, self.backend_id, self.slot_id, self.key_short, self._cancelled, self._stream_complete)
+        log.info("Starting cleanup for model '%s' on backend '%s' slot %d (key %s): cancelled=%s, stream_complete=%s",
+                  self.model_name, self.backend_id, self.slot_id, self.key_short, self._cancelled, self._stream_complete)
         try:
             await self.resp.aclose()
-            log.info("cleanup_aclose_done model=%s be=%s slot=%d key=%s",
-                     self.model_name, self.backend_id, self.slot_id, self.key_short)
+            log.info("Response closed for model '%s' on backend '%s' slot %d (key %s)",
+                      self.model_name, self.backend_id, self.slot_id, self.key_short)
         except Exception as e:
-            log.info("cleanup_aclose_error model=%s be=%s slot=%d key=%s error=%s",
-                     self.model_name, self.backend_id, self.slot_id, self.key_short, e)
+            log.info("Error closing response for model '%s' on backend '%s' slot %d (key %s): %s",
+                      self.model_name, self.backend_id, self.slot_id, self.key_short, e)
         ok = False
         if self._stream_complete:
-            log.info("cleanup_save_start model=%s be=%s slot=%d key=%s",
-                     self.model_name, self.backend_id, self.slot_id, self.key_short)
+            log.info("Saving cache for model '%s' on backend '%s' slot %d (key %s)",
+                      self.model_name, self.backend_id, self.slot_id, self.key_short)
             ok = await self._save()
-            log.info("cleanup_save_done model=%s be=%s slot=%d key=%s ok=%s",
-                     self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
+            log.info("Cache save completed for model '%s' on backend '%s' slot %d (key %s): %s",
+                      self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
         else:
-            log.info("cleanup_save_skipped model=%s be=%s slot=%d key=%s",
-                     self.model_name, self.backend_id, self.slot_id, self.key_short)
+            log.info("Skipping cache save for model '%s' on backend '%s' slot %d (key %s): stream incomplete",
+                      self.model_name, self.backend_id, self.slot_id, self.key_short)
         self.sm.release(self.model_name, self.backend_id, self.slot_id)
-        log.info("cleanup_release_done model=%s be=%s slot=%d key=%s",
-                 self.model_name, self.backend_id, self.slot_id, self.key_short)
-        log.info("stream_reader_done model=%s be=%s slot=%d key=%s saved=%s",
-                 self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
+        log.info("Released slot %d for model '%s' on backend '%s' (key %s)", self.slot_id,
+                  self.model_name, self.backend_id, self.key_short)
+        log.info("Stream reader finished for model '%s' on backend '%s' slot %d (key %s): saved=%s",
+                  self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
 
     async def _reader(self):
         try:
             await self._read_loop()
             self.queue.put_nowait(None)
         except asyncio.CancelledError:
-            log.warning("stream_reader_cancelled model=%s be=%s slot=%d key=%s",
+            log.warning("Stream reader cancelled for model '%s' on backend '%s' slot %d (key %s)",
                         self.model_name, self.backend_id, self.slot_id, self.key_short)
         except Exception as e:
-            log.exception("stream_reader_error model=%s be=%s slot=%d key=%s: %s",
+            log.exception("Stream reader error for model '%s' on backend '%s' slot %d (key %s): %s",
                           self.model_name, self.backend_id, self.slot_id, self.key_short, e)
 
     async def stream(self):
@@ -313,7 +308,7 @@ class StreamReader:
                     except Exception:
                         disconnected = False
                     if disconnected:
-                        log.warning("stream_client_disconnected model=%s be=%s slot=%d key=%s",
+                        log.warning("Client disconnected during stream for model '%s' on backend '%s' slot %d (key %s)",
                                     self.model_name, self.backend_id, self.slot_id, self.key_short)
                         self._signal_done()
                         self._task.cancel()
@@ -397,8 +392,8 @@ async def chat(req: Request):
             key = hs.meta_key(canonical_name, prefix)
 
         log.info(
-            "chat_request client_ip=%s is_big=%s n_words=%d model=%s canonical=%s restore_key=%s restore_be=%s",
-            client_ip, is_big, prompt_tokens, client_model, canonical_name,
+            "Chat request from %s: model '%s', %d words, big=%s, restore key=%s on backend %s",
+            client_ip, is_big, prompt_tokens, client_model,
             restore_key[:16] if restore_key else None,
             restore_backend,
         )
@@ -424,14 +419,14 @@ async def chat(req: Request):
             timeout=ACQUIRE_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        log.error("acquire_timeout client_ip=%s model=%s", client_ip, client_model)
+        log.error("Timed out waiting for slot from client %s for model '%s'", client_ip, client_model)
         return JSONResponse({"error": "all slots busy, please retry later"}, status_code=503)
 
     model_name, be_id, slot_id = g
     client = backend_manager.get_client(be_id)
 
-    log.info("after_acquire client_ip=%s model=%s be=%s slot=%d restored=%s",
-             client_ip, model_name, be_id, slot_id, restored)
+    log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s",
+             model_name, be_id, slot_id, restored)
 
     # Forward canonical name to backend
     body = dict(data)
@@ -446,7 +441,7 @@ async def chat(req: Request):
     body["cache_prompt"] = True
 
     log.info(
-        "dispatch client_ip=%s model=%s be=%s slot=%d is_big=%s (restore_target=%s restored=%s)",
+        "Dispatching request: model '%s' on backend '%s' slot %d, big=%s, restore=%s, restored=%s",
         client_ip,
         model_name,
         be_id,
@@ -529,7 +524,7 @@ async def chat(req: Request):
             return JSONResponse(content=out, status_code=200)
 
     except Exception as e:
-        log.exception("chat_error client_ip=%s model=%s be=%s slot=%d key=%s: %s",
+        log.exception("Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
