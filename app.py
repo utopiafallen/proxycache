@@ -507,18 +507,18 @@ async def chat(req: Request):
                         be_id,
                     )
 
-            log.info(
-                "json_response\n%s",
-                json.dumps(out, indent=2, ensure_ascii=False),
-            )
-            log.info(
-                "json_done client_ip=%s model=%s be=%s slot=%d key=%s saved=%s is_big=%s dur_ms=%d",
-                client_ip, model_name, be_id, slot_id,
-                key[:16],
-                ok,
-                is_big,
-                int((time.time() - t0) * 1000),
-            )
+            # log.info(
+            #     "json_response\n%s",
+            #     json.dumps(out, indent=2, ensure_ascii=False),
+            # )
+            # log.info(
+            #     "json_done client_ip=%s model=%s be=%s slot=%d key=%s saved=%s is_big=%s dur_ms=%d",
+            #     client_ip, model_name, be_id, slot_id,
+            #     key[:16],
+            #     ok,
+            #     is_big,
+            #     int((time.time() - t0) * 1000),
+            # )
             return JSONResponse(content=out, status_code=200)
 
     except Exception as e:
