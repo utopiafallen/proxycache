@@ -19,9 +19,7 @@ except Exception:
     BACKENDS = []
 
 if not BACKENDS:
-    BACKENDS = [{
-        "url": os.getenv("LLAMA_URL", "http://127.0.0.1:8000"),
-    }]
+    BACKENDS = [{"url": "http://127.0.0.1:8000"}]
 
 # Words per block for LCP
 WORDS_PER_BLOCK = int(os.getenv("WORDS_PER_BLOCK", "100"))
