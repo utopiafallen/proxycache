@@ -1974,7 +1974,7 @@ def test_acquire_for_request_retries_on_lock_timeout():
         sm.refresh_slots = AsyncMock()
 
         # Cache backend is 10.0.0.1:8000 (lock busy), fallback is 10.0.0.2:8000
-        restore_info = ("test_key", "10.0.0.1:8000")
+        restore_info = ("test_key", "10.0.0.1:8000", "ModelA")
         candidate_backends = [("10.0.0.2:8000", "ModelA")]
         g, lock, restored = await sm.acquire_for_request(
             candidate_backends, restore_info, prompt_tokens=10,
@@ -1987,6 +1987,119 @@ def test_acquire_for_request_retries_on_lock_timeout():
     result = asyncio.run(_run())
     assert result
     print("PASS: test_acquire_for_request_retries_on_lock_timeout")
+
+
+# ── Cache save ratio threshold tests ────────────────────────────────────
+
+def test_chat_save_skipped_when_ratio_above_threshold():
+    """Non-streaming chat should skip save when restore ratio >= threshold."""
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from slot_manager import SlotManager
+    from backend_manager import backend_manager, DiscoveredModel
+    from llama_client import LlamaClient
+    import app as app_mod
+
+    backend_manager._backends.clear()
+    backend_manager._discovered_models.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+
+    mock_client = AsyncMock(spec=LlamaClient)
+    mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
+    mock_client.discover_models = AsyncMock(return_value=[("test-model", 32768)])
+    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+
+    backend_manager._discovered_models["test-model"] = DiscoveredModel(
+        name="test-model", backends=["10.0.0.1:8000"], n_ctx=32768,
+        total_slots=1, last_discovered=0.0
+    )
+
+    sm = SlotManager()
+    sm._ensure_pool("test-model", "10.0.0.1:8000", 1)
+    app_mod.app.state.sm = sm
+
+    save_called = []
+    original_save = sm.save_after
+    async def track_save(*args, **kwargs):
+        save_called.append(True)
+        return await original_save(*args, **kwargs)
+    sm.save_after = track_save
+
+    with patch("hashing.raw_prefix", return_value="hello world"), \
+         patch("hashing.words_from_text", return_value=["hello", "world"]), \
+         patch("hashing.block_hashes_from_text", return_value=["hash1"]), \
+         patch("hashing.meta_key", return_value="test_key"), \
+         patch("hashing.find_best_restore_candidate", return_value=("test_key", 0.95)):
+
+        client = TestClient(app_mod.app)
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello world"}],
+            "stream": False,
+        })
+
+    assert resp.status_code == 200
+    assert len(save_called) == 0, f"Expected no save calls, got {len(save_called)}"
+    print("PASS: test_chat_save_skipped_when_ratio_above_threshold")
+
+
+def test_chat_save_performed_when_ratio_below_threshold():
+    """Non-streaming chat should save when restore ratio < threshold."""
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from slot_manager import SlotManager
+    from backend_manager import backend_manager, DiscoveredModel
+    from llama_client import LlamaClient
+    import app as app_mod
+
+    backend_manager._backends.clear()
+    backend_manager._discovered_models.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+
+    mock_client = AsyncMock(spec=LlamaClient)
+    mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
+    mock_client.discover_models = AsyncMock(return_value=[("test-model", 32768)])
+    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+    mock_client.save_slot = AsyncMock(return_value=(True, 1024))
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+
+    backend_manager._discovered_models["test-model"] = DiscoveredModel(
+        name="test-model", backends=["10.0.0.1:8000"], n_ctx=32768,
+        total_slots=1, last_discovered=0.0
+    )
+
+    sm = SlotManager()
+    sm._ensure_pool("test-model", "10.0.0.1:8000", 1)
+    app_mod.app.state.sm = sm
+
+    save_called = []
+    original_save = sm.save_after
+    async def track_save(*args, **kwargs):
+        save_called.append(True)
+        return await original_save(*args, **kwargs)
+    sm.save_after = track_save
+
+    # Generate a prompt with 600 words to trigger big request path
+    big_prompt = " ".join(["word" + str(i) for i in range(600)])
+
+    with patch("hashing.raw_prefix", return_value=big_prompt), \
+         patch("hashing.words_from_text", return_value=[f"word{i}" for i in range(600)]), \
+         patch("hashing.block_hashes_from_text", return_value=[f"hash{i}" for i in range(6)]), \
+         patch("hashing.meta_key", return_value="test_key"), \
+         patch("hashing.find_best_restore_candidate", return_value=("test_key", 0.5)), \
+         patch("hashing.write_meta"):
+
+        client = TestClient(app_mod.app)
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": big_prompt}],
+            "stream": False,
+        })
+
+    assert resp.status_code == 200
+    assert len(save_called) == 1, f"Expected 1 save call, got {len(save_called)}"
+    print("PASS: test_chat_save_performed_when_ratio_below_threshold")
 
 
 if __name__ == "__main__":
@@ -2084,6 +2197,11 @@ if __name__ == "__main__":
     # ── Lock retry tests ───────────────────────────────────────────────
 
     test_acquire_for_request_retries_on_lock_timeout()
+
+    # ── Cache save ratio threshold tests ─────────────────────────────────
+
+    test_chat_save_skipped_when_ratio_above_threshold()
+    test_chat_save_performed_when_ratio_below_threshold()
 
     print("\nAll smoke tests passed.")
 

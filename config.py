@@ -57,6 +57,10 @@ DEFAULT_N_CTX = int(os.getenv("DEFAULT_N_CTX", "16384"))
 # KV cache skip threshold (0..1) — skip restore if slot KV cache matches >= this
 KV_CACHE_SKIP_THRESHOLD = float(os.getenv("KV_CACHE_SKIP_THRESHOLD", "0.9"))
 
+# Cache save ratio threshold (0..1) — only save cache if restore candidate ratio < this
+# When a cached prompt already matches well (>= threshold), no need to save a duplicate
+CACHE_SAVE_RATIO_THRESHOLD = float(os.getenv("CACHE_SAVE_RATIO_THRESHOLD", "0.9"))
+
 # Timeout for slot save/restore operations (seconds) — separate from REQUEST_TIMEOUT
 # because chat completions can take minutes, but slot operations should fail fast
 SLOT_TIMEOUT = float(os.getenv("SLOT_TIMEOUT", "30"))

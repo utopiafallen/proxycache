@@ -38,7 +38,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
                     CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
-                    SLOT_TIMEOUT, DEFAULT_N_CTX)
+                    SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD)
 
 import hashing as hs
 from slot_manager import SlotManager
@@ -106,7 +106,7 @@ class StreamReader:
     def __init__(self, resp: httpx.Response, req: Request,
                  model_name: str, backend_id: str, slot_id: int,
                  key: str, prefix: str, blocks: List[str],
-                 sm: SlotManager):
+                 sm: SlotManager, best_ratio: float = 0.0):
         self.resp = resp
         self.req = req
         self.model_name = model_name
@@ -116,6 +116,7 @@ class StreamReader:
         self.prefix = prefix
         self.blocks = blocks
         self.sm = sm
+        self.best_ratio = best_ratio
         self.queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
         self._cancelled = False
         self._stream_complete = False
@@ -227,6 +228,13 @@ class StreamReader:
         self.queue.put_nowait(None)
 
     async def _save(self) -> tuple:
+        if self.best_ratio >= CACHE_SAVE_RATIO_THRESHOLD:
+            log.info(
+                "save_skipped_ratio_ok model=%s be=%s slot=%d key=%s ratio=%.3f",
+                self.model_name, self.backend_id, self.slot_id, self.key_short,
+                self.best_ratio,
+            )
+            return False
         ok = False
         try:
             ok, _ = await asyncio.wait_for(
@@ -375,15 +383,14 @@ async def chat(req: Request):
         key = None
         if is_big:
             for opt in options:
-                mk = hs.meta_key(opt.name, prefix)
                 for be_id in opt.backends:
-                    cand = hs.find_restore_candidate(mk, WORDS_PER_BLOCK, LCP_TH, blocks, be_id)
+                    cand = hs.find_best_restore_candidate(blocks, WORDS_PER_BLOCK, LCP_TH, opt.name, be_id)
                     if cand and cand[1] > best_ratio:
                         best_ratio = cand[1]
-                        restore_key = mk
+                        restore_key = cand[0]
                         restore_backend = be_id
                         canonical_name = opt.name
-                        key = mk
+                        key = cand[0]
         # Fallback: use first option if no cache hit found
         if canonical_name is None:
             canonical_name = options[0].name
@@ -409,9 +416,9 @@ async def chat(req: Request):
                     candidate_backends.append((be_id, opt.name))
 
         # 6. Acquire slot (cache backend tried first via restore_info, then fallback)
-        restore_info: Optional[tuple[str, str]] = None
+        restore_info: Optional[tuple[str, str, str]] = None
         if restore_key and restore_backend:
-            restore_info = (restore_key, restore_backend)
+            restore_info = (restore_key, restore_backend, canonical_name)
         g, lock, restored = await asyncio.wait_for(
             sm.acquire_for_request(candidate_backends, restore_info, blocks, prompt_tokens),
             timeout=ACQUIRE_TIMEOUT,
@@ -466,7 +473,7 @@ async def chat(req: Request):
                 )
 
             reader = StreamReader(resp, req, model_name, be_id, slot_id,
-                                  key, prefix, blocks, sm)
+                                  key, prefix, blocks, sm, best_ratio)
             gen = reader.stream()
             _reader_created = True
 
@@ -493,7 +500,7 @@ async def chat(req: Request):
                 )
 
             ok = False
-            if is_big:
+            if is_big and best_ratio < CACHE_SAVE_RATIO_THRESHOLD:
                 ok, _ = await sm.save_after(
                     model_name, be_id, slot_id, key, blocks,
                 )

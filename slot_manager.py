@@ -124,12 +124,15 @@ class SlotManager:
 
     def _get_free_or_oldest_from_pool(
         self, model_name: str, backend_id: str
-    ) -> Tuple[int, asyncio.Lock]:
-        """Pick free slot or oldest (LRU) from a single backend's pool for a model."""
+    ) -> Tuple[Optional[int], Optional[asyncio.Lock]]:
+        """Pick free slot or oldest (LRU) from a single backend's pool for a model.
+
+        Returns (slot_id, lock) on success, (None, None) if no pool exists.
+        """
         key = (model_name, backend_id)
         pool = self._slot_pools.get(key)
         if not pool:
-            raise RuntimeError(f"No pool for model={model_name} be={backend_id}")
+            return None, None
 
         free = [s for s in pool if self._is_free(model_name, backend_id, s)]
         if free:
@@ -202,7 +205,7 @@ class SlotManager:
     async def acquire_for_request(
         self,
         candidate_backends: list[tuple[str, str]],
-        restore_info: Optional[tuple[str, str]] = None,
+        restore_info: Optional[tuple[str, str, str]] = None,
         blocks: Optional[List[str]] = None,
         prompt_tokens: int = 0,
     ) -> Tuple[GSlot, asyncio.Lock, Optional[bool]]:
@@ -210,21 +213,11 @@ class SlotManager:
 
         candidate_backends: list of fallback (backend_id, canonical_name) pairs
             (does NOT include the cache backend).
-        restore_info: optional (restore_key, cache_backend) tuple. If provided,
-            the cache backend is tried first. If its lock times out, fallback
-            candidates are tried — but restore_key is only used if the cache
-            backend was acquired (cache files are not shared between backends).
+        restore_info: optional (restore_key, cache_backend, canonical_name) tuple.
+            If provided, the cache backend is tried first. If its lock times out,
+            fallback candidates are tried — but restore_key is only used if the
+            cache backend was acquired (cache files are not shared between backends).
         """
-        # Build ordered list: cache backend first (if any), then fallback candidates
-        ordered: list[tuple[str, str]] = []
-        if restore_info:
-            restore_key, cache_backend = restore_info
-            ordered.append((cache_backend, ""))  # canonical_name placeholder
-        ordered.extend(candidate_backends)
-
-        if not ordered:
-            raise RuntimeError("No candidate backends provided")
-
         # Refresh slot counts for all discovered models (with cooldown)
         slot_counts = await backend_manager.refresh_slot_counts()
         for backend_key, model_slots in slot_counts.items():
@@ -234,17 +227,36 @@ class SlotManager:
         # Cap lock acquire timeout at 30s — don't let requests hang forever
         lock_timeout = min(30.0, SLOT_TIMEOUT)
 
-        best: Optional[Tuple[str, str, int, asyncio.Lock]] = None
-        for backend_id, canonical_name in ordered:
+        # Try cache backend first (if provided)
+        if restore_info:
+            restore_key, cache_backend, canonical_name = restore_info
+            min_ctx = backend_manager.get_model_n_ctx(canonical_name)
+            slot_id, lock = self._get_free_or_oldest_from_pool(canonical_name, cache_backend);
+            if prompt_tokens < min_ctx and slot_id is not None:
+                try:
+                    await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "acquire_lock_timeout model=%s be=%s slot=%d after %ds, trying fallback backends",
+                        canonical_name, cache_backend, slot_id, lock_timeout,
+                    )
+                else:
+                    self._last_used[(canonical_name, cache_backend, slot_id)] = time.time()
+                    effective_restore_key = restore_key
+                    return await self._restore_and_return(
+                        canonical_name, cache_backend, slot_id, lock,
+                        effective_restore_key, blocks,
+                    )
+
+        # Fallback: try candidate backends
+        for backend_id, canonical_name in candidate_backends:
             if not canonical_name:
-                # Cache backend placeholder — use first candidate's canonical name
-                canonical_name = ordered[1][1] if len(ordered) > 1 else candidate_backends[0][1]
+                continue
             min_ctx = backend_manager.get_model_n_ctx(canonical_name)
             if prompt_tokens >= min_ctx:
                 continue
-            try:
-                slot_id, lock = self._get_free_or_oldest_from_pool(canonical_name, backend_id)
-            except RuntimeError:
+            slot_id, lock = self._get_free_or_oldest_from_pool(canonical_name, backend_id)
+            if slot_id is None:
                 continue
             try:
                 await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
@@ -254,95 +266,81 @@ class SlotManager:
                     canonical_name, backend_id, slot_id, lock_timeout,
                 )
                 continue
-            # Lock acquired — use this backend
             self._last_used[(canonical_name, backend_id, slot_id)] = time.time()
-            best = (canonical_name, backend_id, slot_id, lock)
-            break
+            effective_restore_key: Optional[str] = None
+            return await self._restore_and_return(
+                canonical_name, backend_id, slot_id, lock,
+                effective_restore_key, blocks,
+            )
 
-        if best is None:
-            raise RuntimeError(f"No slots available for candidate_backends={len(candidate_backends)}")
+        raise RuntimeError(f"No slots available for candidate_backends={len(candidate_backends)}")
 
-        model_name_out, backend_id, slot_id, lock = best
-
-        g = (model_name_out, backend_id, slot_id)
-
-        # Only use restore_key if we acquired the slot on the cache backend
-        effective_restore_key: Optional[str] = None
-        if restore_info:
-            _, cache_backend = restore_info
-            if backend_id == cache_backend:
-                effective_restore_key = restore_info[0]
-
-        # Restore if needed
+    async def _restore_and_return(
+        self,
+        model_name: str,
+        backend_id: str,
+        slot_id: int,
+        lock: asyncio.Lock,
+        effective_restore_key: Optional[str],
+        blocks: Optional[List[str]],
+    ) -> Tuple[GSlot, asyncio.Lock, Optional[bool]]:
+        """Restore KV cache and return (g, lock, restored)."""
+        g = (model_name, backend_id, slot_id)
         restored: Optional[bool] = None
-        try:
-            if blocks:
-                # Skip restore if slot's KV cache already matches well
-                if self._should_skip_restore(g, blocks):
-                    log.info(
-                        "skip_restore_slot_cached model=%s be=%s slot=%d",
-                        model_name_out, backend_id, slot_id,
-                    )
-                    restored = False
-                elif effective_restore_key:
-                    # Restore from pre-computed candidate
-                    client = backend_manager.get_client(backend_id)
-                    restored = await client.restore_slot(slot_id, effective_restore_key, model_name_out)
-                    log.info(
-                        "restore_before_chat model=%s be=%s slot=%d ok=%s",
-                        model_name_out, backend_id, slot_id, restored,
-                    )
-                    if restored:
-                        self._touch_ring(effective_restore_key, backend_id)
-                        # Update tracked KV state with restored candidate blocks
-                        blocks = hs.get_meta_blocks(effective_restore_key, backend_id)
-                        if blocks is not None:
-                            self._slot_kv_state[g] = blocks
-                else:
-                    # No pre-computed candidate and KV cache doesn't match —
-                    # find best meta file to restore from
-                    client = backend_manager.get_client(backend_id)
-                    cand = hs.find_best_restore_candidate(
-                        blocks, WORDS_PER_BLOCK, LCP_TH, model_name_out, backend_id,
-                    )
-                    if cand:
-                        cand_key, cand_ratio = cand
-                        restored = await client.restore_slot(slot_id, cand_key, model_name_out)
-                        log.info(
-                            "restore_dynamic model=%s be=%s slot=%d key=%s ratio=%.3f ok=%s",
-                            model_name_out, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
-                        )
-                        if restored:
-                            blocks = hs.get_meta_blocks(cand_key, backend_id)
-                            if blocks is not None:
-                                self._slot_kv_state[g] = blocks
-                    else:
-                        log.info(
-                            "restore_dynamic_none model=%s be=%s slot=%d",
-                            model_name_out, backend_id, slot_id,
-                        )
-                        restored = False
 
+        if blocks:
+            if self._should_skip_restore(g, blocks):
+                log.info(
+                    "skip_restore_slot_cached model=%s be=%s slot=%d",
+                    model_name, backend_id, slot_id,
+                )
+                restored = False
             elif effective_restore_key:
-                # Legacy path: no blocks passed but restore_key provided
                 client = backend_manager.get_client(backend_id)
-                restored = await client.restore_slot(slot_id, effective_restore_key, model_name_out)
+                restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
                 log.info(
                     "restore_before_chat model=%s be=%s slot=%d ok=%s",
-                    model_name_out, backend_id, slot_id, restored,
+                    model_name, backend_id, slot_id, restored,
                 )
                 if restored:
                     self._touch_ring(effective_restore_key, backend_id)
+                    blocks = hs.get_meta_blocks(effective_restore_key, backend_id)
+                    if blocks is not None:
+                        self._slot_kv_state[g] = blocks
+            else:
+                client = backend_manager.get_client(backend_id)
+                cand = hs.find_best_restore_candidate(
+                    blocks, WORDS_PER_BLOCK, LCP_TH, model_name, backend_id,
+                )
+                if cand:
+                    cand_key, cand_ratio = cand
+                    restored = await client.restore_slot(slot_id, cand_key, model_name)
+                    log.info(
+                        "restore_dynamic model=%s be=%s slot=%d key=%s ratio=%.3f ok=%s",
+                        model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
+                    )
+                    if restored:
+                        blocks = hs.get_meta_blocks(cand_key, backend_id)
+                        if blocks is not None:
+                            self._slot_kv_state[g] = blocks
+                else:
+                    log.info(
+                        "restore_dynamic_none model=%s be=%s slot=%d",
+                        model_name, backend_id, slot_id,
+                    )
+                    restored = False
 
-            return g, lock, restored
-        except Exception:
-            # Clean up leaked KV state on failure so the slot doesn't get
-            # incorrectly skipped on its next use
-            self._slot_kv_state.pop(g, None)
-            # Release lock so the slot isn't held forever after a failure
-            if lock.locked():
-                lock.release()
-            raise
+        elif effective_restore_key:
+            client = backend_manager.get_client(backend_id)
+            restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
+            log.info(
+                "restore_before_chat model=%s be=%s slot=%d ok=%s",
+                model_name, backend_id, slot_id, restored,
+            )
+            if restored:
+                self._touch_ring(effective_restore_key, backend_id)
+
+        return g, lock, restored
 
     async def save_after(
         self,
