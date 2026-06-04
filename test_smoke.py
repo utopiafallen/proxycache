@@ -528,6 +528,7 @@ def test_should_skip_restore_no_tracked_state():
     sm._slot_kv_state.clear()
 
     g = ("ModelA", "10.0.0.1:8000", 0)
+    sm._slot_pools[g[:2]] = {0}
     blocks = ["a", "b", "c", "d", "e"]
 
     assert sm._should_skip_restore(g, blocks) is False
@@ -535,11 +536,12 @@ def test_should_skip_restore_no_tracked_state():
 
 
 def test_should_skip_restore_perfect_match():
-    """_should_skip_restore should return True for perfect block match."""
+    """_should_skip_restore should return True for perfect block match with single slot."""
     from slot_manager import SlotManager
 
     sm = SlotManager()
     g = ("ModelA", "10.0.0.1:8000", 0)
+    sm._slot_pools[g[:2]] = {0}
     kv_blocks = ["a", "b", "c", "d", "e"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -549,11 +551,12 @@ def test_should_skip_restore_perfect_match():
 
 
 def test_should_skip_restore_high_overlap():
-    """_should_skip_restore should return True when overlap >= 0.9."""
+    """_should_skip_restore should return True when overlap >= 0.9 with single slot."""
     from slot_manager import SlotManager
 
     sm = SlotManager()
     g = ("ModelA", "10.0.0.1:8000", 0)
+    sm._slot_pools[g[:2]] = {0}
     kv_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -569,6 +572,7 @@ def test_should_skip_restore_low_overlap():
 
     sm = SlotManager()
     g = ("ModelA", "10.0.0.1:8000", 0)
+    sm._slot_pools[g[:2]] = {0}
     kv_blocks = ["a", "b", "c", "d", "e"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -584,6 +588,7 @@ def test_should_skip_restore_zero_lcp():
 
     sm = SlotManager()
     g = ("ModelA", "10.0.0.1:8000", 0)
+    sm._slot_pools[g[:2]] = {0}
     kv_blocks = ["a", "b", "c"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -593,11 +598,12 @@ def test_should_skip_restore_zero_lcp():
 
 
 def test_should_skip_restore_shorter_kv_cache():
-    """_should_skip_restore should handle shorter KV cache than request."""
+    """_should_skip_restore should handle shorter KV cache than request with single slot."""
     from slot_manager import SlotManager
 
     sm = SlotManager()
     g = ("ModelA", "10.0.0.1:8000", 0)
+    sm._slot_pools[g[:2]] = {0}
     kv_blocks = ["a", "b", "c"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -608,11 +614,12 @@ def test_should_skip_restore_shorter_kv_cache():
 
 
 def test_should_skip_restore_longer_kv_cache():
-    """_should_skip_restore should handle longer KV cache than request."""
+    """_should_skip_restore should handle longer KV cache than request with single slot."""
     from slot_manager import SlotManager
 
     sm = SlotManager()
     g = ("ModelA", "10.0.0.1:8000", 0)
+    sm._slot_pools[g[:2]] = {0}
     kv_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
     sm._slot_kv_state[g] = kv_blocks
 
@@ -620,6 +627,21 @@ def test_should_skip_restore_longer_kv_cache():
     req_blocks = ["a", "b", "c"]
     assert sm._should_skip_restore(g, req_blocks) is True
     print("PASS: test_should_skip_restore_longer_kv_cache")
+
+
+def test_should_skip_restore_multi_slot():
+    """_should_skip_restore should return False when pool has multiple slots."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    g = ("ModelA", "10.0.0.1:8000", 0)
+    sm._slot_pools[g[:2]] = {0, 1, 2}
+    kv_blocks = ["a", "b", "c", "d", "e"]
+    sm._slot_kv_state[g] = kv_blocks
+
+    req_blocks = ["a", "b", "c", "d", "e"]
+    assert sm._should_skip_restore(g, req_blocks) is False
+    print("PASS: test_should_skip_restore_multi_slot")
 
 
 def test_save_after_updates_slot_kv_state():
@@ -1995,6 +2017,7 @@ if __name__ == "__main__":
     test_should_skip_restore_zero_lcp()
     test_should_skip_restore_shorter_kv_cache()
     test_should_skip_restore_longer_kv_cache()
+    test_should_skip_restore_multi_slot()
     test_save_after_updates_slot_kv_state()
     test_save_after_no_blocks_no_state_update()
 

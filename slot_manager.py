@@ -174,11 +174,20 @@ class SlotManager:
     def _should_skip_restore(self, g: GSlot, req_blocks: List[str]) -> bool:
         """Check if the slot's current KV cache already matches the request well enough.
 
+        Only applies when the backend has a single slot. With multiple slots, skipping a
+        restore is unsafe — llama.cpp may evict the chosen slot's cache under memory pressure
+        from serving concurrent requests. A single-slot backend is safe because the proxy
+        knows exactly what traffic goes to the backend and the slot's state is predictable.
+
         Returns True if the slot's tracked KV cache blocks overlap >= KV_CACHE_SKIP_THRESHOLD
         with the request blocks, meaning no restore is needed.
         """
         kv_blocks = self._slot_kv_state.get(g)
         if not kv_blocks:
+            return False
+
+        pool = self._slot_pools.get((g[0], g[1]))
+        if pool is not None and len(pool) > 1:
             return False
 
         lcp = hs.lcp_blocks(req_blocks, kv_blocks)
