@@ -23,13 +23,11 @@ proxycache sits between clients and one or more `llama.cpp` backends. It interce
 
 - **Cache lifecycle** — KV state is saved to disk after each response completes. A per-backend ring buffer evicts expired entries (age-first) then LRU when cache exceeds the configured size. Orphaned/corrupted metadata is reconciled on startup.
 
-- **Small request optimization** — requests under `BIG_THRESHOLD_WORDS` (default 500 words) skip cache I/O entirely, avoiding the overhead of hashing, scanning meta files, and disk reads/writes.
-
 ### Request flow
 
 1. Client sends `POST /v1/chat/completions` with a model name (e.g. "qwen3.6-32b")
 2. Proxy resolves the model name to a canonical name via discovered models
-3. For large requests, scans cache files across all backends for matching prefixes
+3. Scans cache files across all backends for matching prefixes
 4. Builds an ordered backend list — cache backend first, then fallback backends
 5. Acquires a slot (with lock retry across backends) and restores KV cache if available
 6. Forwards the request to llama.cpp with the canonical model name and pinned slot
@@ -50,7 +48,6 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `CACHE_DIR` | — | `llama.cpp` `--slot-save-path` directory |
 | `CACHE_MAX_SIZE_GB` | `25` | Max total cache size per backend in GB |
 | `CACHE_MAX_AGE_HOURS` | `168` | Delete cache files older than this (0=disabled) |
-| `BIG_THRESHOLD_WORDS` | `500` | Min words to trigger cache restore/save |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
 | `LCP_TH` | `0.2` | LCP similarity threshold for cache match (0–1) |
 | `KV_CACHE_SKIP_THRESHOLD` | `0.9` | Skip restore if slot KV cache matches >= this ratio |

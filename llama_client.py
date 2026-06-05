@@ -36,6 +36,14 @@ class LlamaClient:
     async def close(self):
         await self.client.aclose()
 
+    async def tokenize(self, text: str, add_special: bool = False) -> list[int]:
+        resp = await self.client.post(
+            "/tokenize",
+            json={"content": text, "add_special": add_special},
+        )
+        resp.raise_for_status()
+        return resp.json().get("tokens", [])
+
     @staticmethod
     def _with_slot_id(body: Dict, slot_id: Optional[int]) -> Tuple[Dict, Dict]:
         if slot_id is None:
@@ -125,18 +133,15 @@ class LlamaClient:
             path = f"/slots/{slot_id}"
 
         try:
-            resp = await asyncio.wait_for(
-                self.client.post(
-                    path,
-                    params={"action": "save"},
-                    json={"filename": basename, "model": model_name},
-                ),
-                timeout=SLOT_TIMEOUT,
+            resp = await self.client.post(
+                path,
+                params={"action": "save"},
+                json={"filename": basename, "model": model_name},
             )
-        except asyncio.TimeoutError:
+        except Exception as e:
             log.warning(
-                "Save slot timed out after %ds: slot=%d, file=%s",
-                SLOT_TIMEOUT, slot_id, basename[:16],
+                "Save slot failed: slot=%d, file=%s, error=%s",
+                slot_id, basename[:16], e,
             )
             return False, 0
 

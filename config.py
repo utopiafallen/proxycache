@@ -4,7 +4,7 @@
 """
 Single configuration source for proxycache:
 - BACKENDS: [{"url": "..."}]
-- WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS, LCP_TH
+- WORDS_PER_BLOCK, LCP_TH
 - PORT, REQUEST_TIMEOUT, MODEL_ID
 """
 
@@ -23,9 +23,6 @@ if not BACKENDS:
 
 # Words per block for LCP
 WORDS_PER_BLOCK = int(os.getenv("WORDS_PER_BLOCK", "100"))
-
-# Big request threshold
-BIG_THRESHOLD_WORDS = int(os.getenv("BIG_THRESHOLD_WORDS", "500"))
 
 # LCP threshold (0..1)
 LCP_TH = float(os.getenv("LCP_TH", "0.2"))

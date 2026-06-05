@@ -88,7 +88,7 @@ def test_backend_manager_model_registration():
 
 def test_reconcile_meta_removes_orphans():
     """reconcile_meta should delete meta files with no matching cache and skip valid ones."""
-    import hashing as hs
+    from kv_meta_manager import reconcile_meta
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cache_dir = os.path.join(tmpdir, "cache")
@@ -113,7 +113,7 @@ def test_reconcile_meta_removes_orphans():
         with open(os.path.join(meta_dir, f"{corrupted_key}.meta.json"), "w") as f:
             f.write("not json {{{")
 
-        deleted = hs.reconcile_meta(meta_dir, cache_dir)
+        deleted = asyncio.run(reconcile_meta(meta_dir, cache_dir))
 
         assert deleted == 2, f"Expected 2 deleted (orphan + corrupted), got {deleted}"
         assert os.path.exists(os.path.join(meta_dir, f"{valid_key}.meta.json")), "Valid meta was deleted"
@@ -123,12 +123,18 @@ def test_reconcile_meta_removes_orphans():
 
 
 def test_hashing_imports():
-    """hashing module should import without cleanup_old_cache or update_last_read."""
+    """hashing module should have raw hashing functions; kv-meta in kv_meta_manager."""
     import hashing as hs
-    assert hasattr(hs, "reconcile_meta")
-    assert hasattr(hs, "_get_last_used_time")
-    assert hasattr(hs, "write_meta")
-    assert hasattr(hs, "find_best_restore_candidate")
+    from kv_meta_manager import reconcile_meta, _get_last_used_time, write_meta, find_best_restore_candidate
+    assert hasattr(hs, "raw_prefix")
+    assert hasattr(hs, "block_hashes_from_tokens")
+    assert hasattr(hs, "lcp_blocks")
+    assert hasattr(hs, "meta_key")
+    assert hasattr(hs, "prefix_key_sha256")
+    assert callable(reconcile_meta)
+    assert callable(_get_last_used_time)
+    assert callable(write_meta)
+    assert callable(find_best_restore_candidate)
     assert not hasattr(hs, "cleanup_old_cache")
     assert not hasattr(hs, "update_last_read")
     print("PASS: test_hashing_imports")
@@ -191,7 +197,7 @@ def test_cache_agent_client_connect_error():
 
     async def run():
         bm = BackendManager([{"url": "http://10.0.0.1:9999", "agent_port": 8082}])
-        agent = bm.get_agent("10.0.0.1:9999")
+        agent = bm.get_agent("10.0.0.1-9999")
         with patch.object(agent._client, "post", new_callable=AsyncMock,
                           side_effect=httpx.ConnectError("connection refused")):
             result = await agent.delete("test_key")
@@ -265,21 +271,18 @@ def test_slot_manager_release():
     sm = SlotManager()
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
 
-    # Lock and use slot 0
-    lock = sm._locks[("ModelA", "10.0.0.1:8000", 0)]
-    assert not lock.locked()
+    # Slot 0 starts as not in-use
+    assert not sm._in_use[("ModelA", "10.0.0.1:8000", 0)]
 
-    async def _acquire():
-        await lock.acquire()
-
-    asyncio.run(_acquire())
+    # Mark slot 0 as in-use
+    sm._in_use[("ModelA", "10.0.0.1:8000", 0)] = True
     sm._last_used[("ModelA", "10.0.0.1:8000", 0)] = 100.0
-    assert lock.locked()
+    assert sm._in_use[("ModelA", "10.0.0.1:8000", 0)]
     assert sm._last_used[("ModelA", "10.0.0.1:8000", 0)] == 100.0
 
     # Release
     sm.release("ModelA", "10.0.0.1:8000", 0)
-    assert not lock.locked()
+    assert not sm._in_use[("ModelA", "10.0.0.1:8000", 0)]
     assert sm._last_used[("ModelA", "10.0.0.1:8000", 0)] == 0.0
     print("PASS: test_slot_manager_release")
 
@@ -733,68 +736,25 @@ def test_restore_slot_times_out_on_slow_backend():
     print("PASS: test_restore_slot_times_out_on_slow_backend")
 
 
-def test_save_slot_times_out_on_slow_backend():
-    """Behavioral: save_slot returns (False, 0) when backend doesn't respond in time."""
+def test_save_slot_returns_false_on_exception():
+    """Behavioral: save_slot returns (False, 0) when backend raises an exception."""
     from llama_client import LlamaClient
-    import llama_client
 
     client = LlamaClient("http://127.0.0.1:8080")
 
     async def _run():
-        orig_timeout = llama_client.SLOT_TIMEOUT
-        llama_client.SLOT_TIMEOUT = 0.1
+        async def failing_post(*a, **kw):
+            raise ConnectionError("connection refused")
 
-        try:
-            async def slow_post(*a, **kw):
-                await asyncio.sleep(5)
-                return AsyncMock(status_code=200)
-
-            client.client.post = slow_post
-            t0 = time.monotonic()
-            ok, size = await client.save_slot(0, "test_key")
-            elapsed = time.monotonic() - t0
-            assert not ok, "save_slot should return False on timeout"
-            assert size == 0, "save_slot should return 0 size on timeout"
-            assert 0.05 < elapsed < 2, f"Should have timed out near 0.1s, took {elapsed:.1f}s"
-        finally:
-            llama_client.SLOT_TIMEOUT = orig_timeout
-
+        client.client.post = failing_post
+        ok, size = await client.save_slot(0, "test_key")
+        assert not ok, "save_slot should return False on exception"
+        assert size == 0, "save_slot should return 0 size on exception"
     asyncio.run(_run())
-    print("PASS: test_save_slot_times_out_on_slow_backend")
+    print("PASS: test_save_slot_returns_false_on_exception")
 
 
-def test_lock_acquire_has_timeout():
-    """Verify: lock.acquire() is wrapped in wait_for(SLOT_TIMEOUT) — doesn't block forever."""
-    from slot_manager import SlotManager
-    from config import SLOT_TIMEOUT
-    from backend_manager import backend_manager, DiscoveredModel
 
-    backend_manager._backends.clear()
-    backend_manager._discovered_models.clear()
-
-    sm = SlotManager()
-    sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
-    backend_manager._discovered_models["ModelA"] = DiscoveredModel(
-        name="ModelA", n_ctx=4096, backends=["10.0.0.1:8000"],
-        total_slots=1, last_discovered=0.0,
-    )
-
-    # First request acquires the lock
-    _, lock = sm._get_free_or_oldest_from_pool("ModelA", "10.0.0.1:8000")
-    asyncio.run(lock.acquire())
-
-    # Second request tries to acquire — should timeout, not hang forever
-    t0 = time.time()
-    try:
-        asyncio.run(asyncio.wait_for(lock.acquire(), timeout=SLOT_TIMEOUT))
-    except asyncio.TimeoutError:
-        elapsed = time.time() - t0
-        assert 25 < elapsed < 40, f"Took {elapsed:.1f}s — expected ~30s timeout"
-    else:
-        assert False, "Should have raised TimeoutError"
-
-    sm.release("ModelA", "10.0.0.1:8000", 0)
-    print("PASS: test_lock_acquire_has_timeout")
 
 
 def test_adaptive_cooldown_on_failure():
@@ -862,9 +822,9 @@ def test_lock_released_on_restore_failure():
 
     asyncio.run(_run())
 
-    # Lock should be released after the exception
-    _, lock = sm._get_free_or_oldest_from_pool("ModelA", "10.0.0.1:8000")
-    assert not lock.locked(), "Lock must be released after restore failure"
+    # Slot should be released (in_use flag cleared) after the exception
+    _, in_use = sm._get_free_or_oldest_from_pool("ModelA", "10.0.0.1:8000")
+    assert not in_use, "Slot must be released after restore failure"
     print("PASS: test_lock_released_on_restore_failure")
 
 
@@ -911,9 +871,9 @@ def test_non_streaming_cancelled_error_releases_slot():
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
-        g, lock, _ = await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")])
+        g, _ = await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")])
         model_name, be_id, slot_id = g
-        assert lock.locked(), "Lock should be held after acquire"
+        assert sm._in_use[g], "Slot should be in-use after acquire"
         try:
             await mock_client.chat_completions({}, slot_id=slot_id, stream=False)
         except asyncio.CancelledError:
@@ -922,7 +882,7 @@ def test_non_streaming_cancelled_error_releases_slot():
         stream = False
         if not stream:
             sm.release(model_name, be_id, slot_id)
-        assert not lock.locked(), "Lock should be released after finally block"
+        assert not sm._in_use[g], "Slot should be released after finally block"
 
     asyncio.run(_run())
     print("PASS: test_non_streaming_cancelled_error_releases_slot")
@@ -967,12 +927,10 @@ def test_streaming_save_after_skipped_on_cancel():
     print("PASS: test_streaming_save_after_skipped_on_cancel")
 
 
-def test_streaming_save_after_has_timeout():
-    """Behavioral: StreamReader._save respects SLOT_TIMEOUT."""
+def test_streaming_save_after_exception():
+    """Behavioral: StreamReader._save handles exceptions from save_after gracefully."""
     from slot_manager import SlotManager
     from app import StreamReader
-    import app
-    import config
     from backend_manager import backend_manager
 
     backend_manager._backends.clear()
@@ -983,39 +941,26 @@ def test_streaming_save_after_has_timeout():
     mock_client = AsyncMock()
 
     async def _run():
-        # Patch SLOT_TIMEOUT in app module (where it's imported)
-        orig_timeout = app.SLOT_TIMEOUT
-        app.SLOT_TIMEOUT = 0.1
-        config.SLOT_TIMEOUT = 0.1  # also patch config for consistency
+        async def failing_save(*a, **kw):
+            raise ConnectionError("connection refused")
 
-        try:
-            async def hanging_save(*a, **kw):
-                await asyncio.sleep(5)
-                return (True, 0)
+        mock_client.save_slot = failing_save
+        backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
-            mock_client.save_slot = hanging_save
-            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+        mock_resp = AsyncMock()
+        mock_resp.aiter_raw = MagicMock(return_value=iter([]))
+        mock_resp.aclose = AsyncMock()
 
-            mock_resp = AsyncMock()
-            mock_resp.aiter_raw = MagicMock(return_value=iter([]))
-            mock_resp.aclose = AsyncMock()
+        mock_req = AsyncMock()
+        mock_req.is_disconnected = AsyncMock(return_value=False)
 
-            mock_req = AsyncMock()
-            mock_req.is_disconnected = AsyncMock(return_value=False)
+        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
+                              "test_key", 10, ["blk1"], sm)
 
-            reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                                  "test_key", "prefix", ["blk1"], sm)
-
-            t0 = time.monotonic()
-            await reader._save()
-            elapsed = time.monotonic() - t0
-            assert elapsed < 2, f"_save should time out near 0.1s, took {elapsed:.1f}s"
-        finally:
-            app.SLOT_TIMEOUT = orig_timeout
-            config.SLOT_TIMEOUT = orig_timeout
-
+        ok = await reader._save()
+        assert not ok, "_save should return False on exception"
     asyncio.run(_run())
-    print("PASS: test_streaming_save_after_has_timeout")
+    print("PASS: test_streaming_save_after_exception")
 
 
 def test_streaming_gen_sets_cancelled_flag():
@@ -1101,7 +1046,7 @@ def test_streaming_release_not_in_outer_finally():
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     async def _run():
-        g, lock, _ = await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")])
+        g, _ = await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")])
         model_name, be_id, slot_id = g
 
         # Simulate the outer finally from chat() with stream=True
@@ -1109,12 +1054,12 @@ def test_streaming_release_not_in_outer_finally():
         if not stream:
             sm.release(model_name, be_id, slot_id)
 
-        # Lock should still be held — reader is responsible for release
-        assert lock.locked(), "Streaming slot should NOT be released by outer finally"
+        # Slot should still be in-use — reader is responsible for release
+        assert sm._in_use[g], "Streaming slot should NOT be released by outer finally"
 
         # Now simulate the reader's finally releasing it
         sm.release(model_name, be_id, slot_id)
-        assert not lock.locked(), "Reader's release should unlock the slot"
+        assert not sm._in_use[g], "Reader's release should clear the in-use flag"
 
     asyncio.run(_run())
     print("PASS: test_streaming_release_not_in_outer_finally")
@@ -1476,7 +1421,8 @@ def test_resolve_any_no_models():
 
 def test_cache_hit_selects_best_ratio():
     """Two backends have cache hits (ratios 0.95 and 0.70). Select 0.95."""
-    from hashing import write_meta, meta_key
+    from kv_meta_manager import write_meta, find_restore_candidate
+    from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
     import tempfile
     import os
@@ -1521,7 +1467,7 @@ def test_cache_hit_selects_best_ratio():
             for opt_name, be_list in [("model-a", ["be1"]), ("model-b", ["be2"])]:
                 mk = meta_key(opt_name, prefix)
                 for be_id in be_list:
-                    cand = hs.find_restore_candidate(mk, 100, 0.2, req_blocks, be_id)
+                    cand = find_restore_candidate(mk, 100, 0.2, req_blocks, be_id)
                     if cand and cand[1] > best_ratio:
                         best_ratio = cand[1]
                         best_restore_key = mk
@@ -1537,14 +1483,14 @@ def test_cache_hit_selects_best_ratio():
 
 def test_cache_hit_across_canonical_models():
     """Client requests 'qwen3.6', resolves to two canonical models. Each has a cache hit."""
-    from hashing import write_meta, meta_key
+    from kv_meta_manager import write_meta, find_restore_candidate
+    from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
     import tempfile
     import os
 
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
-        import hashing as hs
         old_meta_dir = config.META_DIR
         config.META_DIR = tmpdir
 
@@ -1569,8 +1515,8 @@ def test_cache_hit_across_canonical_models():
             key_a = meta_key("qwen3.6-32b", prefix)
             key_b = meta_key("qwen3.6-8b", prefix)
 
-            hs.write_meta(key_a, prefix, blocks_a, 100, "qwen3.6-32b", "be1")
-            hs.write_meta(key_b, prefix, blocks_b, 100, "qwen3.6-8b", "be2")
+            write_meta(key_a, prefix, blocks_a, 100, "qwen3.6-32b", "be1")
+            write_meta(key_b, prefix, blocks_b, 100, "qwen3.6-8b", "be2")
 
             best_ratio = 0.0
             best_canonical = None
@@ -1578,7 +1524,7 @@ def test_cache_hit_across_canonical_models():
             for dm in backend_manager.get_discovered_models("qwen3.6"):
                 mk = meta_key(dm.name, prefix)
                 for be_id in dm.backends:
-                    cand = hs.find_restore_candidate(mk, 100, 0.2, req_blocks, be_id)
+                    cand = find_restore_candidate(mk, 100, 0.2, req_blocks, be_id)
                     if cand and cand[1] > best_ratio:
                         best_ratio = cand[1]
                         best_canonical = dm.name
@@ -1619,7 +1565,7 @@ def test_no_cache_fallback_lru():
             async def _run():
                 await backend_manager.discover_models()
                         # No cache files exist, so acquire should fall back to LRU
-                g, lock, restored = await sm.acquire_for_request([("10.0.0.1:8000", "model-a")], prompt_tokens=10)
+                g, restored = await sm.acquire_for_request([("10.0.0.1:8000", "model-a")], prompt_tokens=10)
                 return g
 
             result = asyncio.run(_run())
@@ -1638,9 +1584,9 @@ def test_meta_key_uses_canonical_name():
     import hashlib
 
     canonical = "qwen3.6-32b-instruct"
-    prefix = "hello world"
-    expected = hashlib.sha256(f"{canonical}\n{prefix}".encode("utf-8")).hexdigest()
-    result = meta_key(canonical, prefix)
+    token_ids = [123, 456, 789]
+    expected = hashlib.sha256(f"{canonical}\n{','.join(str(t) for t in token_ids)}".encode("utf-8")).hexdigest()
+    result = meta_key(canonical, token_ids)
     assert result == expected, f"Expected {expected}, got {result}"
     print("PASS: test_meta_key_uses_canonical_name")
 
@@ -1692,6 +1638,7 @@ def test_prompt_too_long_rejected():
     )
 
     mock_client = AsyncMock()
+    mock_client.tokenize = AsyncMock(return_value=[0] * 4097)
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     # Set up app state (normally done in startup event)
@@ -1784,6 +1731,8 @@ def test_chat_substring_model_resolution():
     mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
     mock_client.discover_models = AsyncMock(return_value=[("qwen3.6-32b-instruct", 32768)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+    mock_client.tokenize = AsyncMock(return_value=[123, 456])
+    mock_client.save_slot = AsyncMock(return_value=(True, 1024))
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     # Set up app state (normally done in startup event)
@@ -1847,6 +1796,8 @@ def test_chat_any_model_routing():
     mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
     mock_client.discover_models = AsyncMock(return_value=[("model-x", 16384)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+    mock_client.tokenize = AsyncMock(return_value=[123, 456])
+    mock_client.save_slot = AsyncMock(return_value=(True, 1024))
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     # Set up app state (normally done in startup event)
@@ -1871,7 +1822,8 @@ def test_chat_any_model_routing():
 
 def test_chat_any_with_cache_hit():
     """Client requests 'any', multiple canonical models have cache hits. Selects best cache hit."""
-    from hashing import write_meta, meta_key
+    from kv_meta_manager import write_meta
+    from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
     import tempfile
     import os
@@ -1881,7 +1833,6 @@ def test_chat_any_with_cache_hit():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
-        import hashing as hs
         old_meta_dir = config.META_DIR
         old_cache_dir = config.CACHE_DIR
         config.META_DIR = tmpdir
@@ -1902,22 +1853,26 @@ def test_chat_any_with_cache_hit():
             )
 
             # Create meta files: model-a has ratio 0.95, model-b has ratio 0.70
-            prefix = "test prompt for cache hit"
+            token_ids = [123, 456, 789, 101, 102, 103, 104, 105, 106, 107]
             blocks_a = ["blk1", "blk2", "blk3", "blk4", "blk5"]
             blocks_b = ["blk1", "blk2", "x", "x", "x"]
 
-            key_a = meta_key("model-a", prefix)
-            key_b = meta_key("model-b", prefix)
+            key_a = meta_key("model-a", token_ids)
+            key_b = meta_key("model-b", token_ids)
 
-            hs.write_meta(key_a, prefix, blocks_a, 100, "model-a", "10.0.0.1:8000")
-            hs.write_meta(key_b, prefix, blocks_b, 100, "model-b", "10.0.0.1:9000")
+            write_meta(key_a, 10, blocks_a, 100, "model-a", "10.0.0.1:8000")
+            write_meta(key_b, 10, blocks_b, 100, "model-b", "10.0.0.1:9000")
 
-            mock_client = AsyncMock(spec=LlamaClient)
-            mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
-            mock_client.discover_models = AsyncMock(return_value=[("model-a", 32768), ("model-b", 16384)])
-            mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
-            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
-            backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': AsyncMock(spec=LlamaClient), 'agent_client': None})()
+            mock_client_a = AsyncMock(spec=LlamaClient)
+            mock_client_a.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
+            mock_client_a.discover_models = AsyncMock(return_value=[("model-a", 32768), ("model-b", 16384)])
+            mock_client_a.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+            mock_client_a.tokenize = AsyncMock(return_value=token_ids)
+            mock_client_a.save_slot = AsyncMock(return_value=(True, 1024))
+            mock_client_b = AsyncMock(spec=LlamaClient)
+            mock_client_b.tokenize = AsyncMock(return_value=token_ids)
+            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client_a, 'agent_client': None})()
+            backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': mock_client_b, 'agent_client': None})()
 
             # Set up app state (normally done in startup event)
             from slot_manager import SlotManager
@@ -1929,11 +1884,11 @@ def test_chat_any_with_cache_hit():
             client = TestClient(app_mod.app)
             resp = client.post("/v1/chat/completions", json={
                 "model": "any",
-                "messages": [{"role": "user", "content": prefix}],
+                "messages": [{"role": "user", "content": "test prompt for cache hit"}],
             })
 
             assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
-            call_args = mock_client.chat_completions.call_args
+            call_args = mock_client_a.chat_completions.call_args
             assert call_args is not None
             body = call_args[0][0]
             # Should have routed to model-a (better cache hit)
@@ -1954,13 +1909,10 @@ def test_acquire_for_request_retries_on_lock_timeout():
         sm = SlotManager()
         sm._slot_pools[("ModelA", "10.0.0.1:8000")] = {0, 1}
         sm._slot_pools[("ModelA", "10.0.0.2:8000")] = {0, 1}
-        sm._locks["ModelA", "10.0.0.1:8000", 0] = asyncio.Lock()
-        sm._locks["ModelA", "10.0.0.1:8000", 1] = asyncio.Lock()
-        sm._locks["ModelA", "10.0.0.2:8000", 0] = asyncio.Lock()
-        sm._locks["ModelA", "10.0.0.2:8000", 1] = asyncio.Lock()
-        # Pre-acquire both slots on backend 1 so it's fully busy
-        await sm._locks["ModelA", "10.0.0.1:8000", 0].acquire()
-        await sm._locks["ModelA", "10.0.0.1:8000", 1].acquire()
+        sm._in_use[("ModelA", "10.0.0.1:8000", 0)] = True
+        sm._in_use[("ModelA", "10.0.0.1:8000", 1)] = True
+        sm._in_use[("ModelA", "10.0.0.2:8000", 0)] = False
+        sm._in_use[("ModelA", "10.0.0.2:8000", 1)] = False
 
         backend_manager._discovered_models = {
             "ModelA": DiscoveredModel(
@@ -1973,10 +1925,10 @@ def test_acquire_for_request_retries_on_lock_timeout():
         # Mock refresh_slots to avoid it overwriting our pre-acquired locks
         sm.refresh_slots = AsyncMock()
 
-        # Cache backend is 10.0.0.1:8000 (lock busy), fallback is 10.0.0.2:8000
+        # Cache backend is 10.0.0.1:8000 (all slots in-use), fallback is 10.0.0.2:8000
         restore_info = ("test_key", "10.0.0.1:8000", "ModelA")
         candidate_backends = [("10.0.0.2:8000", "ModelA")]
-        g, lock, restored = await sm.acquire_for_request(
+        g, restored = await sm.acquire_for_request(
             candidate_backends, restore_info, prompt_tokens=10,
         )
         model_name, be_id, slot_id = g
@@ -2008,6 +1960,7 @@ def test_chat_save_skipped_when_ratio_above_threshold():
     mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
     mock_client.discover_models = AsyncMock(return_value=[("test-model", 32768)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
+    mock_client.tokenize = AsyncMock(return_value=[123, 456, 789])
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
@@ -2027,10 +1980,8 @@ def test_chat_save_skipped_when_ratio_above_threshold():
     sm.save_after = track_save
 
     with patch("hashing.raw_prefix", return_value="hello world"), \
-         patch("hashing.words_from_text", return_value=["hello", "world"]), \
-         patch("hashing.block_hashes_from_text", return_value=["hash1"]), \
-         patch("hashing.meta_key", return_value="test_key"), \
-         patch("hashing.find_best_restore_candidate", return_value=("test_key", 0.95)):
+         patch("hashing.block_hashes_from_tokens", return_value=["hash1"]), \
+         patch("kv_meta_manager.find_best_restore_candidate", return_value=("test_key", 0.95)):
 
         client = TestClient(app_mod.app)
         resp = client.post("/v1/chat/completions", json={
@@ -2062,6 +2013,7 @@ def test_chat_save_performed_when_ratio_below_threshold():
     mock_client.discover_models = AsyncMock(return_value=[("test-model", 32768)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
+    mock_client.tokenize = AsyncMock(return_value=list(range(600)))
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
@@ -2080,20 +2032,15 @@ def test_chat_save_performed_when_ratio_below_threshold():
         return await original_save(*args, **kwargs)
     sm.save_after = track_save
 
-    # Generate a prompt with 600 words to trigger big request path
-    big_prompt = " ".join(["word" + str(i) for i in range(600)])
-
-    with patch("hashing.raw_prefix", return_value=big_prompt), \
-         patch("hashing.words_from_text", return_value=[f"word{i}" for i in range(600)]), \
-         patch("hashing.block_hashes_from_text", return_value=[f"hash{i}" for i in range(6)]), \
-         patch("hashing.meta_key", return_value="test_key"), \
-         patch("hashing.find_best_restore_candidate", return_value=("test_key", 0.5)), \
-         patch("hashing.write_meta"):
+    with patch("hashing.raw_prefix", return_value="big prompt"), \
+         patch("hashing.block_hashes_from_tokens", return_value=[f"hash{i}" for i in range(6)]), \
+         patch("kv_meta_manager.find_best_restore_candidate", return_value=("test_key", 0.5)), \
+         patch("kv_meta_manager.write_meta"):
 
         client = TestClient(app_mod.app)
         resp = client.post("/v1/chat/completions", json={
             "model": "test-model",
-            "messages": [{"role": "user", "content": big_prompt}],
+            "messages": [{"role": "user", "content": "big prompt for testing"}],
             "stream": False,
         })
 
@@ -2137,15 +2084,14 @@ if __name__ == "__main__":
     # Backend-down fix verification tests
     test_slot_timeout_config()
     test_restore_slot_times_out_on_slow_backend()
-    test_save_slot_times_out_on_slow_backend()
-    test_lock_acquire_has_timeout()
+    test_save_slot_returns_false_on_exception()
     test_adaptive_cooldown_on_failure()
     test_lock_released_on_restore_failure()
 
     # Cancellation handling tests
     test_non_streaming_cancelled_error_releases_slot()
     test_streaming_save_after_skipped_on_cancel()
-    test_streaming_save_after_has_timeout()
+    test_streaming_save_after_exception()
     test_streaming_gen_sets_cancelled_flag()
     test_streaming_release_not_in_outer_finally()
     test_reader_polls_is_disconnected_on_timeout()

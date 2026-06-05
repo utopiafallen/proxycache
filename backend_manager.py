@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 from config import BACKENDS, REFRESH_COOLDOWN_SECONDS, DEFAULT_N_CTX
 from llama_client import LlamaClient
 from cache_agent_client import CacheAgentClient
+from hashing import sanitize_backend_dir
 
 log = logging.getLogger(__name__)
 
@@ -60,11 +61,12 @@ class BackendManager:
 
         for be in backends_config:
             url = be["url"].rstrip("/")
-            key = url.split("://")[-1]  # "10.0.0.1:8000"
+            raw_key = url.split("://")[-1]  # "10.0.0.1:8000"
+            key = sanitize_backend_dir(raw_key)  # "10-0-0-1-8000"
             client = LlamaClient(url)
             agent_client = None
             if "agent_port" in be:
-                host = key.rsplit(":", 1)[0]
+                host = raw_key.rsplit(":", 1)[0]
                 agent_client = CacheAgentClient(f"http://{host}:{be['agent_port']}")
             self._backends[key] = BackendInfo(client=client, agent_client=agent_client)
             if self._first_key is None:

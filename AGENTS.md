@@ -43,7 +43,7 @@ python test_smoke.py                           # smoke tests (no framework, uses
 - **Streaming**: background `reader` task races socket reads against disconnect event → `asyncio.Queue`. Heartbeat checks `is_disconnected()` every 0.5s. `stream()`'s `finally` calls `_cleanup()` which saves the slot only if `_stream_complete` is True (stream finished normally, not cancelled mid-stream), then releases it.
 - **Slot acquire timeout**: 60s hardcoded (`ACQUIRE_TIMEOUT` in app.py). Returns 503 if all slots busy.
 - **Slot timeout**: `SLOT_TIMEOUT` (default 30s) wraps `/slots/{id}?action=save|restore`. Separate from `REQUEST_TIMEOUT` (600s).
-- **Small requests** (`< BIG_THRESHOLD_WORDS`, default 500 words) skip cache I/O entirely — routed to free/oldest slot.
+
 - **KV cache skip**: `acquire_for_request` checks `_slot_kv_state` before restoring. If slot's tracked KV cache blocks have LCP ratio >= `KV_CACHE_SKIP_THRESHOLD` (default 0.9), restore is skipped — llama.cpp appends to existing cache.
 - **Ring buffer eviction**: `SlotManager` evicts expired entries (age-first) then LRU when `_total_bytes > CACHE_MAX_SIZE_GB`. Only triggers on saves.
 - **Slot refresh cooldown**: 300s per (model, backend) pair on success, 30s on failure. On-demand discovery via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode). Falls back to 1 slot if discovery fails.

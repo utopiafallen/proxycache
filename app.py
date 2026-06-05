@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS,
+from config import (BACKENDS, WORDS_PER_BLOCK,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
                     CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
                     SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD)
@@ -46,6 +46,7 @@ from slot_manager import SlotManager
 log = logging.getLogger(__name__)
 
 from backend_manager import backend_manager
+from kv_meta_manager import kv_meta
 
 ACQUIRE_TIMEOUT = 60.0
 STREAM_QUEUE_SIZE = 16
@@ -57,7 +58,7 @@ app = FastAPI(title="Simple KV Proxy")
 @app.on_event("startup")
 async def startup():
     sm = SlotManager()
-    sm.init_from_disk(CACHE_DIR)
+    await sm.init_from_disk(CACHE_DIR)
 
     app.state.sm = sm
     app.state.executor = ThreadPoolExecutor(max_workers=2)
@@ -67,14 +68,15 @@ async def startup():
     backend_keys = list(backend_manager._backends.keys())
     backend_agents = {k: v.agent_client.base_url if v.agent_client else None for k, v in backend_manager._backends.items()}
     backend_agents = {k: v for k, v in backend_agents.items() if v is not None}
-    reconciled = await hs.reconcile_meta(META_DIR, CACHE_DIR, backend_keys, backend_agents)
+    reconciled = await kv_meta.reconcile(CACHE_DIR, backend_keys, backend_agents)
     if reconciled > 0:
         log.info("Cleaned up %d orphaned/corrupted meta files at startup", reconciled)
 
     # Log startup sanity summary
     if CACHE_DIR and os.path.isdir(CACHE_DIR):
         cache_files = len(os.listdir(CACHE_DIR))
-        log.info("After startup reconcile: %d meta files, %d cache files on disk", len(hs.scan_all_meta()), cache_files)
+        meta_count = sum(len(kv_meta.list_keys(k)) for k in backend_keys)
+        log.info("After startup reconcile: %d meta files, %d cache files on disk", meta_count, cache_files)
 
     # Start liveness checker
     await backend_manager.start_liveness_checker()
@@ -103,7 +105,7 @@ async def models():
 class StreamReader:
     def __init__(self, resp: httpx.Response, req: Request,
                  model_name: str, backend_id: str, slot_id: int,
-                 key: str, prefix: str, blocks: List[str],
+                 key: str, n_tokens: int, blocks: List[str],
                  sm: SlotManager, best_ratio: float = 0.0):
         self.resp = resp
         self.req = req
@@ -111,7 +113,7 @@ class StreamReader:
         self.backend_id = backend_id
         self.slot_id = slot_id
         self.key = key
-        self.prefix = prefix
+        self.n_tokens = n_tokens
         self.blocks = blocks
         self.sm = sm
         self.best_ratio = best_ratio
@@ -232,16 +234,12 @@ class StreamReader:
             return False
         ok = False
         try:
-            ok, _ = await asyncio.wait_for(
-                self.sm.save_after(
-                    self.model_name, self.backend_id, self.slot_id,
-                    self.key, self.blocks,
-                ),
-                timeout=SLOT_TIMEOUT,
+            ok, cache_size = await self.sm.save_after(
+                self.model_name, self.backend_id, self.slot_id,
+                self.key, self.blocks,
             )
-        except asyncio.TimeoutError:
-            log.warning("Cache save timed out for model '%s' on backend '%s' slot %d after %ds",
-                        self.model_name, self.backend_id, self.slot_id, SLOT_TIMEOUT)
+            log.info("SAVE: model_name='%s', key='%s', backend='%s', model_id_in_meta='%s'",
+                     self.model_name, self.key[:16], self.backend_id, self.model_name)
         except asyncio.CancelledError:
             log.warning("Cache save cancelled for model '%s' on backend '%s' slot %d",
                         self.model_name, self.backend_id, self.slot_id)
@@ -250,8 +248,8 @@ class StreamReader:
                         self.model_name, self.backend_id, self.slot_id, e)
         if ok:
             try:
-                hs.write_meta(self.key, self.prefix, self.blocks,
-                              WORDS_PER_BLOCK, self.model_name, self.backend_id)
+                kv_meta.write_meta(self.key, self.n_tokens, self.blocks,
+                                   WORDS_PER_BLOCK, self.model_name, self.backend_id, cache_size)
             except Exception as e:
                 log.warning("Failed to write meta file %s: %s", self.key_short, e)
         return ok
@@ -356,47 +354,52 @@ async def chat(req: Request):
             if not options:
                 return JSONResponse({"error": f"model '{client_model}' not found"}, status_code=400)
 
-        # 2. Validate prompt length (early reject with 400)
+        # 2. Tokenize + scan for cache hits
         prefix = hs.raw_prefix(messages)
-        prompt_tokens = len(hs.words_from_text(prefix))
+        first_opt = options[0]
+        first_client = backend_manager.get_client(first_opt.backends[0])
+        first_token_ids = await first_client.tokenize(prefix)
+        prompt_tokens = len(first_token_ids)
         min_ctx = min(opt.n_ctx for opt in options)
         if prompt_tokens >= min_ctx:
             return JSONResponse(
                 {"error": f"prompt too long (tokens={prompt_tokens}, n_ctx={min_ctx})"},
                 status_code=400,
             )
+        canonical_name = first_opt.name
 
-        # 3. Hash prefix
-        blocks = hs.block_hashes_from_text(prefix, WORDS_PER_BLOCK)
-        is_big = prompt_tokens >= BIG_THRESHOLD_WORDS
-
-        # 4. Scan kv-meta across all backends for cache hits (cache-first)
         restore_key = None
         restore_backend = None
         best_ratio = 0.0
-        canonical_name = None
         key = None
-        if is_big:
-            for opt in options:
-                for be_id in opt.backends:
-                    cand = hs.find_best_restore_candidate(blocks, WORDS_PER_BLOCK, LCP_TH, opt.name, be_id)
-                    if cand and cand[1] > best_ratio:
-                        best_ratio = cand[1]
-                        restore_key = cand[0]
-                        restore_backend = be_id
-                        canonical_name = opt.name
-                        key = cand[0]
-        # Fallback: use first option if no cache hit found
-        if canonical_name is None:
-            canonical_name = options[0].name
-            key = hs.meta_key(canonical_name, prefix)
+        blocks = None
+        for opt in options:
+            for be_id in opt.backends:
+                opt_client = backend_manager.get_client(be_id)
+                try:
+                    opt_token_ids = await opt_client.tokenize(prefix)
+                except Exception:
+                    continue
+                opt_blocks = hs.block_hashes_from_tokens(opt_token_ids, WORDS_PER_BLOCK)
+                cand = kv_meta.find_best_restore_candidate(opt_blocks, WORDS_PER_BLOCK, LCP_TH, opt.name, be_id)
+                if cand and cand[1] > best_ratio:
+                    best_ratio = cand[1]
+                    restore_key = cand[0]
+                    restore_backend = be_id
+                    canonical_name = opt.name
+                    key = hs.meta_key(opt.name, opt_token_ids)
+                    blocks = opt_blocks
+                    log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
+                             restore_key[:16], canonical_name, restore_backend, best_ratio)
 
         log.info(
-            "Chat request from %s: model '%s', %d words, big=%s, restore key=%s on backend %s",
-            client_ip, is_big, prompt_tokens, client_model,
+            "Chat request from %s: model '%s', %d tokens, restore key=%s on backend %s",
+            client_ip, client_model, prompt_tokens,
             restore_key[:16] if restore_key else None,
             restore_backend,
         )
+
+        
 
         # 5. Build candidate backends list (fallback ONLY, cache backend excluded)
         candidate_backends: list[tuple[str, str]] = []
@@ -414,7 +417,7 @@ async def chat(req: Request):
         restore_info: Optional[tuple[str, str, str]] = None
         if restore_key and restore_backend:
             restore_info = (restore_key, restore_backend, canonical_name)
-        g, lock, restored = await asyncio.wait_for(
+        g, restored = await asyncio.wait_for(
             sm.acquire_for_request(candidate_backends, restore_info, blocks, prompt_tokens),
             timeout=ACQUIRE_TIMEOUT,
         )
@@ -425,8 +428,14 @@ async def chat(req: Request):
     model_name, be_id, slot_id = g
     client = backend_manager.get_client(be_id)
 
-    log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s",
-             model_name, be_id, slot_id, restored)
+    # Fallback: if no cache hit found, generate key/blocks from the serving backend's model name
+    if key is None:
+        key = hs.meta_key(model_name, first_token_ids)
+        blocks = hs.block_hashes_from_tokens(first_token_ids, WORDS_PER_BLOCK)
+        log.info("No cache hit: using key '%s' for model '%s' (client model '%s')", key[:16], model_name, client_model)
+
+    log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s, key='%s', canonical_name='%s'",
+             model_name, be_id, slot_id, restored, key[:16], canonical_name)
 
     # Forward canonical name to backend
     body = dict(data)
@@ -441,12 +450,11 @@ async def chat(req: Request):
     body["cache_prompt"] = True
 
     log.info(
-        "Dispatching request from client %s: model '%s' on backend '%s' slot %d, big=%s, restore=%s, restored=%s",
+        "Dispatching request from client %s: model '%s' on backend '%s' slot %d, restore=%s, restored=%s",
         client_ip,
         model_name,
         be_id,
         slot_id,
-        is_big,
         restore_key[:16] if restore_key else None,
         restored,
     )
@@ -468,7 +476,7 @@ async def chat(req: Request):
                 )
 
             reader = StreamReader(resp, req, model_name, be_id, slot_id,
-                                  key, prefix, blocks, sm, best_ratio)
+                                  key, prompt_tokens, blocks, sm, best_ratio)
             gen = reader.stream()
             _reader_created = True
 
@@ -495,19 +503,22 @@ async def chat(req: Request):
                 )
 
             ok = False
-            if is_big and best_ratio < CACHE_SAVE_RATIO_THRESHOLD:
-                ok, _ = await sm.save_after(
+            if best_ratio < CACHE_SAVE_RATIO_THRESHOLD:
+                ok, cache_size = await sm.save_after(
                     model_name, be_id, slot_id, key, blocks,
                 )
                 if ok:
-                    hs.write_meta(
+                    kv_meta.write_meta(
                         key,
-                        prefix,
+                        prompt_tokens,
                         blocks,
                         WORDS_PER_BLOCK,
                         canonical_name,
                         be_id,
+                        cache_size,
                     )
+            else:
+                sm._slot_save_skipped[(model_name, be_id, slot_id)] = True
 
             # log.info(
             #     "json_response\n%s",

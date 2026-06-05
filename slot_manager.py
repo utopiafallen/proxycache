@@ -10,6 +10,8 @@ SlotManager: per-model slot pools with lazy discovery and refresh cooldown.
 - Router mode: discovers slot counts via GET /models + child /slots.
 - Non-router mode: uses GET /slots as before.
 - Ring buffer: tracks cache size in memory, evicts expired entries first, then LRU.
+- Slots tracked by in-use flag (not lock) — acquisition checks flag non-blocking,
+  falls back to next slot; if no slots available, sleeps 5s and retries up to 6 times.
 """
 
 import os
@@ -24,6 +26,7 @@ from config import META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, 
     KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK, SLOT_TIMEOUT, DEFAULT_N_CTX
 import hashing as hs
 from backend_manager import backend_manager
+from kv_meta_manager import kv_meta
 
 log = logging.getLogger(__name__)
 
@@ -35,15 +38,13 @@ ModelBackend = Tuple[str, str]
 SlotPools = Dict[ModelBackend, set[int]]
 # (canonical_model_name, backend_id, slot_id) -> last_used timestamp
 LastUsedMap = Dict[GSlot, float]
-# (canonical_model_name, backend_id, slot_id) -> asyncio.Lock
-LockMap = Dict[GSlot, asyncio.Lock]
 
 
 class SlotManager:
     def __init__(self):
         self._slot_pools: SlotPools = {}
         self._last_used: LastUsedMap = {}
-        self._locks: LockMap = {}
+        self._in_use: Dict[GSlot, bool] = {}
 
         # Per-backend cache ring buffer: backend_id -> deque of (key, size_bytes, last_used_time)
         self._cache_ring: Dict[str, deque] = {}
@@ -53,6 +54,8 @@ class SlotManager:
 
         # Per-slot KV cache block state — tracks hash blocks currently in each slot
         self._slot_kv_state: Dict[GSlot, List[str]] = {}
+        # Per-slot save skip tracking — True if last save was intentionally skipped
+        self._slot_save_skipped: Dict[GSlot, bool] = {}
 
         log.info("Cache entry expiry set to %d hours", CACHE_MAX_AGE_HOURS)
 
@@ -84,61 +87,118 @@ class SlotManager:
 
     def _evict_meta_file(self, key: str):
         """Delete the meta file for a cache entry."""
-        hs.delete_meta_file(key)
+        kv_meta.delete_meta_file(key)
 
-    def init_from_disk(self, cache_dir: str):
-        """Populate ring buffer from existing cache files on disk."""
-        if not cache_dir or not os.path.isdir(cache_dir):
+    async def init_from_disk(self, cache_dir: str):
+        """Populate ring buffer from existing cache files on disk.
+        Also performs a cleanup pass to remove expired entries.
+        """
+        if not os.path.isdir(META_DIR):
             return
+
+        total_loaded = 0
+        total_bytes_loaded = 0
+        expired_evicted = 0
+        expired_bytes = 0
+        lru_evicted = 0
+        lru_bytes = 0
+
         # Scan meta files in backend subdirectories to discover cached keys per backend
-        if os.path.isdir(META_DIR):
-            for backend_dir in os.listdir(META_DIR):
-                backend_path = os.path.join(META_DIR, backend_dir)
-                if not os.path.isdir(backend_path):
+        for backend_dir in os.listdir(META_DIR):
+            backend_path = os.path.join(META_DIR, backend_dir)
+            if not os.path.isdir(backend_path):
+                continue
+            ring = self._cache_ring.setdefault(backend_dir, deque())
+            for key in kv_meta.list_keys(backend_dir):
+                if any(entry[0] == key for entry in ring):
                     continue
-                ring = self._cache_ring.setdefault(backend_dir, deque())
-                total = self._total_bytes.setdefault(backend_dir, 0)
-                for meta_file in os.listdir(backend_path):
-                    if not meta_file.endswith(hs.META_SUFFIX):
+                try:
+                    cache_size = await kv_meta.get_cache_size(key, backend_dir, cache_dir)
+                    if not cache_size:
                         continue
-                    key = meta_file.removesuffix(hs.META_SUFFIX)
-                    # Skip if already in ring buffer for this backend
-                    if any(entry[0] == key for entry in ring):
-                        continue
-                    try:
-                        cache_path = os.path.join(cache_dir, key)
-                        if os.path.exists(cache_path):
-                            size = os.stat(cache_path).st_size
-                            last_used = hs._get_last_used_time(key, META_DIR, cache_dir, backend_dir)
-                            ring.append((key, size, last_used))
-                            self._total_bytes[backend_dir] = total + size
-                    except OSError:
-                        continue
-        total_files = sum(len(r) for r in self._cache_ring.values())
-        total_bytes = sum(self._total_bytes.values())
-        log.info("Loaded %d cache files from disk, total %.1f GB", total_files, total_bytes / 1024**3)
+                    last_used = kv_meta.get_last_used_time(key, backend_dir, cache_dir)
+                    ring.append((key, cache_size, last_used))
+                    self._total_bytes[backend_dir] = self._total_bytes.get(backend_dir, 0) + cache_size
+                    total_loaded += 1
+                    total_bytes_loaded += cache_size
+                except OSError:
+                    continue
+
+        # Cleanup pass: evict expired + over-size entries
+        now = time.time()
+        max_bytes = CACHE_MAX_SIZE_GB * 1024**3
+        for backend_id, ring in self._cache_ring.items():
+            while ring:
+                entry = ring[0]
+                if now - entry[2] > self._max_age_seconds:
+                    evict_key, evict_size, _ = entry
+                    ring.popleft()
+                    self._total_bytes[backend_id] -= evict_size
+                    expired_evicted += 1
+                    expired_bytes += evict_size
+                    log.info(
+                        "Startup cleanup: evicting expired entry '%s' for backend '%s' (%d bytes)",
+                        evict_key, backend_id, evict_size,
+                    )
+                    await self._evict_cache_file(evict_key, backend_id, "startup_evict",
+                                                 "(%d bytes)" % evict_size)
+                    self._evict_meta_file(evict_key)
+                else:
+                    break
+
+            # Evict LRU entries if over target size
+            while self._total_bytes.get(backend_id, 0) > max_bytes and ring:
+                lru_idx = len(ring) - 1
+                lru_ts = ring[-1][2]
+                for i in range(len(ring) - 1):
+                    if ring[i][2] < lru_ts:
+                        lru_ts = ring[i][2]
+                        lru_idx = i
+                evict_key, evict_size, _ = ring[lru_idx]
+                ring.remove(ring[lru_idx])
+                self._total_bytes[backend_id] -= evict_size
+                lru_evicted += 1
+                lru_bytes += evict_size
+                log.info(
+                    "Startup cleanup: evicting LRU entry '%s' for backend '%s' (%d bytes, total now=%.1f GB)",
+                    evict_key, backend_id, evict_size, self._total_bytes.get(backend_id, 0) / 1024**3,
+                )
+                await self._evict_cache_file(evict_key, backend_id, "startup_evict",
+                                             "(%d bytes)" % evict_size)
+                self._evict_meta_file(evict_key)
+
+        per_backend = [(bid, self._total_bytes.get(bid, 0), len(self._cache_ring.get(bid, [])))
+                       for bid in self._cache_ring]
+        log.info(
+            "Loaded %d cache files from disk (%.1f GB), evicted %d expired (%.1f GB), "
+            "%d LRU (%.1f GB), per-backend: %s",
+            total_loaded, total_bytes_loaded / 1024**3,
+            expired_evicted, expired_bytes / 1024**3,
+            lru_evicted, lru_bytes / 1024**3,
+            "; ".join(f"{bid}: {sz / 1024**3:.1f} GB ({cnt} files)" for bid, sz, cnt in per_backend),
+        )
 
     def _is_free(self, model_name: str, backend_id: str, slot_id: int) -> bool:
-        return self._last_used.get((model_name, backend_id, slot_id), 0.0) == 0.0
+        return not self._in_use.get((model_name, backend_id, slot_id), False)
 
     def _get_free_or_oldest_from_pool(
         self, model_name: str, backend_id: str
-    ) -> Tuple[Optional[int], Optional[asyncio.Lock]]:
+    ) -> Tuple[Optional[int], bool]:
         """Pick free slot or oldest (LRU) from a single backend's pool for a model.
 
-        Returns (slot_id, lock) on success, (None, None) if no pool exists.
+        Returns (slot_id, in_use_flag) on success, (None, False) if no pool exists.
         """
         key = (model_name, backend_id)
         pool = self._slot_pools.get(key)
         if not pool:
-            return None, None
+            return None, False
 
         free = [s for s in pool if self._is_free(model_name, backend_id, s)]
         if free:
-            return free[0], self._locks[(model_name, backend_id, free[0])]
+            return free[0], self._in_use.get((model_name, backend_id, free[0]), False)
 
         oldest = min(pool, key=lambda s: self._last_used.get((model_name, backend_id, s), 0.0))
-        return oldest, self._locks[(model_name, backend_id, oldest)]
+        return oldest, self._in_use.get((model_name, backend_id, oldest), False)
 
     def _ensure_pool(self, model_name: str, backend_id: str, n_slots: int):
         """Create or update a slot pool for (model_name, backend_key)."""
@@ -147,7 +207,7 @@ class SlotManager:
             new_pool = set(range(n_slots))
             for s in new_pool:
                 self._last_used[(model_name, backend_id, s)] = 0.0
-                self._locks[(model_name, backend_id, s)] = asyncio.Lock()
+                self._in_use[(model_name, backend_id, s)] = False
             self._slot_pools[key] = new_pool
             log.info(
                 "Created slot pool for model '%s' on backend '%s' with %d slots",
@@ -160,13 +220,13 @@ class SlotManager:
             # Add new slots
             for s in new_pool - old_pool:
                 self._last_used[(model_name, backend_id, s)] = 0.0
-                self._locks[(model_name, backend_id, s)] = asyncio.Lock()
+                self._in_use[(model_name, backend_id, s)] = False
             # Remove old slots (only free ones)
             for s in old_pool - new_pool:
                 if self._is_free(model_name, backend_id, s):
                     self._slot_pools[key].discard(s)
                     self._last_used.pop((model_name, backend_id, s), None)
-                    self._locks.pop((model_name, backend_id, s), None)
+                    self._in_use.pop((model_name, backend_id, s), None)
             self._slot_pools[key] = new_pool
             log.info(
                 "Updated slot pool for model '%s' on backend '%s': %d -> %d slots",
@@ -201,20 +261,32 @@ class SlotManager:
         )
         return ratio >= KV_CACHE_SKIP_THRESHOLD
 
+    def _try_acquire(self, model_name: str, backend_id: str, slot_id: int) -> bool:
+        """Try to acquire a slot by setting its in-use flag. Returns True if acquired."""
+        g = (model_name, backend_id, slot_id)
+        if self._in_use.get(g, False):
+            return False
+        self._in_use[g] = True
+        self._last_used[g] = time.time()
+        return True
+
     async def acquire_for_request(
         self,
         candidate_backends: list[tuple[str, str]],
         restore_info: Optional[tuple[str, str, str]] = None,
         blocks: Optional[List[str]] = None,
         prompt_tokens: int = 0,
-    ) -> Tuple[GSlot, asyncio.Lock, Optional[bool]]:
-        """Acquire a slot, trying the cache backend first, then fallback candidates.
+    ) -> Tuple[GSlot, Optional[bool]]:
+        """Acquire a slot, checking all candidate backends before sleeping.
+
+        Uses in-use flag (not lock) — checks flag non-blocking across all backends.
+        If all slots across all backends are unavailable, sleeps 5s and retries up to 6 times.
 
         candidate_backends: list of fallback (backend_id, canonical_name) pairs
             (does NOT include the cache backend).
         restore_info: optional (restore_key, cache_backend, canonical_name) tuple.
-            If provided, the cache backend is tried first. If its lock times out,
-            fallback candidates are tried — but restore_key is only used if the
+            If provided, the cache backend is checked first. But if no slot is available
+            there, fallback candidates are tried — restore_key is only used if the
             cache backend was acquired (cache files are not shared between backends).
         """
         # Refresh slot counts for all discovered models (with cooldown)
@@ -223,54 +295,48 @@ class SlotManager:
             for canonical_name, n_slots in model_slots.items():
                 self._ensure_pool(canonical_name, backend_key, n_slots)
 
-        # Cap lock acquire timeout at 30s — don't let requests hang forever
-        lock_timeout = min(30.0, SLOT_TIMEOUT)
-
-        # Try cache backend first (if provided)
-        if restore_info:
-            restore_key, cache_backend, canonical_name = restore_info
-            min_ctx = backend_manager.get_model_n_ctx(canonical_name)
-            slot_id, lock = self._get_free_or_oldest_from_pool(canonical_name, cache_backend);
-            if prompt_tokens < min_ctx and slot_id is not None:
-                try:
-                    await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "Lock timed out after %ds for model '%s' on backend '%s' slot %d, trying fallback backends",
-                        canonical_name, cache_backend, slot_id, lock_timeout,
-                    )
-                else:
-                    self._last_used[(canonical_name, cache_backend, slot_id)] = time.time()
-                    effective_restore_key = restore_key
-                    return await self._restore_and_return(
-                        canonical_name, cache_backend, slot_id, lock,
-                        effective_restore_key, blocks,
-                    )
-
-        # Fallback: try candidate backends
-        for backend_id, canonical_name in candidate_backends:
-            if not canonical_name:
-                continue
-            min_ctx = backend_manager.get_model_n_ctx(canonical_name)
-            if prompt_tokens >= min_ctx:
-                continue
-            slot_id, lock = self._get_free_or_oldest_from_pool(canonical_name, backend_id)
-            if slot_id is None:
-                continue
-            try:
-                await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
-            except asyncio.TimeoutError:
-                log.warning(
-                    "Lock timed out after %ds for model '%s' on backend '%s' slot %d, trying next backend",
-                    canonical_name, backend_id, slot_id, lock_timeout,
+        # Retry loop: check all backends, sleep 5s if none available, retry up to 6 times
+        for attempt in range(7):
+            if attempt > 0:
+                log.info(
+                    "No slots available across all backends, retrying in 5s (attempt %d/6)", attempt,
                 )
-                continue
-            self._last_used[(canonical_name, backend_id, slot_id)] = time.time()
-            effective_restore_key: Optional[str] = None
-            return await self._restore_and_return(
-                canonical_name, backend_id, slot_id, lock,
-                effective_restore_key, blocks,
-            )
+                await asyncio.sleep(5)
+
+            # Phase 1: check cache backend first (if provided)
+            cache_acquired = False
+            if restore_info:
+                restore_key, cache_backend, canonical_name = restore_info
+                min_ctx = backend_manager.get_model_n_ctx(canonical_name)
+                if prompt_tokens < min_ctx:
+                    slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, cache_backend)
+                    if slot_id is not None and self._try_acquire(canonical_name, cache_backend, slot_id):
+                        cache_acquired = True
+                        return await self._restore_and_return(
+                            canonical_name, cache_backend, slot_id,
+                            restore_key, blocks,
+                        )
+
+            # Phase 2: check all fallback candidate backends
+            for backend_id, canonical_name in candidate_backends:
+                if not canonical_name:
+                    continue
+                min_ctx = backend_manager.get_model_n_ctx(canonical_name)
+                if prompt_tokens >= min_ctx:
+                    continue
+                slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, backend_id)
+                if slot_id is None:
+                    continue
+                if self._try_acquire(canonical_name, backend_id, slot_id):
+                    return await self._restore_and_return(
+                        canonical_name, backend_id, slot_id,
+                        None, blocks,
+                    )
+
+            # If cache backend was acquired in phase 1, we already returned above.
+            # If we're still here, no slot was available anywhere — continue to retry.
+            if attempt == 6:
+                break
 
         raise RuntimeError(f"No slots available for candidate_backends={len(candidate_backends)}")
 
@@ -279,13 +345,24 @@ class SlotManager:
         model_name: str,
         backend_id: str,
         slot_id: int,
-        lock: asyncio.Lock,
         effective_restore_key: Optional[str],
         blocks: Optional[List[str]],
-    ) -> Tuple[GSlot, asyncio.Lock, Optional[bool]]:
-        """Restore KV cache and return (g, lock, restored)."""
+    ) -> Tuple[GSlot, Optional[bool]]:
+        """Restore KV cache and return (g, restored)."""
         g = (model_name, backend_id, slot_id)
         restored: Optional[bool] = None
+
+        # If the slot's last save was skipped, save it now before overwriting with new cache
+        if self._slot_save_skipped.get(g, False):
+            client = backend_manager.get_client(backend_id)
+            save_key = f"pre_restore_{g[2]}_{int(time.time())}"
+            ok, size = await client.save_slot(slot_id, save_key, model_name)
+            self._slot_save_skipped[g] = False
+            if ok and size > 0:
+                log.info(
+                    "Saved skipped cache for model '%s' on backend '%s' slot %d (%d bytes) before restore",
+                    model_name, backend_id, slot_id, size,
+                )
 
         if blocks:
             if self._should_skip_restore(g, blocks):
@@ -303,12 +380,12 @@ class SlotManager:
                 )
                 if restored:
                     self._touch_ring(effective_restore_key, backend_id)
-                    blocks = hs.get_meta_blocks(effective_restore_key, backend_id)
+                    blocks = kv_meta.get_blocks(effective_restore_key, backend_id)
                     if blocks is not None:
                         self._slot_kv_state[g] = blocks
             else:
                 client = backend_manager.get_client(backend_id)
-                cand = hs.find_best_restore_candidate(
+                cand = kv_meta.find_best_restore_candidate(
                     blocks, WORDS_PER_BLOCK, LCP_TH, model_name, backend_id,
                 )
                 if cand:
@@ -319,7 +396,7 @@ class SlotManager:
                         model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
                     )
                     if restored:
-                        blocks = hs.get_meta_blocks(cand_key, backend_id)
+                        blocks = kv_meta.get_blocks(cand_key, backend_id)
                         if blocks is not None:
                             self._slot_kv_state[g] = blocks
                 else:
@@ -339,7 +416,7 @@ class SlotManager:
             if restored:
                 self._touch_ring(effective_restore_key, backend_id)
 
-        return g, lock, restored
+        return g, restored
 
     async def save_after(
         self,
@@ -352,23 +429,29 @@ class SlotManager:
         client = backend_manager.get_client(backend_id)
         ok, size = await client.save_slot(slot_id, key, model_name)
 
+        # Always track KV state for this slot — even if save failed, the slot
+        # was used for this request and its cache now corresponds to these blocks
+        if blocks:
+            g = (model_name, backend_id, slot_id)
+            self._slot_kv_state[g] = blocks
+            log.debug(
+                "Updated KV cache state for model '%s' on backend '%s' slot %d: %d blocks",
+                model_name, backend_id, slot_id, len(blocks),
+            )
+
         if ok and size > 0:
             ring = self._cache_ring.setdefault(backend_id, deque())
             ring.append((key, size, time.time()))
             self._total_bytes[backend_id] = self._total_bytes.get(backend_id, 0) + size
 
-            # Update tracked KV state for this slot
-            if blocks:
-                    g = (model_name, backend_id, slot_id)
-                    self._slot_kv_state[g] = blocks
-                    log.debug(
-                        "Updated KV cache state for model '%s' on backend '%s' slot %d: %d blocks",
-                        model_name, backend_id, slot_id, len(blocks),
-                    )
-
             # Ring buffer eviction: age-first, then LRU (per backend)
             max_bytes = CACHE_MAX_SIZE_GB * 1024**3
             now = time.time()
+            total = self._total_bytes.get(backend_id, 0)
+            log.info(
+                "Cache ring check for backend '%s': total=%d bytes, max=%d bytes, ring_size=%d",
+                backend_id, total, max_bytes, len(ring),
+            )
             while self._total_bytes.get(backend_id, 0) > max_bytes and ring:
                 # First pass: evict expired entries
                 evicted_expired = False
@@ -396,6 +479,10 @@ class SlotManager:
                 evict_key, evict_size, _ = ring[lru_idx]
                 ring.remove(ring[lru_idx])
                 self._total_bytes[backend_id] -= evict_size
+                log.info(
+                    "Ring buffer eviction: evicted LRU entry '%s' for backend '%s' (%d bytes, remaining=%d)",
+                    evict_key, backend_id, evict_size, self._total_bytes.get(backend_id, 0),
+                )
                 await self._evict_cache_file(evict_key, backend_id, "ring_evict_lru",
                                              "(%d bytes, last_used=%.0f)" % (evict_size, lru_ts))
                 self._evict_meta_file(evict_key)
@@ -404,10 +491,8 @@ class SlotManager:
 
     def release(self, model_name: str, backend_id: str, slot_id: int):
         g = (model_name, backend_id, slot_id)
-        lock = self._locks.get(g)
-        if lock and lock.locked():
-            lock.release()
-            self._last_used[g] = 0.0
+        self._in_use[g] = False
+        self._last_used[g] = 0.0
 
     def _touch_ring(self, key: str, backend_id: str):
         """Update the last_used timestamp for a cache entry in the ring buffer."""
