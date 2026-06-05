@@ -150,8 +150,7 @@ def find_best_restore_candidate(
 
         cand_blocks = meta.get("blocks") or []
         lcp = hs.lcp_blocks(req_blocks, cand_blocks)
-        denom = max(1, min(len(req_blocks), len(cand_blocks)))
-        ratio = lcp / denom
+        ratio = lcp / max(1, len(req_blocks))
 
         if ratio >= th and ratio > best_ratio:
             best_ratio = ratio
