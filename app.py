@@ -106,7 +106,7 @@ class StreamReader:
     def __init__(self, resp: httpx.Response, req: Request,
                  model_name: str, backend_id: str, slot_id: int,
                  key: str, n_tokens: int, blocks: List[str],
-                 sm: SlotManager, best_ratio: float = 0.0):
+                 sm: SlotManager, best_ratio: float = 0.0, restored: bool = False):
         self.resp = resp
         self.req = req
         self.model_name = model_name
@@ -117,6 +117,7 @@ class StreamReader:
         self.blocks = blocks
         self.sm = sm
         self.best_ratio = best_ratio
+        self.restored = restored
         self.queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
         self._cancelled = False
         self._stream_complete = False
@@ -225,7 +226,7 @@ class StreamReader:
         self.queue.put_nowait(None)
 
     async def _save(self) -> tuple:
-        if self.best_ratio >= CACHE_SAVE_RATIO_THRESHOLD:
+        if self.restored and self.best_ratio >= CACHE_SAVE_RATIO_THRESHOLD:
             log.info(
                 "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): restore ratio %.3f >= threshold",
                 self.model_name, self.backend_id, self.slot_id, self.key_short,
@@ -476,7 +477,7 @@ async def chat(req: Request):
                 )
 
             reader = StreamReader(resp, req, model_name, be_id, slot_id,
-                                  key, prompt_tokens, blocks, sm, best_ratio)
+                                  key, prompt_tokens, blocks, sm, best_ratio, restored)
             gen = reader.stream()
             _reader_created = True
 
@@ -503,7 +504,7 @@ async def chat(req: Request):
                 )
 
             ok = False
-            if best_ratio < CACHE_SAVE_RATIO_THRESHOLD:
+            if restored and best_ratio < CACHE_SAVE_RATIO_THRESHOLD:
                 ok, cache_size = await sm.save_after(
                     model_name, be_id, slot_id, key, blocks,
                 )
