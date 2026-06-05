@@ -113,7 +113,7 @@ def find_restore_candidate(
         return None
 
     lcp = hs.lcp_blocks(req_blocks, cand_blocks)
-    denom = max(1, min(len(req_blocks), len(cand_blocks)))
+    denom = max(1, len(req_blocks))
     ratio = lcp / denom
 
     if ratio >= th:

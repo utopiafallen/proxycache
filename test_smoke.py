@@ -1961,6 +1961,7 @@ def test_chat_save_skipped_when_ratio_above_threshold():
     mock_client.discover_models = AsyncMock(return_value=[("test-model", 32768)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.tokenize = AsyncMock(return_value=[123, 456, 789])
+    mock_client.apply_chat_template = AsyncMock(return_value="user: hello world\nassistant:")
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
@@ -1979,8 +1980,7 @@ def test_chat_save_skipped_when_ratio_above_threshold():
         return await original_save(*args, **kwargs)
     sm.save_after = track_save
 
-    with patch("hashing.raw_prefix", return_value="hello world"), \
-         patch("hashing.block_hashes_from_tokens", return_value=["hash1"]), \
+    with patch("hashing.block_hashes_from_tokens", return_value=["hash1"]), \
          patch("kv_meta_manager.find_best_restore_candidate", return_value=("test_key", 0.95)):
 
         client = TestClient(app_mod.app)
@@ -2014,6 +2014,7 @@ def test_chat_save_performed_when_ratio_below_threshold():
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
     mock_client.tokenize = AsyncMock(return_value=list(range(600)))
+    mock_client.apply_chat_template = AsyncMock(return_value="user: big prompt for testing\nassistant:")
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
@@ -2032,8 +2033,7 @@ def test_chat_save_performed_when_ratio_below_threshold():
         return await original_save(*args, **kwargs)
     sm.save_after = track_save
 
-    with patch("hashing.raw_prefix", return_value="big prompt"), \
-         patch("hashing.block_hashes_from_tokens", return_value=[f"hash{i}" for i in range(6)]), \
+    with patch("hashing.block_hashes_from_tokens", return_value=[f"hash{i}" for i in range(6)]), \
          patch("kv_meta_manager.find_best_restore_candidate", return_value=("test_key", 0.5)), \
          patch("kv_meta_manager.write_meta"):
 

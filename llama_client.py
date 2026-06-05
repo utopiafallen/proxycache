@@ -36,6 +36,14 @@ class LlamaClient:
     async def close(self):
         await self.client.aclose()
 
+    async def apply_chat_template(self, messages: list) -> str:
+        resp = await self.client.post(
+            "/apply-template",
+            json={"messages": messages},
+        )
+        resp.raise_for_status()
+        return resp.json().get("prompt", "")
+
     async def tokenize(self, text: str, add_special: bool = False) -> list[int]:
         resp = await self.client.post(
             "/tokenize",

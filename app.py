@@ -355,11 +355,11 @@ async def chat(req: Request):
             if not options:
                 return JSONResponse({"error": f"model '{client_model}' not found"}, status_code=400)
 
-        # 2. Tokenize + scan for cache hits
-        prefix = hs.raw_prefix(messages)
+        # 2. Apply chat template + tokenize, then scan for cache hits
         first_opt = options[0]
         first_client = backend_manager.get_client(first_opt.backends[0])
-        first_token_ids = await first_client.tokenize(prefix)
+        templated = await first_client.apply_chat_template(messages)
+        first_token_ids = await first_client.tokenize(templated)
         prompt_tokens = len(first_token_ids)
         min_ctx = min(opt.n_ctx for opt in options)
         if prompt_tokens >= min_ctx:
@@ -377,10 +377,8 @@ async def chat(req: Request):
         for opt in options:
             for be_id in opt.backends:
                 opt_client = backend_manager.get_client(be_id)
-                try:
-                    opt_token_ids = await opt_client.tokenize(prefix)
-                except Exception:
-                    continue
+                opt_templated = await opt_client.apply_chat_template(messages)
+                opt_token_ids = await opt_client.tokenize(opt_templated)
                 opt_blocks = hs.block_hashes_from_tokens(opt_token_ids, WORDS_PER_BLOCK)
                 cand = kv_meta.find_best_restore_candidate(opt_blocks, WORDS_PER_BLOCK, LCP_TH, opt.name, be_id)
                 if cand and cand[1] > best_ratio:
