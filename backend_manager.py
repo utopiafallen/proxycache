@@ -185,7 +185,7 @@ class BackendManager:
                 last_ts, last_success = self._refresh_state.get(refresh_key, (0.0, True))
                 cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
                 if now - last_ts < cooldown:
-                    log.debug("Skipping refresh for model '%s' on backend '%s': last refresh was %.1f seconds ago",
+                    log.warn("Skipping refresh for model '%s' on backend '%s': last refresh was %.1f seconds ago",
                               canonical_name, backend_key, last_ts)
                     continue
 

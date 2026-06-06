@@ -54,8 +54,8 @@ class SlotManager:
 
         # Per-slot KV cache block state — tracks hash blocks currently in each slot
         self._slot_kv_state: Dict[GSlot, List[str]] = {}
-        # Per-slot save skip tracking — True if last save was intentionally skipped
-        self._slot_save_skipped: Dict[GSlot, bool] = {}
+        # Per-slot save skip tracking — (key, blocks, n_tokens) if last save was intentionally skipped
+        self._slot_save_skipped: Dict[GSlot, tuple] = {}
 
         log.info("Cache entry expiry set to %d hours", CACHE_MAX_AGE_HOURS)
 
@@ -255,7 +255,7 @@ class SlotManager:
         lcp = hs.lcp_blocks(req_blocks, kv_blocks)
         denom = max(1, min(len(req_blocks), len(kv_blocks)))
         ratio = lcp / denom
-        log.debug(
+        log.warn(
             "Checking skip restore for model '%s' on backend '%s' slot %d: ratio=%.3f",
             g[0], g[1], g[2], ratio,
         )
@@ -297,12 +297,6 @@ class SlotManager:
 
         # Retry loop: check all backends, sleep 5s if none available, retry up to 6 times
         for attempt in range(7):
-            if attempt > 0:
-                log.info(
-                    "No slots available across all backends, retrying in 5s (attempt %d/6)", attempt,
-                )
-                await asyncio.sleep(5)
-
             # Phase 1: check cache backend first (if provided)
             cache_acquired = False
             if restore_info:
@@ -333,10 +327,11 @@ class SlotManager:
                         None, blocks,
                     )
 
-            # If cache backend was acquired in phase 1, we already returned above.
-            # If we're still here, no slot was available anywhere — continue to retry.
-            if attempt == 6:
-                break
+            # No slot available — exponential backoff before retrying (last iteration skips sleep)
+            if attempt < 6:
+                backoff = (attempt + 1) * 5
+                log.info("No slots available across all backends, retrying in %ds (attempt %d/6)", backoff, attempt + 1)
+                await asyncio.sleep(backoff)
 
         raise RuntimeError(f"No slots available for candidate_backends={len(candidate_backends)}")
 
@@ -352,14 +347,15 @@ class SlotManager:
         g = (model_name, backend_id, slot_id)
         restored: Optional[bool] = None
 
-        # If the slot's last save was skipped, save it now before overwriting with new cache
-        if self._slot_save_skipped.get(g, False):
-            client = backend_manager.get_client(backend_id)
-            save_key = f"pre_restore_{g[2]}_{int(time.time())}"
-            ok, size = await client.save_slot(slot_id, save_key, model_name)
-            self._slot_save_skipped[g] = False
-            if ok and size > 0:
-                log.info(
+        # If the slot's last save was skipped, do a full save now before
+        # overwriting the slot with new cache
+        if g in self._slot_save_skipped:
+            save_key, save_blocks, save_n_tokens = self._slot_save_skipped[g]
+            del self._slot_save_skipped[g]
+            ok, size = await self.save_after(
+                model_name, backend_id, slot_id, save_key, save_blocks, save_n_tokens,
+            )
+            log.info(
                     "Saved skipped cache for model '%s' on backend '%s' slot %d (%d bytes) before restore",
                     model_name, backend_id, slot_id, size,
                 )
@@ -425,6 +421,7 @@ class SlotManager:
         slot_id: int,
         key: str,
         blocks: Optional[List[str]] = None,
+        n_tokens: int = 0,
     ) -> Tuple[bool, int]:
         client = backend_manager.get_client(backend_id)
         ok, size = await client.save_slot(slot_id, key, model_name)
@@ -434,12 +431,19 @@ class SlotManager:
         if blocks:
             g = (model_name, backend_id, slot_id)
             self._slot_kv_state[g] = blocks
-            log.debug(
+            log.warn(
                 "Updated KV cache state for model '%s' on backend '%s' slot %d: %d blocks",
                 model_name, backend_id, slot_id, len(blocks),
             )
 
         if ok and size > 0:
+            # Write meta file — we never want cache files without corresponding meta
+            try:
+                kv_meta.write_meta(
+                    key, n_tokens, blocks, WORDS_PER_BLOCK, model_name, backend_id, size,
+                )
+            except Exception as e:
+                log.warning("Failed to write meta file for key %s: %s", key[:16], e)
             ring = self._cache_ring.setdefault(backend_id, deque())
             ring.append((key, size, time.time()))
             self._total_bytes[backend_id] = self._total_bytes.get(backend_id, 0) + size

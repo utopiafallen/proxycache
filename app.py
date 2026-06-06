@@ -51,6 +51,7 @@ from kv_meta_manager import kv_meta
 ACQUIRE_TIMEOUT = 60.0
 STREAM_QUEUE_SIZE = 16
 STREAM_QUEUE_TIMEOUT = 5.0
+RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS = 0.92
 
 app = FastAPI(title="Simple KV Proxy")
 
@@ -106,7 +107,8 @@ class StreamReader:
     def __init__(self, resp: httpx.Response, req: Request,
                  model_name: str, backend_id: str, slot_id: int,
                  key: str, n_tokens: int, blocks: List[str],
-                 sm: SlotManager, best_ratio: float = 0.0, restored: bool = False):
+                 sm: SlotManager, best_ratio: float = 0.0, restored: bool = False,
+                 restore_key: Optional[str] = None, restore_backend: Optional[str] = None):
         self.resp = resp
         self.req = req
         self.model_name = model_name
@@ -118,12 +120,18 @@ class StreamReader:
         self.sm = sm
         self.best_ratio = best_ratio
         self.restored = restored
+        self.restore_key = restore_key
+        self.restore_backend = restore_backend
         self.queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
         self._cancelled = False
         self._stream_complete = False
         self._task: asyncio.Task | None = None
         self._disconnect_event: asyncio.Event = asyncio.Event()
         self._cleaning_up = False
+        self._raw_response_body: bytearray = bytearray()
+        self._sse_line_buffer: str = ""
+        self._sse_prompt_tokens: int = 0
+        self._sse_cached_tokens: int = 0
         self.key_short = key[:16]
 
     def _log_response_info(self):
@@ -179,8 +187,49 @@ class StreamReader:
                         for t in pending:
                             t.cancel()
                         break
+                    except httpx.RemoteProtocolError:
+                        log.warning(
+                            "Backend closed stream for model '%s' on backend '%s' slot %d (key %s): incomplete body (%d chunks, %d bytes)",
+                            self.model_name, self.backend_id, self.slot_id, self.key_short,
+                            chunks_received, total_bytes,
+                        )
+                        self._disconnect_event.set()
+                        for t in pending:
+                            t.cancel()
+                        break
                     if chunk:
                         total_bytes += len(chunk)
+                        self._raw_response_body.extend(chunk)
+                        # Parse SSE events incrementally to extract usage.prompt_tokens
+                        try:
+                            text = chunk.decode("utf-8", errors="replace")
+                            self._sse_line_buffer += text
+                            while "\n" in self._sse_line_buffer:
+                                line, self._sse_line_buffer = self._sse_line_buffer.split("\n", 1)
+                                line = line.strip()
+                                if line.startswith("data: "):
+                                    data = line[6:].strip()
+                                    if data == "[DONE]":
+                                        break
+                                    try:
+                                        event = json.loads(data)
+                                        usage = event.get("usage")
+                                        if usage and isinstance(usage, dict):
+                                            pt = usage.get("prompt_tokens")
+                                            pt_details = usage.get("prompt_tokens_details") or {}
+                                            ct = pt_details.get("cached_tokens", 0)
+                                            if pt and not self._sse_prompt_tokens:
+                                                self._sse_prompt_tokens = pt
+                                            if ct and not self._sse_cached_tokens:
+                                                self._sse_cached_tokens = ct
+                                                log.info(
+                                                     "Parsed SSE usage: model '%s' slot %d, cached_tokens=%d, prompt_tokens=%d",
+                                                     self.model_name, self.slot_id, ct, pt,
+                                                 )
+                                    except (json.JSONDecodeError, ValueError):
+                                        continue
+                        except Exception:
+                            pass
                         try:
                             self.queue.put_nowait(chunk)
                             chunks_received += 1
@@ -225,19 +274,72 @@ class StreamReader:
         self._cancelled = True
         self.queue.put_nowait(None)
 
+    def _extract_sse_prompt_tokens(self) -> int:
+        """Parse SSE events from raw response body and return usage.prompt_tokens.
+
+        Note: llama.cpp reports total_tokens (prompt + completion) in the
+        'prompt_tokens' field of its SSE usage event, unlike OpenAI which
+        reports only prompt tokens. We capture the first usage event's
+        prompt_tokens value.
+        """
+        try:
+            text = self._raw_response_body.decode("utf-8", errors="replace")
+        except Exception:
+            return 0
+        for line in text.split("\n"):
+            line = line.strip()
+            if line.startswith("data: "):
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                    usage = event.get("usage")
+                    if usage and isinstance(usage, dict):
+                        pt = usage.get("prompt_tokens")
+                        if pt:
+                            return pt
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return 0
+
     async def _save(self) -> tuple:
-        if self.restored and self.best_ratio >= CACHE_SAVE_RATIO_THRESHOLD:
+        # Detect recompute from SSE cached_tokens before deciding whether to save
+        recompute_happened = False
+        if self.restored and self.restore_key and self.restore_backend:
+            cached_tokens = self._sse_cached_tokens
+            llm_prompt_tokens = self._sse_prompt_tokens or self.n_tokens
             log.info(
-                "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): restore ratio %.3f >= threshold",
+                "Recompute check for model '%s' slot %d: cached_tokens=%d, request_prompt_tokens=%d (llm=%d), ratio=%.3f",
+                self.model_name, self.slot_id, cached_tokens, self.n_tokens, llm_prompt_tokens,
+                self.best_ratio,
+            )
+            if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
+                recompute_happened = True
+                log.warning(
+                    "Recompute detected for model '%s' on backend '%s' slot %d (key %s): "
+                    "cached_tokens=%d llm_prompt_tokens=%d, "
+                    "KV cache restore was partial/useless",
+                    self.model_name, self.backend_id, self.slot_id, self.key_short,
+                    cached_tokens, llm_prompt_tokens,
+                )
+                kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
+
+        # Skip save only if restored, no recompute happened, and ratio is high enough
+        if self.restored and not recompute_happened and self.best_ratio >= CACHE_SAVE_RATIO_THRESHOLD:
+            log.info(
+                "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): "
+                "restore ratio %.3f >= threshold (no recompute, cache was useful)",
                 self.model_name, self.backend_id, self.slot_id, self.key_short,
                 self.best_ratio,
             )
+            self.sm._slot_save_skipped[(self.model_name, self.backend_id, self.slot_id)] = (self.key, self.blocks, self.n_tokens)
             return False
         ok = False
         try:
             ok, cache_size = await self.sm.save_after(
                 self.model_name, self.backend_id, self.slot_id,
-                self.key, self.blocks,
+                self.key, self.blocks, self.n_tokens,
             )
             log.info("SAVE: model_name='%s', key='%s', backend='%s', model_id_in_meta='%s'",
                      self.model_name, self.key[:16], self.backend_id, self.model_name)
@@ -247,12 +349,6 @@ class StreamReader:
         except Exception as e:
             log.warning("Cache save failed for model '%s' on backend '%s' slot %d: %s",
                         self.model_name, self.backend_id, self.slot_id, e)
-        if ok:
-            try:
-                kv_meta.write_meta(self.key, self.n_tokens, self.blocks,
-                                   WORDS_PER_BLOCK, self.model_name, self.backend_id, cache_size)
-            except Exception as e:
-                log.warning("Failed to write meta file %s: %s", self.key_short, e)
         return ok
 
     async def _cleanup(self):
@@ -358,8 +454,13 @@ async def chat(req: Request):
         # 2. Apply chat template + tokenize, then scan for cache hits
         first_opt = options[0]
         first_client = backend_manager.get_client(first_opt.backends[0])
-        templated = await first_client.apply_chat_template(messages)
-        first_token_ids = await first_client.tokenize(templated)
+        try:
+            templated = await first_client.apply_chat_template(messages)
+            first_token_ids = await first_client.tokenize(templated)
+        except httpx.ConnectError:
+            log.error("Failed to connect to backend %s for model '%s' from client %s",
+                      first_opt.backends[0], client_model, client_ip)
+            return JSONResponse({"error": "backend unreachable"}, status_code=503)
         prompt_tokens = len(first_token_ids)
         min_ctx = min(opt.n_ctx for opt in options)
         if prompt_tokens >= min_ctx:
@@ -377,8 +478,13 @@ async def chat(req: Request):
         for opt in options:
             for be_id in opt.backends:
                 opt_client = backend_manager.get_client(be_id)
-                opt_templated = await opt_client.apply_chat_template(messages)
-                opt_token_ids = await opt_client.tokenize(opt_templated)
+                try:
+                    opt_templated = await opt_client.apply_chat_template(messages)
+                    opt_token_ids = await opt_client.tokenize(opt_templated)
+                except httpx.ConnectError:
+                    log.warning("Backend %s unreachable, skipping for model '%s' from client %s",
+                                be_id, opt.name, client_ip)
+                    continue
                 opt_blocks = hs.block_hashes_from_tokens(opt_token_ids, WORDS_PER_BLOCK)
                 cand = kv_meta.find_best_restore_candidate(opt_blocks, WORDS_PER_BLOCK, LCP_TH, opt.name, be_id)
                 if cand and cand[1] > best_ratio:
@@ -420,8 +526,8 @@ async def chat(req: Request):
             sm.acquire_for_request(candidate_backends, restore_info, blocks, prompt_tokens),
             timeout=ACQUIRE_TIMEOUT,
         )
-    except asyncio.TimeoutError:
-        log.error("Timed out waiting for slot from client %s for model '%s'", client_ip, client_model)
+    except (asyncio.TimeoutError, RuntimeError) as e:
+        log.error("Could not acquire slot from client %s for model '%s': %s", client_ip, client_model, e)
         return JSONResponse({"error": "all slots busy, please retry later"}, status_code=503)
 
     model_name, be_id, slot_id = g
@@ -475,7 +581,8 @@ async def chat(req: Request):
                 )
 
             reader = StreamReader(resp, req, model_name, be_id, slot_id,
-                                  key, prompt_tokens, blocks, sm, best_ratio, restored)
+                                  key, prompt_tokens, blocks, sm, best_ratio, restored,
+                                  restore_key, restore_backend)
             gen = reader.stream()
             _reader_created = True
 
@@ -502,23 +609,37 @@ async def chat(req: Request):
                 )
 
             ok = False
-            if restored and best_ratio < CACHE_SAVE_RATIO_THRESHOLD:
-                ok, cache_size = await sm.save_after(
-                    model_name, be_id, slot_id, key, blocks,
-                )
-                if ok:
-                    kv_meta.write_meta(
-                        key,
-                        prompt_tokens,
-                        blocks,
-                        WORDS_PER_BLOCK,
-                        canonical_name,
-                        be_id,
-                        cache_size,
-                    )
-            else:
-                sm._slot_save_skipped[(model_name, be_id, slot_id)] = True
 
+            # Track recompute penalty: if restore was attempted and cached_tokens < request length,
+            # the KV cache restore was partial/useless (llama.cpp had to recompute)
+            recompute_happened = False
+            if restored and restore_key and restore_backend:
+                usage = out.get("usage") or {}
+                pt_details = usage.get("prompt_tokens_details") or {}
+                cached_tokens = pt_details.get("cached_tokens", 0)
+                llm_prompt_tokens = usage.get("prompt_tokens", 0)
+                log.info(
+                    "Recompute check for model '%s' slot %d: cached_tokens=%d, request_prompt_tokens=%d (llm=%d), ratio=%.3f",
+                    model_name, slot_id, cached_tokens, prompt_tokens, llm_prompt_tokens,
+                    best_ratio,
+                )
+                if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
+                    recompute_happened = True
+                    log.warning(
+                        "Recompute detected for model '%s' on backend '%s' slot %d (key %s): "
+                        "cached_tokens=%d llm_prompt_tokens=%d, "
+                        "KV cache restore was partial/useless",
+                        model_name, be_id, slot_id, key[:16],
+                        cached_tokens, llm_prompt_tokens,
+                    )
+                    kv_meta.increment_recompute_penalty(restore_key, restore_backend)
+
+            if (restored and best_ratio < CACHE_SAVE_RATIO_THRESHOLD) or recompute_happened:
+                ok, cache_size = await sm.save_after(
+                    model_name, be_id, slot_id, key, blocks, prompt_tokens,
+                )
+            else:
+                sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens)
             # log.info(
             #     "json_response\n%s",
             #     json.dumps(out, indent=2, ensure_ascii=False),

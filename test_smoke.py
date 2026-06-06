@@ -88,7 +88,8 @@ def test_backend_manager_model_registration():
 
 def test_reconcile_meta_removes_orphans():
     """reconcile_meta should delete meta files with no matching cache and skip valid ones."""
-    from kv_meta_manager import reconcile_meta
+    from kv_meta_manager import KVMetaManager
+    mgr = KVMetaManager()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cache_dir = os.path.join(tmpdir, "cache")
@@ -123,18 +124,18 @@ def test_reconcile_meta_removes_orphans():
 
 
 def test_hashing_imports():
-    """hashing module should have raw hashing functions; kv-meta in kv_meta_manager."""
+    """hashing module should have hashing functions; kv-meta in kv_meta_manager."""
     import hashing as hs
-    from kv_meta_manager import reconcile_meta, _get_last_used_time, write_meta, find_best_restore_candidate
-    assert hasattr(hs, "raw_prefix")
+    from kv_meta_manager import KVMetaManager
     assert hasattr(hs, "block_hashes_from_tokens")
     assert hasattr(hs, "lcp_blocks")
     assert hasattr(hs, "meta_key")
     assert hasattr(hs, "prefix_key_sha256")
-    assert callable(reconcile_meta)
-    assert callable(_get_last_used_time)
-    assert callable(write_meta)
-    assert callable(find_best_restore_candidate)
+    mgr = KVMetaManager()
+    assert callable(mgr.reconcile)
+    assert callable(mgr.get_last_used_time)
+    assert callable(mgr.write_meta)
+    assert callable(mgr.find_best_restore_candidate)
     assert not hasattr(hs, "cleanup_old_cache")
     assert not hasattr(hs, "update_last_read")
     print("PASS: test_hashing_imports")
@@ -1421,7 +1422,8 @@ def test_resolve_any_no_models():
 
 def test_cache_hit_selects_best_ratio():
     """Two backends have cache hits (ratios 0.95 and 0.70). Select 0.95."""
-    from kv_meta_manager import write_meta, find_restore_candidate
+    from kv_meta_manager import KVMetaManager
+    mgr = KVMetaManager()
     from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
     import tempfile
@@ -1455,8 +1457,8 @@ def test_cache_hit_selects_best_ratio():
             key_a = meta_key(canonical_a, prefix)
             key_b = meta_key(canonical_b, prefix)
 
-            write_meta(key_a, prefix, blocks_a, 100, canonical_a, "be1")
-            write_meta(key_b, prefix, blocks_b, 100, canonical_b, "be2")
+            mgr.write_meta(key_a, prefix, blocks_a, 100, canonical_a, "be1")
+            mgr.write_meta(key_b, prefix, blocks_b, 100, canonical_b, "be2")
 
             # Simulate cache-first selection logic
             req_blocks = ["blk1", "blk2", "blk3", "blk4", "blk5"]
@@ -1467,7 +1469,7 @@ def test_cache_hit_selects_best_ratio():
             for opt_name, be_list in [("model-a", ["be1"]), ("model-b", ["be2"])]:
                 mk = meta_key(opt_name, prefix)
                 for be_id in be_list:
-                    cand = find_restore_candidate(mk, 100, 0.2, req_blocks, be_id)
+                    cand = mgr.find_restore_candidate(mk, 100, 0.2, req_blocks, be_id)
                     if cand and cand[1] > best_ratio:
                         best_ratio = cand[1]
                         best_restore_key = mk
@@ -1483,7 +1485,8 @@ def test_cache_hit_selects_best_ratio():
 
 def test_cache_hit_across_canonical_models():
     """Client requests 'qwen3.6', resolves to two canonical models. Each has a cache hit."""
-    from kv_meta_manager import write_meta, find_restore_candidate
+    from kv_meta_manager import KVMetaManager
+    mgr = KVMetaManager()
     from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
     import tempfile
@@ -1515,8 +1518,8 @@ def test_cache_hit_across_canonical_models():
             key_a = meta_key("qwen3.6-32b", prefix)
             key_b = meta_key("qwen3.6-8b", prefix)
 
-            write_meta(key_a, prefix, blocks_a, 100, "qwen3.6-32b", "be1")
-            write_meta(key_b, prefix, blocks_b, 100, "qwen3.6-8b", "be2")
+            mgr.write_meta(key_a, prefix, blocks_a, 100, "qwen3.6-32b", "be1")
+            mgr.write_meta(key_b, prefix, blocks_b, 100, "qwen3.6-8b", "be2")
 
             best_ratio = 0.0
             best_canonical = None
@@ -1524,7 +1527,7 @@ def test_cache_hit_across_canonical_models():
             for dm in backend_manager.get_discovered_models("qwen3.6"):
                 mk = meta_key(dm.name, prefix)
                 for be_id in dm.backends:
-                    cand = find_restore_candidate(mk, 100, 0.2, req_blocks, be_id)
+                    cand = mgr.find_restore_candidate(mk, 100, 0.2, req_blocks, be_id)
                     if cand and cand[1] > best_ratio:
                         best_ratio = cand[1]
                         best_canonical = dm.name
@@ -1822,7 +1825,8 @@ def test_chat_any_model_routing():
 
 def test_chat_any_with_cache_hit():
     """Client requests 'any', multiple canonical models have cache hits. Selects best cache hit."""
-    from kv_meta_manager import write_meta
+    from kv_meta_manager import KVMetaManager
+    mgr = KVMetaManager()
     from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
     import tempfile
@@ -1860,8 +1864,8 @@ def test_chat_any_with_cache_hit():
             key_a = meta_key("model-a", token_ids)
             key_b = meta_key("model-b", token_ids)
 
-            write_meta(key_a, 10, blocks_a, 100, "model-a", "10.0.0.1:8000")
-            write_meta(key_b, 10, blocks_b, 100, "model-b", "10.0.0.1:9000")
+            mgr.write_meta(key_a, 10, blocks_a, 100, "model-a", "10.0.0.1:8000")
+            mgr.write_meta(key_b, 10, blocks_b, 100, "model-b", "10.0.0.1:9000")
 
             mock_client_a = AsyncMock(spec=LlamaClient)
             mock_client_a.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
@@ -1957,11 +1961,13 @@ def test_chat_save_skipped_when_ratio_above_threshold():
     backend_manager._first_key = "10.0.0.1:8000"
 
     mock_client = AsyncMock(spec=LlamaClient)
-    mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
+    mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": [], "usage": {"prompt_tokens": 3, "prompt_tokens_details": {"cached_tokens": 3}}})
     mock_client.discover_models = AsyncMock(return_value=[("test-model", 32768)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.tokenize = AsyncMock(return_value=[123, 456, 789])
     mock_client.apply_chat_template = AsyncMock(return_value="user: hello world\nassistant:")
+    mock_client.save_slot = AsyncMock(return_value=(True, 1024))
+    mock_client.get_slot_status = AsyncMock(return_value={"cached_tokens": 3})
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
@@ -1981,7 +1987,7 @@ def test_chat_save_skipped_when_ratio_above_threshold():
     sm.save_after = track_save
 
     with patch("hashing.block_hashes_from_tokens", return_value=["hash1"]), \
-         patch("kv_meta_manager.find_best_restore_candidate", return_value=("test_key", 0.95)):
+         patch("kv_meta_manager.KVMetaManager.find_best_restore_candidate", return_value=("test_key", 0.95)):
 
         client = TestClient(app_mod.app)
         resp = client.post("/v1/chat/completions", json={
@@ -2034,8 +2040,8 @@ def test_chat_save_performed_when_ratio_below_threshold():
     sm.save_after = track_save
 
     with patch("hashing.block_hashes_from_tokens", return_value=[f"hash{i}" for i in range(6)]), \
-         patch("kv_meta_manager.find_best_restore_candidate", return_value=("test_key", 0.5)), \
-         patch("kv_meta_manager.write_meta"):
+         patch("kv_meta_manager.KVMetaManager.find_best_restore_candidate", return_value=("test_key", 0.5)), \
+         patch("kv_meta_manager.KVMetaManager.write_meta"):
 
         client = TestClient(app_mod.app)
         resp = client.post("/v1/chat/completions", json={

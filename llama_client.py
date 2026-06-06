@@ -202,6 +202,16 @@ class LlamaClient:
 
         return True
 
+    async def get_slot_status(self, slot_id: int) -> Optional[dict]:
+        """GET /slots/{slot_id} — returns slot status dict or None."""
+        try:
+            resp = await self.client.get(f"/slots/{slot_id}")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            log.warning("Failed to get slot status for slot %d: %s", slot_id, e)
+            return None
+
     async def _parse_router_models(self) -> list:
         """
         GET /models — returns list of {id, status.value, status.args} for each
@@ -305,7 +315,7 @@ class LlamaClient:
                     s["_router_model"] = m["name"]
                     s["_router_port"] = m["port"]
                 all_slots.extend(slots)
-                log.debug(
+                log.warn(
                     "Child process %s:%d returned %d slots",
                     m["name"], m["port"], len(slots),
                 )
