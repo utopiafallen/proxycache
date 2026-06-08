@@ -38,7 +38,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from config import (BACKENDS, WORDS_PER_BLOCK,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
                     CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
-                    SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD)
+                    SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD,
+                    should_save_cache)
 
 import hashing as hs
 from slot_manager import SlotManager
@@ -326,14 +327,14 @@ class StreamReader:
                 kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
 
         # Skip save only if restored, no recompute happened, and ratio is high enough
-        if self.restored and not recompute_happened and self.best_ratio >= CACHE_SAVE_RATIO_THRESHOLD:
+        if not should_save_cache(self.restored, self.best_ratio, recompute_happened):
             log.info(
                 "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): "
                 "restore ratio %.3f >= threshold (no recompute, cache was useful)",
                 self.model_name, self.backend_id, self.slot_id, self.key_short,
                 self.best_ratio,
             )
-            self.sm._slot_save_skipped[(self.model_name, self.backend_id, self.slot_id)] = (self.key, self.blocks, self.n_tokens)
+            self.sm._slot_save_skipped[(self.model_name, self.backend_id, self.slot_id)] = (self.key, self.blocks, self.n_tokens, self.restored, self.best_ratio, recompute_happened)
             return False
         ok = False
         try:
@@ -371,6 +372,10 @@ class StreamReader:
         else:
             log.info("Skipping cache save for model '%s' on backend '%s' slot %d (key %s): stream incomplete",
                       self.model_name, self.backend_id, self.slot_id, self.key_short)
+            if self._cancelled:
+                log.info("Request cancelled — invalidating KV cache for model '%s' on backend '%s' slot %d (key %s)",
+                         self.model_name, self.backend_id, self.slot_id, self.key_short)
+                self.sm.invalidate_slot(self.model_name, self.backend_id, self.slot_id)
         self.sm.release(self.model_name, self.backend_id, self.slot_id)
         log.info("Released slot %d for model '%s' on backend '%s' (key %s)", self.slot_id,
                   self.model_name, self.backend_id, self.key_short)
@@ -456,7 +461,7 @@ async def chat(req: Request):
         first_client = backend_manager.get_client(first_opt.backends[0])
         try:
             templated = await first_client.apply_chat_template(messages)
-            first_token_ids = await first_client.tokenize(templated)
+            first_token_ids = await first_client.tokenize(templated, add_special=True)
         except httpx.ConnectError:
             log.error("Failed to connect to backend %s for model '%s' from client %s",
                       first_opt.backends[0], client_model, client_ip)
@@ -480,7 +485,7 @@ async def chat(req: Request):
                 opt_client = backend_manager.get_client(be_id)
                 try:
                     opt_templated = await opt_client.apply_chat_template(messages)
-                    opt_token_ids = await opt_client.tokenize(opt_templated)
+                    opt_token_ids = await opt_client.tokenize(opt_templated, add_special=True)
                 except httpx.ConnectError:
                     log.warning("Backend %s unreachable, skipping for model '%s' from client %s",
                                 be_id, opt.name, client_ip)
@@ -507,15 +512,13 @@ async def chat(req: Request):
         
 
         # 5. Build candidate backends list (fallback ONLY, cache backend excluded)
+        # Only include backends for the canonical model (the one used for slot pools).
+        # Each DiscoveredModel already has its own backend list, so we only pair
+        # backends that actually support that specific model variant.
         candidate_backends: list[tuple[str, str]] = []
-        if restore_backend:
-            for opt in options:
-                for be_id in opt.backends:
-                    if be_id != restore_backend:
-                        candidate_backends.append((be_id, opt.name))
-        else:
-            for opt in options:
-                for be_id in opt.backends:
+        for opt in options:
+            for be_id in opt.backends:
+                if be_id != restore_backend:
                     candidate_backends.append((be_id, opt.name))
 
         # 6. Acquire slot (cache backend tried first via restore_info, then fallback)
@@ -634,12 +637,12 @@ async def chat(req: Request):
                     )
                     kv_meta.increment_recompute_penalty(restore_key, restore_backend)
 
-            if (restored and best_ratio < CACHE_SAVE_RATIO_THRESHOLD) or recompute_happened:
+            if should_save_cache(restored, best_ratio, recompute_happened):
                 ok, cache_size = await sm.save_after(
                     model_name, be_id, slot_id, key, blocks, prompt_tokens,
                 )
             else:
-                sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens)
+                sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens, restored, best_ratio, recompute_happened)
             # log.info(
             #     "json_response\n%s",
             #     json.dumps(out, indent=2, ensure_ascii=False),
@@ -654,6 +657,10 @@ async def chat(req: Request):
             # )
             return JSONResponse(content=out, status_code=200)
 
+    except httpx.TimeoutException as e:
+        log.exception("Chat timeout for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
+                       client_ip, model_name, be_id, slot_id, key[:16], e)
+        return JSONResponse({"error": str(e)}, status_code=504)
     except Exception as e:
         log.exception("Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)

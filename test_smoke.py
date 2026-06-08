@@ -780,12 +780,12 @@ def test_adaptive_cooldown_on_failure():
 
     asyncio.run(_run())
 
-    # After failure, _refresh_state stores (timestamp, success_flag) tuple
+    # After failure, _refresh_state stores (timestamp, success_flag, cached_n_slots) tuple
     refresh_key = ("ModelA", "10.0.0.1:8000")
     last_refresh = backend_manager._refresh_state.get(refresh_key)
     assert last_refresh is not None, "Cooldown was not set after failure"
-    assert isinstance(last_refresh, tuple), f"Expected (timestamp, success) tuple, got {type(last_refresh)}"
-    timestamp, success = last_refresh
+    assert isinstance(last_refresh, tuple), f"Expected (timestamp, success, cached_n) tuple, got {type(last_refresh)}"
+    timestamp, success, cached_n = last_refresh
     assert success is False, f"Expected success=False after failure, got success={success}"
     assert timestamp > 0
     print("PASS: test_adaptive_cooldown_on_failure")

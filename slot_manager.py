@@ -23,7 +23,8 @@ from collections import deque
 from typing import List, Tuple, Dict, Optional
 
 from config import META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, \
-    KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK, SLOT_TIMEOUT, DEFAULT_N_CTX
+    KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK, SLOT_TIMEOUT, DEFAULT_N_CTX, \
+    should_save_cache
 import hashing as hs
 from backend_manager import backend_manager
 from kv_meta_manager import kv_meta
@@ -296,7 +297,7 @@ class SlotManager:
                 self._ensure_pool(canonical_name, backend_key, n_slots)
 
         # Retry loop: check all backends, sleep 5s if none available, retry up to 6 times
-        for attempt in range(7):
+        for attempt in range(11):
             # Phase 1: check cache backend first (if provided)
             cache_acquired = False
             if restore_info:
@@ -347,16 +348,36 @@ class SlotManager:
         g = (model_name, backend_id, slot_id)
         restored: Optional[bool] = None
 
-        # If the slot's last save was skipped, do a full save now before
+        # If the slot's last save was skipped, re-evaluate and do a full save now before
         # overwriting the slot with new cache
         if g in self._slot_save_skipped:
-            save_key, save_blocks, save_n_tokens = self._slot_save_skipped[g]
+            skip_entry = self._slot_save_skipped[g]
             del self._slot_save_skipped[g]
-            ok, size = await self.save_after(
-                model_name, backend_id, slot_id, save_key, save_blocks, save_n_tokens,
-            )
-            log.info(
-                    "Saved skipped cache for model '%s' on backend '%s' slot %d (%d bytes) before restore",
+            if len(skip_entry) >= 6:
+                save_key, save_blocks, save_n_tokens, skip_restored, skip_ratio, skip_recompute = skip_entry
+                if not should_save_cache(skip_restored, skip_ratio, skip_recompute):
+                    log.info(
+                        "Flushed skipped cache for model '%s' on backend '%s' slot %d: "
+                        "still not worth saving (ratio %.3f, restored=%s, recompute=%s)",
+                        model_name, backend_id, slot_id, skip_ratio, skip_restored, skip_recompute,
+                    )
+                    ok, size = 0, 0
+                else:
+                    ok, size = await self.save_after(
+                        model_name, backend_id, slot_id, save_key, save_blocks, save_n_tokens,
+                    )
+                    log.info(
+                        "Saved skipped cache for model '%s' on backend '%s' slot %d (%d bytes) before restore",
+                        model_name, backend_id, slot_id, size,
+                    )
+            else:
+                # Legacy format: (key, blocks, n_tokens) — always save for backward compat
+                save_key, save_blocks, save_n_tokens = skip_entry[:3]
+                ok, size = await self.save_after(
+                    model_name, backend_id, slot_id, save_key, save_blocks, save_n_tokens,
+                )
+                log.info(
+                    "Saved skipped cache for model '%s' on backend '%s' slot %d (%d bytes) before restore (legacy format)",
                     model_name, backend_id, slot_id, size,
                 )
 
@@ -492,6 +513,16 @@ class SlotManager:
                 self._evict_meta_file(evict_key)
 
         return ok, size
+
+    def invalidate_slot(self, model_name: str, backend_id: str, slot_id: int):
+        """Clear KV cache tracking for a slot whose cache is in an unknown state."""
+        g = (model_name, backend_id, slot_id)
+        if g in self._slot_kv_state:
+            del self._slot_kv_state[g]
+            log.info(
+                "Invalidated KV cache tracking for model '%s' on backend '%s' slot %d",
+                model_name, backend_id, slot_id,
+            )
 
     def release(self, model_name: str, backend_id: str, slot_id: int):
         g = (model_name, backend_id, slot_id)

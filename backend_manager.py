@@ -54,7 +54,7 @@ class BackendManager:
     def __init__(self, backends_config: list[dict]):
         self._backends: dict[str, BackendInfo] = {}
         self._first_key: str | None = None
-        self._refresh_state: dict[tuple[str, str], tuple[float, bool]] = {}
+        self._refresh_state: dict[tuple[str, str], tuple[float, bool, int]] = {}
         self._discovered_models: dict[str, DiscoveredModel] = {}
         self._backend_state: dict[str, bool] = {}
         self._discovery_task: asyncio.Task | None = None
@@ -162,8 +162,8 @@ class BackendManager:
         """
         backend_keys = self.keys()
         log.info(
-            "Refreshing slot counts: %d backends, %d known models",
-            len(backend_keys), len(self._discovered_models),
+            "Refreshing slot counts: %d known models, %d backends",
+            len(self._discovered_models), len(backend_keys),
         )
 
         if not backend_keys:
@@ -175,18 +175,22 @@ class BackendManager:
         slot_counts: dict[str, dict[str, int]] = {}
         refreshed_any = False
 
-        for backend_key in backend_keys:
-            client = self.get_client(backend_key)
-
-            # For each discovered model, check cooldown
-            for canonical_name in list(self._discovered_models.keys()):
+        for canonical_name, info in self._discovered_models.items():
+            for backend_key in info.backends:
+                if backend_key not in self._backends:
+                    continue
+                client = self.get_client(backend_key)
                 refresh_key = (canonical_name, backend_key)
                 now = time.time()
-                last_ts, last_success = self._refresh_state.get(refresh_key, (0.0, True))
+                last_ts, last_success, cached_n = self._refresh_state.get(refresh_key, (0.0, True, 0))
                 cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
                 if now - last_ts < cooldown:
                     log.warn("Skipping refresh for model '%s' on backend '%s': last refresh was %.1f seconds ago",
                               canonical_name, backend_key, last_ts)
+                    if cached_n > 0:
+                        if backend_key not in slot_counts:
+                            slot_counts[backend_key] = {}
+                        slot_counts[backend_key][canonical_name] = cached_n
                     continue
 
                 try:
@@ -215,14 +219,14 @@ class BackendManager:
                     if backend_key not in slot_counts:
                         slot_counts[backend_key] = {}
                     slot_counts[backend_key][canonical_name] = n_slots
-                    self._refresh_state[refresh_key] = (now, True)
+                    self._refresh_state[refresh_key] = (now, True, n_slots)
                     refreshed_any = True
                 else:
                     log.warning(
                         "Model '%s' not loaded on backend '%s'",
                         canonical_name, backend_key,
                     )
-                    self._refresh_state[refresh_key] = (now, False)
+                    self._refresh_state[refresh_key] = (now, False, 0)
                     refreshed_any = True
 
         if not refreshed_any:
@@ -272,6 +276,10 @@ class BackendManager:
                     changed = True
             if changed:
                 await self.discover_models()
+                try:
+                    await self.refresh_slot_counts()
+                except Exception:
+                    log.exception("Failed to refresh slot counts after backend state change")
 
 
 # Module-level singleton

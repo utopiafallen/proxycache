@@ -56,7 +56,23 @@ KV_CACHE_SKIP_THRESHOLD = float(os.getenv("KV_CACHE_SKIP_THRESHOLD", "0.9"))
 
 # Cache save ratio threshold (0..1) — only save cache if restore candidate ratio < this
 # When a cached prompt already matches well (>= threshold), no need to save a duplicate
-CACHE_SAVE_RATIO_THRESHOLD = float(os.getenv("CACHE_SAVE_RATIO_THRESHOLD", "0.9"))
+CACHE_SAVE_RATIO_THRESHOLD = float(os.getenv("CACHE_SAVE_RATIO_THRESHOLD", "0.8"))
+
+
+def should_save_cache(restored: bool, best_ratio: float, recompute_happened: bool) -> bool:
+    """Decide whether to save a slot's cache to disk.
+
+    Returns True (save) when:
+    - No restore happened at all
+    - Restore happened but ratio < threshold (cache was partially useless)
+    - Recompute happened (restore was partial/useless)
+
+    Returns False (skip) when:
+    - Restore happened, ratio >= threshold, and no recompute (old cache still useful)
+    """
+    if restored and best_ratio >= CACHE_SAVE_RATIO_THRESHOLD and not recompute_happened:
+        return False
+    return True
 
 # Timeout for slot save/restore operations (seconds) — separate from REQUEST_TIMEOUT
 # because chat completions can take minutes, but slot operations should fail fast
