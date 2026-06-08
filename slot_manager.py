@@ -296,8 +296,9 @@ class SlotManager:
             for canonical_name, n_slots in model_slots.items():
                 self._ensure_pool(canonical_name, backend_key, n_slots)
 
-        # Retry loop: check all backends, sleep 5s if none available, retry up to 6 times
-        for attempt in range(11):
+        # Retry loop: check all backends, sleep 5s if none available
+        RETRY_COUNT=11
+        for attempt in range(RETRY_COUNT):
             # Phase 1: check cache backend first (if provided)
             cache_acquired = False
             if restore_info:
@@ -329,9 +330,9 @@ class SlotManager:
                     )
 
             # No slot available — exponential backoff before retrying (last iteration skips sleep)
-            if attempt < 6:
+            if attempt < RETRY_COUNT:
                 backoff = (attempt + 1) * 5
-                log.info("No slots available across all backends, retrying in %ds (attempt %d/6)", backoff, attempt + 1)
+                log.info("No slots available across all backends, retrying in %ds (attempt %d/%d)", backoff, attempt + 1, RETRY_COUNT)
                 await asyncio.sleep(backoff)
 
         raise RuntimeError(f"No slots available for candidate_backends={len(candidate_backends)}")
