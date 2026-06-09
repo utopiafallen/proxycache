@@ -542,7 +542,7 @@ async def chat(req: Request):
         blocks = hs.block_hashes_from_tokens(first_token_ids, WORDS_PER_BLOCK)
         log.info("No cache hit: using key '%s' for model '%s' (client model '%s')", key[:16], model_name, client_model)
 
-    log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s, key='%s', canonical_name='%s'",
+    log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s, save_key='%s', canonical_name='%s'",
              model_name, be_id, slot_id, restored, key[:16], canonical_name)
 
     # Forward canonical name to backend
