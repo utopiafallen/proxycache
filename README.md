@@ -127,6 +127,8 @@ When `agent_port` is set, eviction uses the agent's `POST /cache/delete?key=<bas
 llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 --port 8000 --swa-full
 ```
 
+**Note:** For the most effective cache management, run llama.cpp with a single slot (`-np 1`) or with unified KV cache disabled (`-no-kvu`). Unified KV cache can cause slot-level cache restores to fail across requests due to fragmentation or contention inside the unified KV cache. Refer to your llama.cpp version's documentation for the appropriate flags.
+
 ### 2. Run the proxy
 
 ```bash
