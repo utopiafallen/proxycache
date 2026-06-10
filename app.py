@@ -188,9 +188,9 @@ class StreamReader:
                         for t in pending:
                             t.cancel()
                         break
-                    except httpx.RemoteProtocolError:
+                    except (httpx.RemoteProtocolError, httpx.ConnectError):
                         log.warning(
-                            "Backend closed stream for model '%s' on backend '%s' slot %d (key %s): incomplete body (%d chunks, %d bytes)",
+                            "Backend disconnected for model '%s' on backend '%s' slot %d (key %s): incomplete body (%d chunks, %d bytes)",
                             self.model_name, self.backend_id, self.slot_id, self.key_short,
                             chunks_received, total_bytes,
                         )
@@ -374,6 +374,10 @@ class StreamReader:
                       self.model_name, self.backend_id, self.slot_id, self.key_short)
             if self._cancelled:
                 log.info("Request cancelled — invalidating KV cache for model '%s' on backend '%s' slot %d (key %s)",
+                         self.model_name, self.backend_id, self.slot_id, self.key_short)
+                self.sm.invalidate_slot(self.model_name, self.backend_id, self.slot_id)
+            else:
+                log.info("Backend disconnected — invalidating KV cache for model '%s' on backend '%s' slot %d (key %s)",
                          self.model_name, self.backend_id, self.slot_id, self.key_short)
                 self.sm.invalidate_slot(self.model_name, self.backend_id, self.slot_id)
         self.sm.release(self.model_name, self.backend_id, self.slot_id)
@@ -661,6 +665,11 @@ async def chat(req: Request):
         log.exception("Chat timeout for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)
         return JSONResponse({"error": str(e)}, status_code=504)
+    except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
+        log.exception("Backend connection error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
+                      client_ip, model_name, be_id, slot_id, key[:16], e)
+        sm.invalidate_slot(model_name, be_id, slot_id)
+        return JSONResponse({"error": "backend connection failed"}, status_code=503)
     except Exception as e:
         log.exception("Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)

@@ -22,6 +22,8 @@ import logging
 from collections import deque
 from typing import List, Tuple, Dict, Optional
 
+import httpx
+
 from config import META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, \
     KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK, SLOT_TIMEOUT, DEFAULT_N_CTX, \
     should_save_cache, CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, CACHE_HIT_WAIT_MAX_PENDING_REQS, \
@@ -302,7 +304,11 @@ class SlotManager:
             cache backend was acquired (cache files are not shared between backends).
         """
         # Refresh slot counts for all discovered models (with cooldown)
-        slot_counts = await backend_manager.refresh_slot_counts()
+        try:
+            slot_counts = await backend_manager.refresh_slot_counts()
+        except Exception as e:
+            log.warning("Failed to refresh slot counts: %s — proceeding with existing pool state", e)
+            slot_counts = {}
         for backend_key, model_slots in slot_counts.items():
             for canonical_name, n_slots in model_slots.items():
                 self._ensure_pool(canonical_name, backend_key, n_slots)
@@ -435,7 +441,20 @@ class SlotManager:
                 restored = False
             elif effective_restore_key:
                 client = backend_manager.get_client(backend_id)
-                restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
+                try:
+                    restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
+                except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
+                    log.warning(
+                        "Restore failed for model '%s' on backend '%s' slot %d (key %s): %s — trying fallback",
+                        model_name, backend_id, slot_id, effective_restore_key[:16], e,
+                    )
+                    restored = False
+                except Exception as e:
+                    log.warning(
+                        "Unexpected error restoring cache for model '%s' on backend '%s' slot %d (key %s): %s",
+                        model_name, backend_id, slot_id, effective_restore_key[:16], e,
+                    )
+                    restored = False
                 log.info(
                     "Restored cache for model '%s' on backend '%s' slot %d: ok=%s",
                     model_name, backend_id, slot_id, restored,
@@ -452,7 +471,20 @@ class SlotManager:
                 )
                 if cand:
                     cand_key, cand_ratio = cand
-                    restored = await client.restore_slot(slot_id, cand_key, model_name)
+                    try:
+                        restored = await client.restore_slot(slot_id, cand_key, model_name)
+                    except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
+                        log.warning(
+                            "Dynamic restore failed for model '%s' on backend '%s' slot %d (key %s): %s — trying fallback",
+                            model_name, backend_id, slot_id, cand_key[:16], e,
+                        )
+                        restored = False
+                    except Exception as e:
+                        log.warning(
+                            "Unexpected error restoring cache for model '%s' on backend '%s' slot %d (key %s): %s",
+                            model_name, backend_id, slot_id, cand_key[:16], e,
+                        )
+                        restored = False
                     log.info(
                         "Dynamically restored cache for model '%s' on backend '%s' slot %d (key %s, ratio %.3f): ok=%s",
                         model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
@@ -470,7 +502,20 @@ class SlotManager:
 
         elif effective_restore_key:
             client = backend_manager.get_client(backend_id)
-            restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
+            try:
+                restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
+            except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
+                log.warning(
+                    "Restore failed for model '%s' on backend '%s' slot %d (key %s): %s — trying fallback",
+                    model_name, backend_id, slot_id, effective_restore_key[:16], e,
+                )
+                restored = False
+            except Exception as e:
+                log.warning(
+                    "Unexpected error restoring cache for model '%s' on backend '%s' slot %d (key %s): %s",
+                    model_name, backend_id, slot_id, effective_restore_key[:16], e,
+                )
+                restored = False
             log.info(
                 "Restored cache for model '%s' on backend '%s' slot %d: ok=%s",
                 model_name, backend_id, slot_id, restored,
