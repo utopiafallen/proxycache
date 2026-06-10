@@ -406,7 +406,7 @@ class SlotManager:
             del self._slot_save_skipped[g]
             if len(skip_entry) >= 6:
                 save_key, save_blocks, save_n_tokens, skip_restored, skip_ratio, skip_recompute = skip_entry
-                if not should_save_cache(skip_restored, skip_ratio, skip_recompute):
+                if not should_save_cache(skip_ratio, skip_recompute):
                     log.info(
                         "Flushed skipped cache for model '%s' on backend '%s' slot %d: "
                         "still not worth saving (ratio %.3f, restored=%s, recompute=%s)",

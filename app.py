@@ -327,7 +327,7 @@ class StreamReader:
                 kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
 
         # Skip save only if restored, no recompute happened, and ratio is high enough
-        if not should_save_cache(self.restored, self.best_ratio, recompute_happened):
+        if not should_save_cache(self.best_ratio, recompute_happened):
             log.info(
                 "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): "
                 "restore ratio %.3f >= threshold (no recompute, cache was useful)",
@@ -641,7 +641,7 @@ async def chat(req: Request):
                     )
                     kv_meta.increment_recompute_penalty(restore_key, restore_backend)
 
-            if should_save_cache(restored, best_ratio, recompute_happened):
+            if should_save_cache(best_ratio, recompute_happened):
                 ok, cache_size = await sm.save_after(
                     model_name, be_id, slot_id, key, blocks, prompt_tokens,
                 )
