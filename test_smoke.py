@@ -2055,6 +2055,273 @@ def test_chat_save_performed_when_ratio_below_threshold():
     print("PASS: test_chat_save_performed_when_ratio_below_threshold")
 
 
+def test_cache_hit_wait_phase0_success():
+    """Phase 0 should succeed when semaphore is released during wait."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch, MagicMock
+    from slot_manager import SlotManager
+    from backend_manager import backend_manager, DiscoveredModel
+    from config import CACHE_HIT_WAIT_MAX_PENDING_REQS
+
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._discovered_models.clear()
+
+    async def run_test():
+        sm = SlotManager()
+        sm._ensure_pool("ModelA", "backend1", 1)
+
+        backend_manager._discovered_models = {
+            "ModelA": DiscoveredModel(
+                name="ModelA", n_ctx=4096,
+                backends=["backend1"],
+                total_slots=1, last_discovered=time.time(),
+            ),
+        }
+
+        # Mark the slot as in-use
+        sm._in_use[("ModelA", "backend1", 0)] = True
+
+        restore_info = ("abc123", "backend1", "ModelA")
+        candidate_backends = []
+
+        # Release the semaphore after a short delay to simulate slot freeing
+        async def release_after_delay():
+            await asyncio.sleep(0.1)
+            sm.release("ModelA", "backend1", 0)
+
+        asyncio.create_task(release_after_delay())
+
+        # Mock refresh_slot_counts and get_client to avoid backend setup
+        mock_client = MagicMock()
+        mock_client.restore_slot = AsyncMock(return_value=True)
+
+        def mock_get_client(key):
+            return mock_client
+
+        with patch.object(backend_manager, "refresh_slot_counts", new=AsyncMock(return_value={})):
+            with patch.object(backend_manager, "get_client", side_effect=mock_get_client):
+                g, restored = await sm.acquire_for_request(
+                    candidate_backends, restore_info, blocks=["block1"], prompt_tokens=10
+                )
+                return g, restored
+
+    g, restored = asyncio.run(run_test())
+    assert g == ("ModelA", "backend1", 0), f"Expected ('ModelA', 'backend1', 0), got {g}"
+    assert restored is True
+    print("PASS: test_cache_hit_wait_phase0_success")
+
+
+def test_cache_hit_wait_phase0_timeout():
+    """Phase 0 should timeout and fall through to retry loop."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch, MagicMock
+    from slot_manager import SlotManager
+    from backend_manager import backend_manager, DiscoveredModel
+    from config import CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
+
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._discovered_models.clear()
+
+    async def run_test():
+        sm = SlotManager()
+        sm._ensure_pool("ModelA", "backend1", 1)
+        sm._ensure_pool("ModelB", "backend2", 1)
+
+        backend_manager._discovered_models = {
+            "ModelA": DiscoveredModel(
+                name="ModelA", n_ctx=4096,
+                backends=["backend1"],
+                total_slots=1, last_discovered=time.time(),
+            ),
+            "ModelB": DiscoveredModel(
+                name="ModelB", n_ctx=4096,
+                backends=["backend2"],
+                total_slots=1, last_discovered=time.time(),
+            ),
+        }
+
+        # Mark cache backend slot as in-use, fallback slot as free
+        sm._in_use[("ModelA", "backend1", 0)] = True
+        sm._in_use[("ModelB", "backend2", 0)] = False
+
+        restore_info = ("abc123", "backend1", "ModelA")
+        candidate_backends = [("backend2", "ModelB")]
+
+        # Use a very short timeout by directly manipulating the EMA
+        sm._slot_duration_ema["backend1"] = CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
+
+        # Mock get_client to return a mock client
+        mock_client = MagicMock()
+        mock_client.restore_slot = AsyncMock(return_value=True)
+
+        def mock_get_client(key):
+            return mock_client
+
+        with patch.object(backend_manager, "refresh_slot_counts", new=AsyncMock(return_value={})):
+            with patch.object(backend_manager, "get_client", side_effect=mock_get_client):
+                g, restored = await sm.acquire_for_request(
+                    candidate_backends, restore_info, blocks=["block1"], prompt_tokens=10
+                )
+                return g, restored
+
+    g, restored = asyncio.run(run_test())
+    # Should fall through to Phase 2 after Phase 0 timeout
+    assert g == ("ModelB", "backend2", 0), f"Expected ('ModelB', 'backend2', 0), got {g}"
+    print("PASS: test_cache_hit_wait_phase0_timeout")
+
+
+def test_cache_hit_wait_pending_count_blocks():
+    """Pending count >= MAX_PENDING_REQS should skip Phase 0 entirely."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch, MagicMock
+    from slot_manager import SlotManager
+    from backend_manager import backend_manager, DiscoveredModel
+    from config import CACHE_HIT_WAIT_MAX_PENDING_REQS
+
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._discovered_models.clear()
+
+    async def run_test():
+        sm = SlotManager()
+        sm._ensure_pool("ModelA", "backend1", 1)
+        sm._ensure_pool("ModelB", "backend2", 1)
+
+        backend_manager._discovered_models = {
+            "ModelA": DiscoveredModel(
+                name="ModelA", n_ctx=4096,
+                backends=["backend1"],
+                total_slots=1, last_discovered=time.time(),
+            ),
+            "ModelB": DiscoveredModel(
+                name="ModelB", n_ctx=4096,
+                backends=["backend2"],
+                total_slots=1, last_discovered=time.time(),
+            ),
+        }
+
+        # Fill up the pending count
+        for i in range(CACHE_HIT_WAIT_MAX_PENDING_REQS):
+            sm._cache_wait_pending["backend1"] = sm._cache_wait_pending.get("backend1", 0) + 1
+
+        # Mark cache backend slot as in-use, fallback slot as free
+        sm._in_use[("ModelA", "backend1", 0)] = True
+        sm._in_use[("ModelB", "backend2", 0)] = False
+
+        restore_info = ("abc123", "backend1", "ModelA")
+        candidate_backends = [("backend2", "ModelB")]
+
+        # Mock get_client to return a mock client
+        mock_client = MagicMock()
+        mock_client.restore_slot = AsyncMock(return_value=True)
+
+        def mock_get_client(key):
+            return mock_client
+
+        with patch.object(backend_manager, "refresh_slot_counts", new=AsyncMock(return_value={})):
+            with patch.object(backend_manager, "get_client", side_effect=mock_get_client):
+                g, restored = await sm.acquire_for_request(
+                    candidate_backends, restore_info, blocks=["block1"], prompt_tokens=10
+                )
+                return sm, g, restored
+
+    sm, g, restored = asyncio.run(run_test())
+    # pending count was at MAX, so Phase 0 was skipped — fell through to Phase 2
+    assert g == ("ModelB", "backend2", 0), f"Expected ('ModelB', 'backend2', 0), got {g}"
+    assert sm._cache_wait_pending.get("backend1", 0) == CACHE_HIT_WAIT_MAX_PENDING_REQS
+    print("PASS: test_cache_hit_wait_pending_count_blocks")
+
+
+def test_slot_duration_ema_updates_after_release():
+    """EMA should update with slot occupancy duration after release."""
+    from slot_manager import SlotManager
+    from backend_manager import backend_manager
+    from config import CACHE_HIT_WAIT_EMA_ALPHA, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT
+
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._discovered_models.clear()
+
+    sm = SlotManager()
+    sm._ensure_pool("ModelA", "backend1", 1)
+
+    # Use a fixed time base for testing
+    time_base = 1000.0
+
+    # Simulate slot acquisition
+    g = ("ModelA", "backend1", 0)
+    sm._slot_acquired_at[g] = time_base
+    sm._in_use[g] = True
+
+    # Mock time.time() to return time_base + 50 for release
+    original_time = time.time
+    time.time = lambda: time_base + 50
+
+    try:
+        # Simulate release after 50 seconds
+        sm.release("ModelA", "backend1", 0)
+    finally:
+        time.time = original_time
+
+    # EMA should be: alpha * duration + (1 - alpha) * initial
+    expected_ema = CACHE_HIT_WAIT_EMA_ALPHA * 50 + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT
+    assert sm._slot_duration_ema.get("backend1") == expected_ema, \
+        f"Expected EMA {expected_ema}, got {sm._slot_duration_ema.get('backend1')}"
+    assert g not in sm._slot_acquired_at
+    print("PASS: test_slot_duration_ema_updates_after_release")
+
+
+def test_slot_duration_ema_bounds():
+    """EMA timeout should be clamped between MIN and MAX."""
+    from config import CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT
+
+    # Test MAX cap: EMA above max should be capped
+    ema_high = 500.0
+    wait_timeout = max(min(ema_high, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
+    assert wait_timeout == CACHE_HIT_WAIT_EMA_MAX_TIMEOUT, \
+        f"Expected MAX cap {CACHE_HIT_WAIT_EMA_MAX_TIMEOUT}, got {wait_timeout}"
+
+    # Test MIN floor: EMA below min should use min
+    ema_low = 5.0
+    wait_timeout = max(min(ema_low, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
+    assert wait_timeout == CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, \
+        f"Expected MIN floor {CACHE_HIT_WAIT_EMA_MIN_TIMEOUT}, got {wait_timeout}"
+
+    # Test normal range: EMA between min and max passes through
+    ema_normal = 50.0
+    wait_timeout = max(min(ema_normal, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
+    assert wait_timeout == 50.0, f"Expected 50.0, got {wait_timeout}"
+    print("PASS: test_slot_duration_ema_bounds")
+
+
+def test_slot_duration_ema_uses_initial_for_new_backend():
+    """New backend with no EMA data should use INITIAL_TIMEOUT."""
+    from slot_manager import SlotManager
+    from backend_manager import backend_manager
+    from config import CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT, \
+        CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
+
+    backend_manager._backends.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._refresh_state.clear()
+    backend_manager._discovered_models.clear()
+
+    sm = SlotManager()
+    sm._ensure_pool("ModelA", "backend1", 1)
+
+    # No prior EMA data
+    assert "backend1" not in sm._slot_duration_ema
+
+    # Effective timeout should use INITIAL_TIMEOUT
+    ema = sm._slot_duration_ema.get("backend1", CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
+    wait_timeout = max(min(ema, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
+    assert wait_timeout == CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, \
+        f"Expected INITIAL_TIMEOUT {CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT}, got {wait_timeout}"
+    print("PASS: test_slot_duration_ema_uses_initial_for_new_backend")
+
+
 if __name__ == "__main__":
     test_compile_all()
     # Hashing import test (must run first — imports hashing.py at module level)
@@ -2154,6 +2421,15 @@ if __name__ == "__main__":
 
     test_chat_save_skipped_when_ratio_above_threshold()
     test_chat_save_performed_when_ratio_below_threshold()
+
+    # ── Cache hit wait queue tests ─────────────────────────────────────
+
+    test_cache_hit_wait_phase0_success()
+    test_cache_hit_wait_phase0_timeout()
+    test_cache_hit_wait_pending_count_blocks()
+    test_slot_duration_ema_updates_after_release()
+    test_slot_duration_ema_bounds()
+    test_slot_duration_ema_uses_initial_for_new_backend()
 
     print("\nAll smoke tests passed.")
 

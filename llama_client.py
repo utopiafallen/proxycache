@@ -359,8 +359,9 @@ class LlamaClient:
                         models.append((name, int(n_ctx)))
                 if models:
                     return models
-        except Exception:
-            pass
+                log.warning("Router /models returned no loaded models on %s", self.base_url)
+        except Exception as e:
+             log.warning("Router /models failed on %s: %s", self.base_url, e)
 
         # Non-router mode: GET /v1/models
         try:
@@ -375,7 +376,8 @@ class LlamaClient:
                         n_ctx = meta.get("n_ctx", DEFAULT_N_CTX)
                     if name:
                         return [(name, int(n_ctx))]
-        except Exception:
-            pass
+        except Exception as e:
+             log.warning("Non-router /v1/models failed on %s: %s", self.base_url, e)
 
+        log.warning("discover_models returned empty on %s (both router and non-router failed)", self.base_url)
         return []

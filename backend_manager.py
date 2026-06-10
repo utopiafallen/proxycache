@@ -113,6 +113,10 @@ class BackendManager:
         all_discovered: dict[str, list[tuple[str, int]]] = {}
         for backend_key in self.keys():
             models = await self.get_client(backend_key).discover_models()
+            log.info("discover_models on backend '%s': %s", backend_key, models)
+            if not models:
+                log.warning("No models discovered on backend '%s'", backend_key)
+                continue
             for name, n_ctx in models:
                 if name not in all_discovered:
                     all_discovered[name] = []
@@ -176,6 +180,7 @@ class BackendManager:
         refreshed_any = False
 
         for canonical_name, info in self._discovered_models.items():
+            log.info("Model '%s' has backends: %s", canonical_name, info.backends)
             for backend_key in info.backends:
                 if backend_key not in self._backends:
                     continue
@@ -186,7 +191,7 @@ class BackendManager:
                 cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
                 if now - last_ts < cooldown:
                     log.warn("Skipping refresh for model '%s' on backend '%s': last refresh was %.1f seconds ago",
-                              canonical_name, backend_key, last_ts)
+                              canonical_name, backend_key, now - last_ts)
                     if cached_n > 0:
                         if backend_key not in slot_counts:
                             slot_counts[backend_key] = {}
@@ -275,7 +280,10 @@ class BackendManager:
                     self._backend_state[backend_key] = is_up
                     changed = True
             if changed:
-                await self.discover_models()
+                try:
+                    await self.discover_models()
+                except Exception as e:
+                    log.error("discover_models failed during liveness check: %s", e)
                 try:
                     await self.refresh_slot_counts()
                 except Exception:
