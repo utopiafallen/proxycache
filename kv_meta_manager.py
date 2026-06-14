@@ -283,14 +283,16 @@ class KVMetaManager:
 
                 meta_files = sorted(glob.glob(os.path.join(backend_dir, "*" + hs.META_SUFFIX)))
 
+                # First pass: read all meta files, remove corrupted ones, collect valid keys
+                valid_entries = []  # (meta_path, basename, cachename)
                 for meta_path in meta_files:
                     basename = os.path.basename(meta_path)
                     cachename = basename.removesuffix(hs.META_SUFFIX)
 
                     try:
                         with open(meta_path, "r", encoding="utf-8") as f:
-                            meta = json.load(f)
-                    except (json.JSONDecodeError, Exception) as e:
+                            json.load(f)
+                    except (json.JSONDecodeError, Exception):
                         log.warning("Removed corrupted meta file: %s", basename)
                         try:
                             os.remove(meta_path)
@@ -300,8 +302,35 @@ class KVMetaManager:
                             pass
                         continue
 
+                    valid_entries.append((meta_path, basename, cachename))
+
+                # Second pass: check cache existence
+                if agent_url and valid_entries:
+                    # Batch query all keys in one API call
+                    try:
+                        from cache_agent_client import CacheAgentClient
+                        agent_client = CacheAgentClient(agent_url)
+                        try:
+                            cachenames = [e[2] for e in valid_entries]
+                            results = await agent_client.batch_get_file_sizes(cachenames)
+                        finally:
+                            await agent_client.close()
+                    except Exception as e:
+                        log.warning("Batch cache size check failed for backend '%s' (%d keys): %s — falling back to individual checks",
+                                    backend_key, len(valid_entries), e)
+                        results = None
+                else:
+                    results = None
+
+                for meta_path, basename, cachename in valid_entries:
                     cache_exists = False
-                    if agent_url:
+                    if results is not None and cachename in results:
+                        cache_exists = results[cachename].get("exists", False)
+                    elif results is not None:
+                        # Batch returned but key not in results — treat as not found
+                        cache_exists = False
+                    elif agent_url and results is None:
+                        # Fallback: individual check on batch failure
                         try:
                             from cache_agent_client import get_file_size
                             result = await get_file_size(agent_url, cachename)

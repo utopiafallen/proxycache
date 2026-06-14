@@ -279,6 +279,14 @@ class BackendManager:
                 if is_up != old_state:
                     self._backend_state[backend_key] = is_up
                     changed = True
+            # Also trigger if an up backend has no models in the registry
+            # (discovery previously failed or never ran for that backend)
+            up_keys = {k for k, v in self._backend_state.items() if v}
+            discovered_backends = {be
+                                    for info in self._discovered_models.values()
+                                    for be in info.backends}
+            if up_keys - discovered_backends:
+                changed = True
             if changed:
                 try:
                     await self.discover_models()

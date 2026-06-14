@@ -10,7 +10,7 @@ typically on a separate port (e.g., 8082 vs 8080).
 """
 
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from urllib.parse import urljoin
 
 import httpx
@@ -82,6 +82,35 @@ class CacheAgentClient:
             return None
 
         return resp.json()
+
+    async def batch_get_file_sizes(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Get file sizes for multiple cache files in one API call.
+
+        Args:
+            keys: List of cache file basenames (SHA256 keys)
+
+        Returns:
+            Dict mapping key -> {"size": int, "exists": bool} or {"exists": False}.
+            Empty dict on connection error.
+        """
+        if not keys:
+            return {}
+        url = urljoin(self.base_url + "/", "/cache/files/batch")
+        try:
+            resp = await self._client.post(url, json={"keys": keys})
+        except Exception as e:
+            log.warning("Cache agent batch size check error on %s (%d keys): %s",
+                        self.base_url, len(keys), e)
+            return {}
+
+        if resp.status_code != 200:
+            log.warning("Cache agent batch returned status %d for %d keys: %s",
+                        resp.status_code, len(keys), resp.text[:200])
+            return {}
+
+        data = resp.json()
+        return data.get("results", {})
 
     async def close(self):
         await self._client.aclose()

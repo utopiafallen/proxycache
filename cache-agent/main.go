@@ -23,6 +23,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cache/delete", handleDelete)
+	mux.HandleFunc("/cache/files/batch", handleBatchFileSizes)
 	mux.HandleFunc("/cache/files/", handleFileSizes)
 
 	addr := ":" + port
@@ -38,6 +39,47 @@ type deleteResponse struct {
 type fileResponse struct {
 	Size   int64 `json:"size"`
 	Exists bool  `json:"exists"`
+}
+
+type batchRequest struct {
+	Keys []string `json:"keys"`
+}
+
+type batchResponse struct {
+	Results map[string]fileResponse `json:"results"`
+}
+
+func handleBatchFileSizes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(batchResponse{Results: map[string]fileResponse{}})
+		return
+	}
+
+	var req batchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(batchResponse{Results: map[string]fileResponse{}})
+		return
+	}
+
+	results := make(map[string]fileResponse)
+	for _, key := range req.Keys {
+		filepath := cacheDir + "/" + key
+		info, err := os.Stat(filepath)
+		if err != nil {
+			results[key] = fileResponse{Exists: false}
+		} else {
+			results[key] = fileResponse{Size: info.Size(), Exists: true}
+		}
+	}
+
+	log.Printf("batch file size: %d keys queried\n", len(req.Keys))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(batchResponse{Results: results})
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
