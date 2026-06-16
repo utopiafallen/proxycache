@@ -65,6 +65,9 @@ class SlotManager:
         self._cache_wait_semaphores: Dict[str, asyncio.Semaphore] = {}
         self._cache_wait_pending: Dict[str, int] = {}
 
+        # Per-backend save lock to protect ring buffer + eviction from concurrent saves
+        self._save_locks: Dict[str, asyncio.Lock] = {}
+
         # EMA of slot occupancy duration per backend: backend_id -> float
         self._slot_duration_ema: Dict[str, float] = {}
 
@@ -326,7 +329,6 @@ class SlotManager:
                 try:
                     self._cache_wait_pending[cache_backend] = pending + 1
                     await asyncio.wait_for(sem.acquire(), timeout=wait_timeout)
-                    self._cache_wait_pending[cache_backend] -= 1
                     # Semaphore released → cache backend freed a slot, try to acquire it
                     slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, cache_backend)
                     if slot_id is not None:
@@ -339,6 +341,8 @@ class SlotManager:
                                 restore_key, blocks,
                             )
                 except asyncio.TimeoutError:
+                    pass
+                finally:
                     self._cache_wait_pending[cache_backend] -= 1
                     # Timeout — fall through to retry loop (Phase 1 + Phase 2)
 
@@ -548,59 +552,61 @@ class SlotManager:
             )
 
         if ok and size > 0:
-            # Write meta file — we never want cache files without corresponding meta
-            try:
-                kv_meta.write_meta(
-                    key, n_tokens, blocks, WORDS_PER_BLOCK, model_name, backend_id, size,
-                )
-            except Exception as e:
-                log.warning("Failed to write meta file for key %s: %s", key[:16], e)
-            ring = self._cache_ring.setdefault(backend_id, deque())
-            ring.append((key, size, time.time()))
-            self._total_bytes[backend_id] = self._total_bytes.get(backend_id, 0) + size
+            lock = self._save_locks.setdefault(backend_id, asyncio.Lock())
+            async with lock:
+                # Write meta file — we never want cache files without corresponding meta
+                try:
+                    kv_meta.write_meta(
+                        key, n_tokens, blocks, WORDS_PER_BLOCK, model_name, backend_id, size,
+                    )
+                except Exception as e:
+                    log.warning("Failed to write meta file for key %s: %s", key[:16], e)
+                ring = self._cache_ring.setdefault(backend_id, deque())
+                ring.append((key, size, time.time()))
+                self._total_bytes[backend_id] = self._total_bytes.get(backend_id, 0) + size
 
-            # Ring buffer eviction: age-first, then LRU (per backend)
-            max_bytes = CACHE_MAX_SIZE_GB * 1024**3
-            now = time.time()
-            total = self._total_bytes.get(backend_id, 0)
-            log.info(
-                "Cache ring check for backend '%s': total=%d bytes, max=%d bytes, ring_size=%d",
-                backend_id, total, max_bytes, len(ring),
-            )
-            while self._total_bytes.get(backend_id, 0) > max_bytes and ring:
-                # First pass: evict expired entries
-                evicted_expired = False
-                for entry in ring:
-                    if now - entry[2] > self._max_age_seconds:
-                        evict_key, evict_size, _ = entry
-                        ring.remove(entry)
-                        self._total_bytes[backend_id] -= evict_size
-                        age_hours = (now - entry[2]) / 3600
-                        await self._evict_cache_file(evict_key, backend_id, "ring_evict_expired",
-                                                     "(%d bytes, age=%.1fh)" % (evict_size, age_hours))
-                        self._evict_meta_file(evict_key)
-                        evicted_expired = True
-                        break
-                if evicted_expired:
-                    continue
-
-                # Second pass: evict LRU entry (no expired entries left)
-                lru_idx = 0
-                lru_ts = ring[0][2]
-                for i in range(1, len(ring)):
-                    if ring[i][2] < lru_ts:
-                        lru_ts = ring[i][2]
-                        lru_idx = i
-                evict_key, evict_size, _ = ring[lru_idx]
-                ring.remove(ring[lru_idx])
-                self._total_bytes[backend_id] -= evict_size
+                # Ring buffer eviction: age-first, then LRU (per backend)
+                max_bytes = CACHE_MAX_SIZE_GB * 1024**3
+                now = time.time()
+                total = self._total_bytes.get(backend_id, 0)
                 log.info(
-                    "Ring buffer eviction: evicted LRU entry '%s' for backend '%s' (%d bytes, remaining=%d)",
-                    evict_key, backend_id, evict_size, self._total_bytes.get(backend_id, 0),
+                    "Cache ring check for backend '%s': total=%d bytes, max=%d bytes, ring_size=%d",
+                    backend_id, total, max_bytes, len(ring),
                 )
-                await self._evict_cache_file(evict_key, backend_id, "ring_evict_lru",
-                                             "(%d bytes, last_used=%.0f)" % (evict_size, lru_ts))
-                self._evict_meta_file(evict_key)
+                while self._total_bytes.get(backend_id, 0) > max_bytes and ring:
+                    # First pass: evict expired entries
+                    evicted_expired = False
+                    for entry in ring:
+                        if now - entry[2] > self._max_age_seconds:
+                            evict_key, evict_size, _ = entry
+                            ring.remove(entry)
+                            self._total_bytes[backend_id] -= evict_size
+                            age_hours = (now - entry[2]) / 3600
+                            await self._evict_cache_file(evict_key, backend_id, "ring_evict_expired",
+                                                         "(%d bytes, age=%.1fh)" % (evict_size, age_hours))
+                            self._evict_meta_file(evict_key)
+                            evicted_expired = True
+                            break
+                    if evicted_expired:
+                        continue
+
+                    # Second pass: evict LRU entry (no expired entries left)
+                    lru_idx = 0
+                    lru_ts = ring[0][2]
+                    for i in range(1, len(ring)):
+                        if ring[i][2] < lru_ts:
+                            lru_ts = ring[i][2]
+                            lru_idx = i
+                    evict_key, evict_size, _ = ring[lru_idx]
+                    ring.remove(ring[lru_idx])
+                    self._total_bytes[backend_id] -= evict_size
+                    log.info(
+                        "Ring buffer eviction: evicted LRU entry '%s' for backend '%s' (%d bytes, remaining=%d)",
+                        evict_key, backend_id, evict_size, self._total_bytes.get(backend_id, 0),
+                    )
+                    await self._evict_cache_file(evict_key, backend_id, "ring_evict_lru",
+                                                 "(%d bytes, last_used=%.0f)" % (evict_size, lru_ts))
+                    self._evict_meta_file(evict_key)
 
         return ok, size
 
