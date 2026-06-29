@@ -24,7 +24,7 @@ from typing import List, Tuple, Dict, Optional
 
 import httpx
 
-from config import META_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, \
+from config import META_DIR, CACHE_MAX_AGE_HOURS, \
     KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK, SLOT_TIMEOUT, DEFAULT_N_CTX, \
     should_save_cache, CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, CACHE_HIT_WAIT_MAX_PENDING_REQS, \
     CACHE_HIT_WAIT_EMA_ALPHA, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT
@@ -137,8 +137,8 @@ class SlotManager:
 
         # Cleanup pass: evict expired + over-size entries
         now = time.time()
-        max_bytes = CACHE_MAX_SIZE_GB * 1024**3
         for backend_id, ring in self._cache_ring.items():
+            max_bytes = backend_manager.get_cache_max_size_gb(backend_id) * 1024**3
             while ring:
                 entry = ring[0]
                 if now - entry[2] > self._max_age_seconds:
@@ -560,7 +560,7 @@ class SlotManager:
                 self._total_bytes[backend_id] = self._total_bytes.get(backend_id, 0) + size
 
                 # Ring buffer eviction: age-first, then LRU (per backend)
-                max_bytes = CACHE_MAX_SIZE_GB * 1024**3
+                max_bytes = backend_manager.get_cache_max_size_gb(backend_id) * 1024**3
                 now = time.time()
                 total = self._total_bytes.get(backend_id, 0)
                 log.info(

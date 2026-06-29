@@ -40,6 +40,7 @@ class BackendInfo:
     client: LlamaClient
     agent_client: CacheAgentClient | None
     cache_dir: str | None
+    cache_max_size_gb: float = 25.0
 
 
 class BackendManager:
@@ -80,7 +81,8 @@ class BackendManager:
             if "agent_port" in be:
                 host = raw_key.rsplit(":", 1)[0]
                 agent_client = CacheAgentClient(f"http://{host}:{be['agent_port']}")
-            self._backends[key] = BackendInfo(client=client, agent_client=agent_client, cache_dir=cache_dir)
+            cache_max_size_gb = float(be.get("cache_max_size_gb", 25.0))
+            self._backends[key] = BackendInfo(client=client, agent_client=agent_client, cache_dir=cache_dir, cache_max_size_gb=cache_max_size_gb)
             if self._first_key is None:
                 self._first_key = key
 
@@ -112,6 +114,12 @@ class BackendManager:
         if be is None:
             raise KeyError(f"Unknown backend key: {key}")
         return be.agent_client is not None or be.cache_dir is not None
+
+    def get_cache_max_size_gb(self, key: str) -> float:
+        be = self._backends.get(key)
+        if be is None:
+            raise KeyError(f"Unknown backend key: {key}")
+        return getattr(be, 'cache_max_size_gb', 25.0)
 
     async def cache_delete(self, backend_id: str, key: str) -> bool:
         """Delete a cache file via agent or local filesystem."""

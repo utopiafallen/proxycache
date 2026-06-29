@@ -38,7 +38,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 from config import (BACKENDS, WORDS_PER_BLOCK,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
-                    CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
+                    CACHE_MAX_AGE_HOURS,
                     SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD,
                     REFRESH_COOLDOWN_SECONDS, should_save_cache)
 
@@ -909,7 +909,8 @@ def _get_cache_stats() -> dict:
     for backend_id in backend_manager.keys():
         ring = sm._cache_ring.get(backend_id, deque())
         total_bytes = sm._total_bytes.get(backend_id, 0)
-        max_bytes = CACHE_MAX_SIZE_GB * 1024**3
+        max_gb = backend_manager.get_cache_max_size_gb(backend_id)
+        max_bytes = max_gb * 1024**3
         utilization = (total_bytes / max_bytes * 100) if max_bytes > 0 else 0
         file_count = len(ring)
         oldest = None
@@ -922,7 +923,7 @@ def _get_cache_stats() -> dict:
             "ring_size": file_count,
             "total_bytes": total_bytes,
             "total_gb": round(total_bytes / 1024**3, 2),
-            "max_gb": CACHE_MAX_SIZE_GB,
+            "max_gb": max_gb,
             "utilization_pct": round(utilization, 1),
             "cache_dir": cache_dir,
             "oldest_entry": oldest,

@@ -46,7 +46,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `BACKENDS` | `[]` | JSON array of backend configs (see below). Empty defaults to `[{"url":"http://127.0.0.1:8000"}]`. |
 | `BACKEND_MODE` | `llama-cpp` | `llama-cpp` or `llama-swap` (changes `/slots` URL paths) |
 | `META_DIR` | `./kv_meta` | Local metadata directory (organized by backend subdirectories) |
-| `CACHE_MAX_SIZE_GB` | `25` | Max total cache size per backend in GB |
+
 | `CACHE_MAX_AGE_HOURS` | `168` | Delete cache files older than this (0=disabled) |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
 | `LCP_TH` | `0.2` | LCP similarity threshold for cache match (0–1) |
@@ -128,14 +128,14 @@ models:
 
 ## Cache Management
 
-Each backend can be configured with either `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). These options are mutually exclusive.
+Each backend can be configured with either `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). These options are mutually exclusive. Each backend can also optionally specify `cache_max_size_gb` to control its individual cache ring buffer size (default: `25`).
 
 ### Local cache management
 
 For backends on the same host, set `cache_dir` to the path matching llama.cpp's `--slot-save-path`:
 
 ```bash
-BACKENDS='[{"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache"}]'
+BACKENDS='[{"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache","cache_max_size_gb":50}]'
 ```
 
 ### Cache Agent
@@ -172,8 +172,8 @@ You can mix both styles across backends:
 
 ```bash
 BACKENDS='[
-  {"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache/b1"},
-  {"url":"http://10.0.0.2:8000","agent_port":8082},
+  {"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache/b1","cache_max_size_gb":50},
+  {"url":"http://10.0.0.2:8000","agent_port":8082,"cache_max_size_gb":10},
   {"url":"http://10.0.0.3:8000"}
 ]'
 ```
