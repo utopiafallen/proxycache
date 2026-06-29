@@ -36,17 +36,18 @@ python test_smoke.py                           # smoke tests (no framework, uses
 
 - **llama.cpp prerequisite**: MUST start with `--slot-save-path <dir>`. Cache save/restore fails silently without it.
 - **Config**: all env vars only — `config.py` has defaults. No `.env` file support.
-- **Cache key**: `sha256(model_id + "\n" + raw_prefix)` where `raw_prefix` strips message roles and concatenates content with `\n\n`.
-- **Backend keys**: stable `host:port` strings (e.g. `"10.0.0.1:8000"`), NOT integer indices. Integer indices change across restarts.
+- **Cache key**: `sha256(canonical_name + '\n' + ','.join(token_ids))` — based on token IDs, not raw text.
+- **Backend keys**: sanitized `host-port` strings (colons replaced with dashes, e.g. `"10-0-0-1-8000"`), NOT raw `host:port`. Used as directory names under `META_DIR/`.
 - **Slot pinning** is duplicated 3 ways in every request body: root (`slot_id`, `id_slot`, `_slot_id`), `options` dict, and query params.
 - **Save happens after response** completes (both stream and non-stream), never before.
 - **Streaming**: background `reader` task races socket reads against disconnect event → `asyncio.Queue`. Heartbeat checks `is_disconnected()` every 0.5s. `stream()`'s `finally` calls `_cleanup()` which saves the slot only if `_stream_complete` is True (stream finished normally, not cancelled mid-stream), then releases it.
 - **Slot acquire timeout**: 60s hardcoded (`ACQUIRE_TIMEOUT` in app.py). Returns 503 if all slots busy.
 - **Slot timeout**: `SLOT_TIMEOUT` (default 30s) wraps `/slots/{id}?action=save|restore`. Separate from `REQUEST_TIMEOUT` (600s).
 - **Cache hit wait queue**: when a cache-hit request's backend has no free slots, Phase 0 waits up to an EMA-derived timeout (`CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT`, default 30s) on a per-backend semaphore. On slot release, the EMA is updated with actual occupancy duration and one waiter is woken. Clamped between `CACHE_HIT_WAIT_EMA_MIN_TIMEOUT` (10s) and `CACHE_HIT_WAIT_EMA_MAX_TIMEOUT` (300s). Max concurrent waiters per backend: `CACHE_HIT_WAIT_MAX_PENDING_REQS` (3). Falls through to normal retry loop on timeout.
-
-- **KV cache skip**: `acquire_for_request` checks `_slot_kv_state` before restoring. If slot's tracked KV cache blocks have LCP ratio >= `KV_CACHE_SKIP_THRESHOLD` (default 0.9), restore is skipped — llama.cpp appends to existing cache.
+- **KV cache skip**: `acquire_for_request` checks `_slot_kv_state` before restoring. If slot's tracked KV cache blocks have LCP ratio >= `KV_CACHE_SKIP_THRESHOLD` (default 0.9), restore is skipped — llama.cpp appends to existing cache. Only safe on single-slot backends.
 - **Ring buffer eviction**: `SlotManager` evicts expired entries (age-first) then LRU when `_total_bytes > backend.cache_max_size_gb * 1024**3`. Per-backend, defaults to 25 GB. Only triggers on saves.
 - **Slot refresh cooldown**: 300s per (model, backend) pair on success, 30s on failure. On-demand discovery via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode). Falls back to 1 slot if discovery fails.
 - **Meta reconciliation**: on startup, orphaned/corrupted `.meta.json` files are deleted via `reconcile_meta()`.
-- `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, `run-proxycache.ps1`, and `uv.lock`.
+- **Backend config validation**: each backend MUST specify exactly one of `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). Mutually exclusive. Missing either raises `ValueError` at startup.
+- **BACKENDS default**: when empty, defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`.
+- `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, `run-proxycache.ps1`, `uv.lock`, and `cache-agent.exe`.
