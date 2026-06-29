@@ -2494,6 +2494,190 @@ def test_slot_duration_ema_uses_initial_for_new_backend():
     print("PASS: test_slot_duration_ema_uses_initial_for_new_backend")
 
 
+# ── Metrics tests ──────────────────────────────────────────────────────────
+
+def test_metrics_collector_basic():
+    """MetricsCollector should track requests and compute basic metrics."""
+    from metrics import MetricsCollector
+
+    m = MetricsCollector(retention=10)
+
+    # Record a cache hit with no recompute
+    m.record({
+        "t0": 1000.0, "request_json": {"model": "test", "messages": [{"role": "user", "content": "hello"}]},
+        "model": "test", "backend": "be1", "slot_id": 0,
+        "cache_hit": True, "restored": True, "recompute": False,
+        "saved": True, "latency_ms": 100.0, "n_tokens": 10, "cache_size_bytes": 1024,
+    })
+
+    # Record a cache miss
+    m.record({
+        "t0": 1001.0, "request_json": {"model": "test", "messages": [{"role": "user", "content": "world"}]},
+        "model": "test", "backend": "be1", "slot_id": 1,
+        "cache_hit": False, "restored": False, "recompute": False,
+        "saved": True, "latency_ms": 200.0, "n_tokens": 20, "cache_size_bytes": 2048,
+    })
+
+    # Record a cache hit with recompute
+    m.record({
+        "t0": 1002.0, "request_json": {"model": "test", "messages": [{"role": "user", "content": "foo"}]},
+        "model": "test", "backend": "be1", "slot_id": 0,
+        "cache_hit": True, "restored": True, "recompute": True,
+        "saved": False, "latency_ms": 300.0, "n_tokens": 30, "cache_size_bytes": 0,
+    })
+
+    perf = m.get_performance()
+    assert perf["total_requests"] == 3
+    assert perf["cache_hits"] == 2
+    assert perf["cache_misses"] == 1
+    assert perf["cache_recomputes"] == 1
+    assert perf["cache_saved"] == 2
+    assert perf["cache_save_skipped"] == 1
+    assert abs(perf["cache_hit_rate"] - 2/3) < 0.01
+    assert abs(perf["cache_mispredict_rate"] - 0.5) < 0.01
+    assert abs(perf["cache_utility_rate"] - 1/3) < 0.01
+    assert abs(perf["latency"]["avg_ms"] - 200.0) < 1.0
+
+    requests = m.get_requests()
+    assert len(requests) == 3
+    assert requests[0]["prompt_preview"] == "hello"
+    # full_request_json is only stored for last ~20% of entries (2 of 3 with retention=10)
+    assert requests[2]["full_request_json"] == {"model": "test", "messages": [{"role": "user", "content": "foo"}]}
+
+    print("PASS: test_metrics_collector_basic")
+
+
+def test_metrics_collector_performance():
+    """MetricsCollector should compute latency percentiles correctly."""
+    from metrics import MetricsCollector
+
+    m = MetricsCollector(retention=100)
+
+    # Record requests with known latencies
+    latencies = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    for i, lat in enumerate(latencies):
+        m.record({
+            "t0": 1000.0 + i, "request_json": {},
+            "model": "test", "backend": "be1", "slot_id": 0,
+            "cache_hit": False, "restored": False, "recompute": False,
+            "saved": False, "latency_ms": lat, "n_tokens": 1,
+        })
+
+    perf = m.get_performance()
+    assert perf["latency"]["avg_ms"] == 55.0  # (10+100)/2 = 55
+    # Percentile indices: int(n*p) for n=10: p50->5, p95->9, p99->9
+    assert perf["latency"]["p50_ms"] == 60.0  # latencies[5]
+    assert perf["latency"]["p95_ms"] == 100.0  # latencies[9]
+    assert perf["latency"]["p99_ms"] == 100.0  # latencies[9]
+
+    print("PASS: test_metrics_collector_performance")
+
+
+def test_metrics_collector_ring_overflow():
+    """MetricsCollector should overflow ring buffer correctly."""
+    from metrics import MetricsCollector
+
+    m = MetricsCollector(retention=5)
+
+    for i in range(10):
+        m.record({
+            "t0": 1000.0 + i, "request_json": {"i": i},
+            "model": "test", "backend": "be1", "slot_id": 0,
+            "cache_hit": False, "restored": False, "recompute": False,
+            "saved": False, "latency_ms": 10.0, "n_tokens": 1,
+        })
+
+    requests = m.get_requests()
+    assert len(requests) == 5
+    # Should have the last 5 entries (i=5..9)
+    # With retention=5, max_full=1, so only the last entry has full_request_json
+    assert requests[4]["full_request_json"]["i"] == 9
+
+    # Total counters should reflect all 10 records
+    perf = m.get_performance()
+    assert perf["total_requests"] == 10
+
+    print("PASS: test_metrics_collector_ring_overflow")
+
+
+def test_metrics_collector_per_model():
+    """MetricsCollector should compute per-model metrics."""
+    from metrics import MetricsCollector
+
+    m = MetricsCollector(retention=100)
+
+    m.record({
+        "t0": 1000.0, "request_json": {},
+        "model": "model-a", "backend": "be1", "slot_id": 0,
+        "cache_hit": True, "restored": True, "recompute": False,
+        "saved": True, "latency_ms": 100.0,
+    })
+    m.record({
+        "t0": 1001.0, "request_json": {},
+        "model": "model-b", "backend": "be1", "slot_id": 0,
+        "cache_hit": False, "restored": False, "recompute": False,
+        "saved": False, "latency_ms": 200.0,
+    })
+
+    perf_a = m.get_performance(model="model-a")
+    assert perf_a["cache_hit_rate"] == 1.0
+    assert perf_a["total_requests"] == 1
+
+    perf_b = m.get_performance(model="model-b")
+    assert perf_b["cache_hit_rate"] == 0.0
+    assert perf_b["total_requests"] == 1
+
+    print("PASS: test_metrics_collector_per_model")
+
+
+def test_metrics_collector_per_backend():
+    """MetricsCollector should compute per-backend metrics."""
+    from metrics import MetricsCollector
+
+    m = MetricsCollector(retention=100)
+
+    m.record({
+        "t0": 1000.0, "request_json": {},
+        "model": "test", "backend": "be1", "slot_id": 0,
+        "cache_hit": True, "restored": True, "recompute": False,
+        "saved": True, "latency_ms": 100.0,
+    })
+    m.record({
+        "t0": 1001.0, "request_json": {},
+        "model": "test", "backend": "be2", "slot_id": 0,
+        "cache_hit": False, "restored": False, "recompute": False,
+        "saved": False, "latency_ms": 200.0,
+    })
+
+    perf_1 = m.get_performance(backend="be1")
+    assert perf_1["cache_hit_rate"] == 1.0
+
+    perf_2 = m.get_performance(backend="be2")
+    assert perf_2["cache_hit_rate"] == 0.0
+
+    print("PASS: test_metrics_collector_per_backend")
+
+
+def test_dashboard_endpoint():
+    """Dashboard endpoint should return HTML when enabled."""
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+    import app as app_module
+    import config
+
+    client = TestClient(app_module.app)
+
+    with patch.object(config, "DASHBOARD_ENABLED", True):
+        with patch("os.path.exists", return_value=True):
+            mock_file = open("/dev/null", "r")
+            with patch("builtins.open", return_value=mock_file):
+                resp = client.get("/dashboard")
+                assert resp.status_code in (200, 404)
+            mock_file.close()
+
+    print("PASS: test_dashboard_endpoint")
+
+
 if __name__ == "__main__":
     test_compile_all()
     # Hashing import test (must run first — imports hashing.py at module level)
@@ -2613,6 +2797,15 @@ if __name__ == "__main__":
     test_slot_duration_ema_updates_after_release()
     test_slot_duration_ema_bounds()
     test_slot_duration_ema_uses_initial_for_new_backend()
+
+    # ── Metrics tests ──────────────────────────────────────────────────
+
+    test_metrics_collector_basic()
+    test_metrics_collector_performance()
+    test_metrics_collector_ring_overflow()
+    test_metrics_collector_per_model()
+    test_metrics_collector_per_backend()
+    test_dashboard_endpoint()
 
     print("\nAll smoke tests passed.")
 

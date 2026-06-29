@@ -28,18 +28,19 @@ import json
 import os
 import time
 import logging
+from collections import deque
 from typing import List, Dict, AsyncGenerator, Optional
 
 import httpx
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 from config import (BACKENDS, WORDS_PER_BLOCK,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
                     CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
                     SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD,
-                    should_save_cache)
+                    REFRESH_COOLDOWN_SECONDS, should_save_cache)
 
 import hashing as hs
 from slot_manager import SlotManager
@@ -107,7 +108,8 @@ class StreamReader:
                  model_name: str, backend_id: str, slot_id: int,
                  key: str, n_tokens: int, blocks: List[str],
                  sm: SlotManager, best_ratio: float = 0.0, restored: bool = False,
-                 restore_key: Optional[str] = None, restore_backend: Optional[str] = None):
+                 restore_key: Optional[str] = None, restore_backend: Optional[str] = None,
+                 t0: float = 0, request_json: Optional[Dict] = None):
         self.resp = resp
         self.req = req
         self.model_name = model_name
@@ -121,6 +123,8 @@ class StreamReader:
         self.restored = restored
         self.restore_key = restore_key
         self.restore_backend = restore_backend
+        self._t0 = t0
+        self._request_json = request_json
         self.queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
         self._cancelled = False
         self._stream_complete = False
@@ -381,6 +385,46 @@ class StreamReader:
         self.sm.release(self.model_name, self.backend_id, self.slot_id)
         log.info("Released slot %d for model '%s' on backend '%s' (key %s)", self.slot_id,
                   self.model_name, self.backend_id, self.key_short)
+
+        # Record metrics for streaming requests
+        if self._t0 > 0:
+            recompute_happened = False
+            if self.restored and self.restore_key and self.restore_backend:
+                cached_tokens = self._sse_cached_tokens
+                llm_prompt_tokens = self._sse_prompt_tokens or self.n_tokens
+                if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
+                    recompute_happened = True
+
+            from metrics import metrics as _metrics
+            prompt_preview = ""
+            if self._request_json:
+                messages = self._request_json.get("messages", [])
+                for msg in messages:
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            prompt_preview = content[:200]
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    prompt_preview = c["text"][:200]
+                        break
+            _metrics.record({
+                "t0": self._t0,
+                "request_json": self._request_json or {},
+                "model": self.model_name,
+                "backend": self.backend_id,
+                "slot_id": self.slot_id,
+                "cache_hit": bool(self.restore_key),
+                "restored": self.restored,
+                "recompute": recompute_happened,
+                "saved": ok,
+                "latency_ms": (time.time() - self._t0) * 1000,
+                "n_tokens": self.n_tokens,
+                "cache_size_bytes": 0,
+                "prompt_preview": prompt_preview,
+            })
+
         log.info("Stream reader finished for model '%s' on backend '%s' slot %d (key %s): saved=%s",
                   self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
 
@@ -443,7 +487,11 @@ async def chat(req: Request):
 
     t0 = time.time()
     client_ip = req.client.host if req.client else "-"
-    data = await req.json()
+
+    # Capture request body once for metrics (before req.json() consumes it)
+    raw_body = await req.body()
+    request_json = json.loads(raw_body)
+    data = request_json
 
     messages: List[Dict] = data.get("messages") or []
     stream = bool(data.get("stream", False))
@@ -587,7 +635,7 @@ async def chat(req: Request):
 
             reader = StreamReader(resp, req, model_name, be_id, slot_id,
                                   key, prompt_tokens, blocks, sm, best_ratio, restored,
-                                  restore_key, restore_backend)
+                                  restore_key, restore_backend, t0=t0, request_json=request_json)
             gen = reader.stream()
             _reader_created = True
 
@@ -639,12 +687,45 @@ async def chat(req: Request):
                     )
                     kv_meta.increment_recompute_penalty(restore_key, restore_backend)
 
+            save_ok = False
             if should_save_cache(best_ratio, recompute_happened):
                 ok, cache_size = await sm.save_after(
                     model_name, be_id, slot_id, key, blocks, prompt_tokens,
                 )
+                save_ok = ok
             else:
                 sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens, restored, best_ratio, recompute_happened)
+
+            # Record metrics for non-streaming requests
+            from metrics import metrics as _metrics
+            prompt_preview = ""
+            messages = request_json.get("messages", [])
+            for msg in messages:
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        prompt_preview = content[:200]
+                    elif isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "text":
+                                prompt_preview = c["text"][:200]
+                    break
+            _metrics.record({
+                "t0": t0,
+                "request_json": request_json,
+                "model": model_name,
+                "backend": be_id,
+                "slot_id": slot_id,
+                "cache_hit": bool(restore_key),
+                "restored": restored,
+                "recompute": recompute_happened,
+                "saved": save_ok,
+                "latency_ms": (time.time() - t0) * 1000,
+                "n_tokens": prompt_tokens,
+                "cache_size_bytes": cache_size if ok else 0,
+                "prompt_preview": prompt_preview,
+            })
+
             # log.info(
             #     "json_response\n%s",
             #     json.dumps(out, indent=2, ensure_ascii=False),
@@ -675,3 +756,176 @@ async def chat(req: Request):
     finally:
         if not _reader_created:
             sm.release(model_name, be_id, slot_id)
+
+
+# ── Metrics & Dashboard Endpoints ────────────────────────────────────
+
+@app.get("/metrics/summary")
+async def metrics_summary():
+    """Full summary for the dashboard."""
+    from metrics import metrics as _metrics
+    summary = _metrics.get_summary()
+    summary["backends"] = _get_backend_health()
+    summary["slots"] = _get_slot_status()
+    summary["cache"] = _get_cache_stats()
+    return summary
+
+
+@app.get("/metrics/health")
+async def metrics_health():
+    """Backend health and model discovery info."""
+    return _get_backend_health()
+
+
+@app.get("/metrics/slots")
+async def metrics_slots():
+    """Per-slot state for all backends."""
+    return _get_slot_status()
+
+
+@app.get("/metrics/cache")
+async def metrics_cache():
+    """Per-backend cache utilization stats."""
+    return _get_cache_stats()
+
+
+@app.get("/metrics/requests")
+async def metrics_requests(limit: int = 100, offset: int = 0):
+    """Recent requests with full JSON payload."""
+    from metrics import metrics as _metrics
+    requests = _metrics.get_requests(limit=limit, offset=offset)
+    return {"requests": requests, "total": len(requests)}
+
+
+@app.get("/metrics/performance")
+async def metrics_performance(model: str = None, backend: str = None):
+    """Cache performance metrics."""
+    from metrics import metrics as _metrics
+    perf = _metrics.get_performance(model=model, backend=backend)
+    return perf
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Serve the monitoring dashboard HTML."""
+    from config import DASHBOARD_ENABLED
+    if not DASHBOARD_ENABLED:
+        return JSONResponse({"error": "Dashboard disabled"}, status_code=404)
+    dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+    if os.path.exists(dashboard_path):
+        with open(dashboard_path, "r") as f:
+            return HTMLResponse(content=f.read())
+    return JSONResponse({"error": "dashboard.html not found"}, status_code=404)
+
+
+# ── Helper Functions for Metrics ─────────────────────────────────────
+
+
+def _get_backend_health() -> dict:
+    """Build backend health info from BackendManager and SlotManager."""
+    sm = app.state.sm if hasattr(app.state, "sm") else None
+    result = {}
+    for key in backend_manager.keys():
+        be = backend_manager._backends.get(key)
+        if be is None:
+            continue
+        info = {
+            "url": be.client.base_url,
+            "up": backend_manager._backend_state.get(key, False),
+            "cache_dir": be.cache_dir,
+            "has_agent": be.agent_client is not None,
+            "models": {},
+        }
+        for model_name, model_info in backend_manager._discovered_models.items():
+            if key not in model_info.backends:
+                continue
+            # Count in-use slots for this model/backend
+            in_use = 0
+            total_slots = 0
+            if sm:
+                pool_key = (model_name, key)
+                pool = sm._slot_pools.get(pool_key)
+                if pool:
+                    total_slots = len(pool)
+                    for slot_id in pool:
+                        if sm._in_use.get((model_name, key, slot_id), False):
+                            in_use += 1
+            # Get refresh cooldown info
+            refresh_key = (model_name, key)
+            last_ts, last_success, cached_n = backend_manager._refresh_state.get(refresh_key, (0.0, True, 0))
+            now = time.time()
+            cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
+            cooldown_remaining = max(0, cooldown - (now - last_ts))
+            info["models"][model_name] = {
+                "n_ctx": model_info.n_ctx,
+                "total_slots": model_info.total_slots,
+                "in_use": in_use,
+                "last_discovered": model_info.last_discovered,
+                "last_refresh": last_ts,
+                "refresh_cooldown_remaining": round(cooldown_remaining, 1),
+            }
+        result[key] = info
+    return result
+
+
+def _get_slot_status() -> dict:
+    """Build per-slot state for all backends."""
+    sm = app.state.sm if hasattr(app.state, "sm") else None
+    if not sm:
+        return {}
+    result = {}
+    for (model_name, backend_id), pool in sm._slot_pools.items():
+        if backend_id not in result:
+            result[backend_id] = {"models": {}}
+        if model_name not in result[backend_id]["models"]:
+            result[backend_id]["models"][model_name] = {"slots": {}}
+        slots = result[backend_id]["models"][model_name]["slots"]
+        for slot_id in pool:
+            g = (model_name, backend_id, slot_id)
+            in_use = sm._in_use.get(g, False)
+            last_used = sm._last_used.get(g, 0)
+            kv_blocks = len(sm._slot_kv_state.get(g, []))
+            # Check if slot was recently restored (within 5s)
+            last_restore_key = None
+            if g in sm._slot_save_skipped:
+                skip_entry = sm._slot_save_skipped[g]
+                if len(skip_entry) >= 3:
+                    last_restore_key = skip_entry[0][:16] if skip_entry[0] else None
+            slots[str(slot_id)] = {
+                "in_use": in_use,
+                "last_used": last_used,
+                "kv_blocks": kv_blocks,
+                "last_restore": last_restore_key,
+            }
+    return result
+
+
+def _get_cache_stats() -> dict:
+    """Build per-backend cache utilization stats."""
+    sm = app.state.sm if hasattr(app.state, "sm") else None
+    if not sm:
+        return {}
+    result = {}
+    for backend_id in backend_manager.keys():
+        ring = sm._cache_ring.get(backend_id, deque())
+        total_bytes = sm._total_bytes.get(backend_id, 0)
+        max_bytes = CACHE_MAX_SIZE_GB * 1024**3
+        utilization = (total_bytes / max_bytes * 100) if max_bytes > 0 else 0
+        file_count = len(ring)
+        oldest = None
+        newest = None
+        if ring:
+            oldest = ring[0][2]
+            newest = ring[-1][2]
+        cache_dir = backend_manager.get_cache_dir(backend_id)
+        result[backend_id] = {
+            "ring_size": file_count,
+            "total_bytes": total_bytes,
+            "total_gb": round(total_bytes / 1024**3, 2),
+            "max_gb": CACHE_MAX_SIZE_GB,
+            "utilization_pct": round(utilization, 1),
+            "cache_dir": cache_dir,
+            "oldest_entry": oldest,
+            "newest_entry": newest,
+        }
+    return result
