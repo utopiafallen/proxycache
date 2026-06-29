@@ -125,6 +125,8 @@ class SlotManager:
             backend_path = os.path.join(META_DIR, backend_dir)
             if not os.path.isdir(backend_path):
                 continue
+            if not backend_path in backend_manager.keys():
+                continue
             ring = self._cache_ring.setdefault(backend_dir, deque())
             for key in kv_meta.list_keys(backend_dir):
                 if any(entry[0] == key for entry in ring):
