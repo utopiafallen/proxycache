@@ -349,11 +349,6 @@ header .controls select, header .controls button {
         <option value="30">30s</option>
       </select>
     </label>
-    <label>Backend:
-      <select id="backendFilter">
-        <option value="">All</option>
-      </select>
-    </label>
     <button id="darkModeToggle">Toggle Dark</button>
   </div>
 </header>
@@ -407,6 +402,9 @@ header .controls select, header .controls button {
         <button onclick="setFilter('hit', this)">Hits</button>
         <button onclick="setFilter('miss', this)">Misses</button>
         <button onclick="setFilter('recompute', this)">Recomputes</button>
+        <select id="backendFilter" style="margin-left:auto;padding:4px 6px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);">
+          <option value="">All backends</option>
+        </select>
       </div>
       <div id="requestsList"></div>
       <button class="show-all-btn" id="showAllBtn" onclick="showAllRequests()">Show all 100</button>
@@ -509,7 +507,7 @@ function renderBackendHealth(backends) {
     if (info.models) {
       for (const [modelName, modelInfo] of Object.entries(info.models)) {
         html += `<div class="backend-models">
-          ${modelName} — ${modelInfo.total_slots} slots (${modelInfo.in_use} in use), n_ctx=${modelInfo.n_ctx}
+          ${modelName} | ${modelInfo.total_slots} slots (${modelInfo.in_use} in use), n_ctx=${modelInfo.n_ctx}
         </div>`;
       }
     }
@@ -636,7 +634,13 @@ function renderFilteredRequests() {
     const bodyOpen = expanded ? 'open' : '';
     const arrowOpen = expanded ? 'open' : '';
     const preview = req.prompt_preview ? `<div class="request-preview">"${req.prompt_preview}${req.prompt_preview.length >= 200 ? '...' : ''}"</div>` : '';
-    const fullJson = req.full_request_json ? `<pre>${JSON.stringify(req.full_request_json, null, 2)}</pre>` : '';
+    const metricsParts = [];
+    if (req.n_tokens) metricsParts.push(`${req.n_tokens} tokens`);
+    if (req.cache_size_bytes) metricsParts.push(formatBytes(req.cache_size_bytes));
+    if (req.restored) metricsParts.push('restored');
+    if (req.saved) metricsParts.push('saved');
+    const metricsHtml = metricsParts.length ? `<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">${metricsParts.join(' &middot; ')}</div>` : '';
+    const fullJson = req.full_request_json ? `<pre>${JSON.stringify(req.full_request_json, null, 2)}</pre>` : '<p style="color:var(--text-secondary);font-size:12px;">No request body available</p>';
     html += `<div class="request-item">
       <div class="request-header" onclick="toggleRequest(${req.timestamp})">
         <span class="request-expand ${arrowOpen}">&#9654;</span>
@@ -648,7 +652,7 @@ function renderFilteredRequests() {
         <span class="request-latency">${req.latency_ms.toFixed(0)}ms</span>
       </div>
       ${preview}
-      <div class="request-body ${bodyOpen}">${fullJson}</div>
+      <div class="request-body ${bodyOpen}">${metricsHtml}${fullJson}</div>
     </div>`;
   }
   el.innerHTML = html;
@@ -681,8 +685,14 @@ document.getElementById('darkModeToggle').addEventListener('click', () => {
 });
 
 // Refresh interval
+const savedRefresh = localStorage.getItem('proxycache_refresh_interval');
+if (savedRefresh) {
+  document.getElementById('refreshInterval').value = savedRefresh;
+  startAutoRefresh(parseInt(savedRefresh) * 1000);
+}
 document.getElementById('refreshInterval').addEventListener('change', (e) => {
   const interval = parseInt(e.target.value) * 1000;
+  localStorage.setItem('proxycache_refresh_interval', e.target.value);
   startAutoRefresh(interval);
 });
 
