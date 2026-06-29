@@ -24,7 +24,7 @@ from typing import List, Tuple, Dict, Optional
 
 import httpx
 
-from config import META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, \
+from config import META_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, \
     KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK, SLOT_TIMEOUT, DEFAULT_N_CTX, \
     should_save_cache, CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, CACHE_HIT_WAIT_MAX_PENDING_REQS, \
     CACHE_HIT_WAIT_EMA_ALPHA, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT
@@ -86,27 +86,19 @@ class SlotManager:
             log_extra: Extra info for log message
         """
         if backend_id is not None:
-            agent = backend_manager.get_agent(backend_id)
-            if agent:
-                ok = await agent.delete(key)
-                if ok:
-                    log.info("%s: %s %s", log_msg, key[:16], log_extra)
-                else:
-                    log.warning("%s_agent_fail: %s", log_msg, key[:16])
-                return
-        cache_path = CACHE_DIR + "/" + key if CACHE_DIR else None
-        if cache_path and os.path.exists(cache_path):
-            try:
-                os.remove(cache_path)
+            ok = await backend_manager.cache_delete(backend_id, key)
+            if ok:
                 log.info("%s: %s %s", log_msg, key[:16], log_extra)
-            except OSError:
-                pass
+            else:
+                log.warning("%s_agent_fail: %s", log_msg, key[:16])
+        else:
+            log.warning("%s: no backend_id, skipping cache file deletion", log_msg)
 
     def _evict_meta_file(self, key: str):
         """Delete the meta file for a cache entry."""
         kv_meta.delete_meta_file(key)
 
-    async def init_from_disk(self, cache_dir: str):
+    async def init_from_disk(self):
         """Populate ring buffer from existing cache files on disk.
         Also performs a cleanup pass to remove expired entries.
         """
@@ -132,10 +124,10 @@ class SlotManager:
                 if any(entry[0] == key for entry in ring):
                     continue
                 try:
-                    cache_size = await kv_meta.get_cache_size(key, backend_dir, cache_dir)
+                    cache_size = await kv_meta.get_cache_size(key, backend_dir)
                     if not cache_size:
                         continue
-                    last_used = kv_meta.get_last_used_time(key, backend_dir, cache_dir)
+                    last_used = kv_meta.get_last_used_time(key, backend_dir)
                     ring.append((key, cache_size, last_used))
                     self._total_bytes[backend_dir] = self._total_bytes.get(backend_dir, 0) + cache_size
                     total_loaded += 1

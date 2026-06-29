@@ -17,7 +17,7 @@ import logging
 from typing import List, Dict, Optional, Tuple
 
 import hashing as hs
-from config import META_DIR, CACHE_DIR
+from config import META_DIR
 from backend_manager import backend_manager
 
 log = logging.getLogger(__name__)
@@ -211,7 +211,7 @@ class KVMetaManager:
 
         return (best_key, best_ratio) if best_key else None
 
-    async def get_cache_size(self, key: str, backend_id: str, cache_dir: str = CACHE_DIR) -> int:
+    async def get_cache_size(self, key: str, backend_id: str) -> int:
         """Return cache size in bytes for a key, or 0 if not found."""
         meta = self.read_meta(key, backend_id)
         if meta:
@@ -219,29 +219,10 @@ class KVMetaManager:
             if size:
                 return size
 
-        # Fallback: query cache-agent for remote size
-        try:
-            agent = backend_manager.get_agent(backend_id)
-        except KeyError:
-            agent = None
-        if agent:
-            try:
-                from cache_agent_client import get_file_size
-                result = await get_file_size(agent.base_url, key)
-                if result and result.get("exists", False):
-                    return result.get("size", 0)
-            except Exception as e:
-                log.warn("Cache-agent size lookup failed for '%s' on '%s': %s", key, backend_id, e)
+        # Fallback: query backend's cache store (agent or local filesystem)
+        return await backend_manager.cache_get_size(backend_id, key)
 
-        # Fallback: local filesystem stat
-        if cache_dir and os.path.isdir(cache_dir):
-            cache_path = os.path.join(cache_dir, key)
-            if os.path.exists(cache_path):
-                return os.stat(cache_path).st_size
-
-        return 0
-
-    def get_last_used_time(self, key: str, backend_id: str, cache_dir: str = CACHE_DIR) -> float:
+    def get_last_used_time(self, key: str, backend_id: str) -> float:
         """Return last-used timestamp for a cache file."""
         path = self.meta_file_path(key, backend_id)
         if os.path.exists(path):
@@ -254,20 +235,14 @@ class KVMetaManager:
             except (json.JSONDecodeError, Exception):
                 pass
 
-        if cache_dir:
-            cache_path = os.path.join(cache_dir, key)
-            if os.path.exists(cache_path):
-                return os.path.getmtime(cache_path)
-
-        return time.time()
+        # Fallback: use local filesystem mtime (agent doesn't provide mtime)
+        return backend_manager.cache_get_mtime(backend_id, key)
 
     async def reconcile(
         self,
-        cache_dir: str = CACHE_DIR,
         backend_keys: Optional[List[str]] = None,
-        backend_agents: Optional[Dict[str, str]] = None,
     ) -> int:
-        """Reconcile meta files with cache directory. Returns count deleted."""
+        """Reconcile meta files with cache store. Returns count deleted."""
         deleted = 0
         deleted_backends = set()
 
@@ -276,10 +251,6 @@ class KVMetaManager:
                 backend_dir = self.meta_dir(backend_key)
                 if not os.path.isdir(backend_dir):
                     continue
-
-                agent_url = None
-                if backend_agents and backend_key in backend_agents:
-                    agent_url = backend_agents[backend_key]
 
                 meta_files = sorted(glob.glob(os.path.join(backend_dir, "*" + hs.META_SUFFIX)))
 
@@ -304,45 +275,9 @@ class KVMetaManager:
 
                     valid_entries.append((meta_path, basename, cachename))
 
-                # Second pass: check cache existence
-                if agent_url and valid_entries:
-                    # Batch query all keys in one API call
-                    try:
-                        from cache_agent_client import CacheAgentClient
-                        agent_client = CacheAgentClient(agent_url)
-                        try:
-                            cachenames = [e[2] for e in valid_entries]
-                            results = await agent_client.batch_get_file_sizes(cachenames)
-                        finally:
-                            await agent_client.close()
-                    except Exception as e:
-                        log.warning("Batch cache size check failed for backend '%s' (%d keys): %s — falling back to individual checks",
-                                    backend_key, len(valid_entries), e)
-                        results = None
-                else:
-                    results = None
-
+                # Second pass: check cache existence via backend_manager
                 for meta_path, basename, cachename in valid_entries:
-                    cache_exists = False
-                    if results is not None and cachename in results:
-                        cache_exists = results[cachename].get("exists", False)
-                    elif results is not None:
-                        # Batch returned but key not in results — treat as not found
-                        cache_exists = False
-                    elif agent_url and results is None:
-                        # Fallback: individual check on batch failure
-                        try:
-                            from cache_agent_client import get_file_size
-                            result = await get_file_size(agent_url, cachename)
-                            if result and result.get("exists", False):
-                                cache_exists = True
-                        except Exception as e:
-                            log.warning("Failed to check cache size via agent on backend '%s' for key %s: %s",
-                                        backend_key, cachename, e)
-                    elif cache_dir and os.path.isdir(cache_dir):
-                        cache_path = os.path.join(cache_dir, cachename)
-                        if os.path.exists(cache_path):
-                            cache_exists = True
+                    cache_exists = await backend_manager.cache_exists(backend_key, cachename)
 
                     if not cache_exists:
                         log.info("Removed orphan meta file (no matching cache): %s", basename)
@@ -378,20 +313,19 @@ class KVMetaManager:
                         pass
                     continue
 
-                if cache_dir and os.path.isdir(cache_dir):
-                    cache_path = os.path.join(cache_dir, cachename)
-                    if not os.path.exists(cache_path):
-                        log.info("Removed orphan meta file (no matching cache): %s", basename)
-                        try:
-                            os.remove(meta_path)
-                            deleted += 1
-                        except OSError:
-                            pass
+                # Without backend_keys, we can't determine the backend for cache existence checks
+                # Skip cache existence check for standalone meta files
+                log.info("Removed orphan meta file (no backend context): %s", basename)
+                try:
+                    os.remove(meta_path)
+                    deleted += 1
+                except OSError:
+                    pass
 
         log.info("Finished reconciling meta files with llama cache directory")
         return deleted
 
-    async def total_meta_size(self, backend_id: str, cache_dir: str = CACHE_DIR) -> int:
+    async def total_meta_size(self, backend_id: str) -> int:
         """Return total size of all cache files for a backend."""
         total = 0
         for key in self.list_keys(backend_id):

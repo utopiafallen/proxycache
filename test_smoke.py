@@ -67,7 +67,7 @@ def test_backend_manager_model_registration():
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}, {"id": 1}])
     mock_client.discover_models = AsyncMock(return_value=[("ModelA", 4096)])
-    bm._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    bm._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
     
     async def _run():
         await bm.discover_models()
@@ -87,8 +87,9 @@ def test_backend_manager_model_registration():
 # ── hashing tests (unchanged) ────────────────────────────────────────
 
 def test_reconcile_meta_removes_orphans():
-    """reconcile_meta should delete meta files with no matching cache and skip valid ones."""
+    """reconcile should delete meta files with no matching cache and skip valid ones."""
     from kv_meta_manager import KVMetaManager
+    from hashing import sanitize_backend_dir
     mgr = KVMetaManager()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -101,25 +102,35 @@ def test_reconcile_meta_removes_orphans():
         valid_key = "valid_cache_key"
         with open(os.path.join(cache_dir, valid_key), "w") as f:
             f.write("cache data")
-        with open(os.path.join(meta_dir, f"{valid_key}.meta.json"), "w") as f:
+        backend_key = sanitize_backend_dir("10.0.0.1:8000")
+        backend_meta_dir = os.path.join(meta_dir, backend_key)
+        os.makedirs(backend_meta_dir)
+        with open(os.path.join(backend_meta_dir, f"{valid_key}.meta.json"), "w") as f:
             json.dump({"key": valid_key, "model_id": "test", "wpb": 100, "blocks": []}, f)
 
         # Orphaned entry: meta exists but cache does not
         orphan_key = "orphan_cache_key"
-        with open(os.path.join(meta_dir, f"{orphan_key}.meta.json"), "w") as f:
+        with open(os.path.join(backend_meta_dir, f"{orphan_key}.meta.json"), "w") as f:
             json.dump({"key": orphan_key, "model_id": "test", "wpb": 100, "blocks": []}, f)
 
         # Corrupted meta file
         corrupted_key = "corrupted_cache_key"
-        with open(os.path.join(meta_dir, f"{corrupted_key}.meta.json"), "w") as f:
+        with open(os.path.join(backend_meta_dir, f"{corrupted_key}.meta.json"), "w") as f:
             f.write("not json {{{")
 
-        deleted = asyncio.run(reconcile_meta(meta_dir, cache_dir))
+        # Set up backend_manager so reconcile can find the backend
+        from backend_manager import backend_manager
+        backend_manager._backends.clear()
+        backend_manager._backends[backend_key] = type('obj', (object,), {
+            'client': AsyncMock(), 'agent_client': None, 'cache_dir': None, 'cache_dir': cache_dir
+        })()
+
+        deleted = asyncio.run(mgr.reconcile([backend_key]))
 
         assert deleted == 2, f"Expected 2 deleted (orphan + corrupted), got {deleted}"
-        assert os.path.exists(os.path.join(meta_dir, f"{valid_key}.meta.json")), "Valid meta was deleted"
-        assert not os.path.exists(os.path.join(meta_dir, f"{orphan_key}.meta.json")), "Orphan meta was not deleted"
-        assert not os.path.exists(os.path.join(meta_dir, f"{corrupted_key}.meta.json")), "Corrupted meta was not deleted"
+        assert os.path.exists(os.path.join(backend_meta_dir, f"{valid_key}.meta.json")), "Valid meta was deleted"
+        assert not os.path.exists(os.path.join(backend_meta_dir, f"{orphan_key}.meta.json")), "Orphan meta was not deleted"
+        assert not os.path.exists(os.path.join(backend_meta_dir, f"{corrupted_key}.meta.json")), "Corrupted meta was not deleted"
         print("PASS: test_reconcile_meta_removes_orphans")
 
 
@@ -659,7 +670,7 @@ def test_save_after_updates_slot_kv_state():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     blocks = ["blk_a", "blk_b", "blk_c"]
 
@@ -691,7 +702,7 @@ def test_save_after_no_blocks_no_state_update():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         ok, size = await sm.save_after(
@@ -770,7 +781,7 @@ def test_adaptive_cooldown_on_failure():
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(side_effect=Exception("connection refused"))
     mock_client.discover_models = AsyncMock(return_value=[("ModelA", 4096)])
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         # First discover models to populate _discovered_models
@@ -813,7 +824,7 @@ def test_lock_released_on_restore_failure():
     mock_client.restore_slot = AsyncMock(side_effect=Exception("connection refused"))
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.discover_models = AsyncMock(return_value=[("ModelA", 4096)])
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         try:
@@ -869,7 +880,7 @@ def test_non_streaming_cancelled_error_releases_slot():
     mock_client = AsyncMock()
     mock_client.chat_completions = AsyncMock(side_effect=asyncio.CancelledError())
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         g, _ = await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")])
@@ -905,7 +916,7 @@ def test_streaming_save_after_skipped_on_cancel():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         mock_resp = AsyncMock()
@@ -946,7 +957,7 @@ def test_streaming_save_after_exception():
             raise ConnectionError("connection refused")
 
         mock_client.save_slot = failing_save
-        backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+        backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
         mock_resp = AsyncMock()
         mock_resp.aiter_raw = MagicMock(return_value=iter([]))
@@ -980,7 +991,7 @@ def test_streaming_gen_sets_cancelled_flag():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(False, 0))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         # Iterator that hangs — reader will block waiting for data
@@ -1044,7 +1055,7 @@ def test_streaming_release_not_in_outer_finally():
     mock_client = AsyncMock()
     mock_client.chat_completions = AsyncMock(return_value=AsyncMock(status_code=200))
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         g, _ = await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")])
@@ -1082,7 +1093,7 @@ def test_reader_polls_is_disconnected_on_timeout():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(False, 0))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         # Iterator that never yields — forces timeout path
@@ -1138,7 +1149,7 @@ def test_streaming_completion_releases_slot():
 
     mock_client = AsyncMock(spec=LlamaClient)
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     async def _run():
         # Iterator yields chunks then finishes (normal completion)
@@ -1312,6 +1323,173 @@ def test_discover_models_both_endpoints_fail():
     print("PASS: test_discover_models_both_endpoints_fail")
 
 
+# ── Per-backend cache_dir tests ───────────────────────────────────────
+
+def test_backend_cache_dir_per_backend():
+    """BackendManager should read cache_dir from backend config."""
+    from backend_manager import BackendManager
+    from hashing import sanitize_backend_dir
+
+    bm = BackendManager([
+        {"url": "http://10.0.0.1:8000", "cache_dir": "/mnt/cache/b1"},
+        {"url": "http://10.0.0.2:8000", "agent_port": 8082},
+    ])
+    be1 = sanitize_backend_dir("10.0.0.1:8000")
+    be2 = sanitize_backend_dir("10.0.0.2:8000")
+    assert bm.keys() == [be1, be2]
+    assert bm.get_cache_dir(be1) == "/mnt/cache/b1"
+    assert bm.get_cache_dir(be2) is None
+    assert bm.has_cache_config(be1) is True
+    assert bm.has_cache_config(be2) is True
+    print("PASS: test_backend_cache_dir_per_backend")
+
+
+def test_backend_cache_dir_mutual_exclusivity():
+    """BackendManager should raise ValueError if both cache_dir and agent_port are set, or if neither is set."""
+    from backend_manager import BackendManager
+
+    try:
+        BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": "/mnt/cache", "agent_port": 8082}])
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "cache_dir" in str(e).lower() or "agent_port" in str(e).lower()
+
+    # Also: must have at least one of cache_dir or agent_port
+    try:
+        BackendManager([{"url": "http://10.0.0.1:8000"}])
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "cache_dir" in str(e).lower() or "agent_port" in str(e).lower()
+
+    print("PASS: test_backend_cache_dir_mutual_exclusivity")
+
+
+def test_backend_cache_delete_via_agent():
+    """cache_delete should use agent when available."""
+    from backend_manager import BackendManager
+    from hashing import sanitize_backend_dir
+
+    bm = BackendManager([{"url": "http://10.0.0.1:8000", "agent_port": 8082}])
+    be = sanitize_backend_dir("10.0.0.1:8000")
+    agent = bm.get_agent(be)
+
+    async def run():
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        with patch.object(agent._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+            result = await bm.cache_delete(be, "test_key")
+            assert result is True, f"Expected True, got {result}"
+
+    asyncio.run(run())
+    print("PASS: test_backend_cache_delete_via_agent")
+
+
+def test_backend_cache_delete_via_local():
+    """cache_delete should use local filesystem when no agent."""
+    from backend_manager import BackendManager
+    from hashing import sanitize_backend_dir
+    import tempfile
+    import os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache_file = os.path.join(tmpdir, "test_key")
+        with open(cache_file, "w") as f:
+            f.write("data")
+
+        bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": tmpdir}])
+        be = sanitize_backend_dir("10.0.0.1:8000")
+
+        result = asyncio.run(bm.cache_delete(be, "test_key"))
+        assert result is True, f"Expected True, got {result}"
+        assert not os.path.exists(cache_file), "Cache file should be deleted"
+
+    print("PASS: test_backend_cache_delete_via_local")
+
+
+def test_backend_cache_get_size_via_local():
+    """cache_get_size should use local filesystem stat when no agent."""
+    from backend_manager import BackendManager
+    from hashing import sanitize_backend_dir
+    import tempfile
+    import os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache_file = os.path.join(tmpdir, "test_key")
+        with open(cache_file, "w") as f:
+            f.write("x" * 1234)
+
+        bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": tmpdir}])
+        be = sanitize_backend_dir("10.0.0.1:8000")
+
+        result = asyncio.run(bm.cache_get_size(be, "test_key"))
+        assert result == 1234, f"Expected 1234, got {result}"
+
+    print("PASS: test_backend_cache_get_size_via_local")
+
+
+def test_backend_cache_get_size_not_found():
+    """cache_get_size should return 0 for non-existent file."""
+    from backend_manager import BackendManager
+    from hashing import sanitize_backend_dir
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": tmpdir}])
+        be = sanitize_backend_dir("10.0.0.1:8000")
+
+        result = asyncio.run(bm.cache_get_size(be, "nonexistent"))
+        assert result == 0, f"Expected 0, got {result}"
+
+    print("PASS: test_backend_cache_get_size_not_found")
+
+
+def test_backend_cache_exists_via_local():
+    """cache_exists should use local filesystem check when no agent."""
+    from backend_manager import BackendManager
+    from hashing import sanitize_backend_dir
+    import tempfile
+    import os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache_file = os.path.join(tmpdir, "test_key")
+        with open(cache_file, "w") as f:
+            f.write("data")
+
+        bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": tmpdir}])
+        be = sanitize_backend_dir("10.0.0.1:8000")
+
+        async def run():
+            assert await bm.cache_exists(be, "test_key") is True
+            assert await bm.cache_exists(be, "nonexistent") is False
+
+        asyncio.run(run())
+
+    print("PASS: test_backend_cache_exists_via_local")
+
+
+def test_backend_cache_get_mtime_via_local():
+    """cache_get_mtime should use local filesystem mtime when no agent."""
+    from backend_manager import BackendManager
+    from hashing import sanitize_backend_dir
+    import tempfile
+    import os
+    import time
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache_file = os.path.join(tmpdir, "test_key")
+        with open(cache_file, "w") as f:
+            f.write("data")
+        mtime = os.path.getmtime(cache_file)
+
+        bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": tmpdir}])
+        be = sanitize_backend_dir("10.0.0.1:8000")
+
+        result = bm.cache_get_mtime(be, "test_key")
+        assert abs(result - mtime) < 1.0, f"Expected ~{mtime}, got {result}"
+
+    print("PASS: test_backend_cache_get_mtime_via_local")
+
+
 # ── Model resolution tests ─────────────────────────────────────────────
 
 def test_resolve_exact_match():
@@ -1320,8 +1498,8 @@ def test_resolve_exact_match():
 
     backend_manager._backends.clear()
     backend_manager._discovered_models.clear()
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': AsyncMock(), 'agent_client': None})()
-    backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': AsyncMock(), 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': AsyncMock(), 'agent_client': None, 'cache_dir': None})()
+    backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': AsyncMock(), 'agent_client': None, 'cache_dir': None})()
 
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
         name="qwen3.6-32b", n_ctx=32768, backends=["10.0.0.1:8000", "10.0.0.1:9000"],
@@ -1549,9 +1727,7 @@ def test_no_cache_fallback_lru():
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
         old_meta_dir = config.META_DIR
-        old_cache_dir = config.CACHE_DIR
         config.META_DIR = tmpdir
-        config.CACHE_DIR = ""
 
         try:
             backend_manager._backends.clear()
@@ -1561,7 +1737,7 @@ def test_no_cache_fallback_lru():
             mock_client = AsyncMock()
             mock_client.discover_models = AsyncMock(return_value=[("model-a", 32768)])
             mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}, {"id": 1}])
-            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None, 'cache_dir': None})()
 
             sm = SlotManager()
 
@@ -1576,7 +1752,6 @@ def test_no_cache_fallback_lru():
             assert result[2] == 0, f"Expected slot 0, got {result[2]}"
         finally:
             config.META_DIR = old_meta_dir
-            config.CACHE_DIR = old_cache_dir
 
     print("PASS: test_no_cache_fallback_lru")
 
@@ -1642,7 +1817,7 @@ def test_prompt_too_long_rejected():
 
     mock_client = AsyncMock()
     mock_client.tokenize = AsyncMock(return_value=[0] * 4097)
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     # Set up app state (normally done in startup event)
     from slot_manager import SlotManager
@@ -1736,7 +1911,7 @@ def test_chat_substring_model_resolution():
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.tokenize = AsyncMock(return_value=[123, 456])
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     # Set up app state (normally done in startup event)
     from slot_manager import SlotManager
@@ -1801,7 +1976,7 @@ def test_chat_any_model_routing():
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.tokenize = AsyncMock(return_value=[123, 456])
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     # Set up app state (normally done in startup event)
     from slot_manager import SlotManager
@@ -1838,9 +2013,7 @@ def test_chat_any_with_cache_hit():
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
         old_meta_dir = config.META_DIR
-        old_cache_dir = config.CACHE_DIR
         config.META_DIR = tmpdir
-        config.CACHE_DIR = ""
 
         try:
             backend_manager._backends.clear()
@@ -1875,8 +2048,8 @@ def test_chat_any_with_cache_hit():
             mock_client_a.save_slot = AsyncMock(return_value=(True, 1024))
             mock_client_b = AsyncMock(spec=LlamaClient)
             mock_client_b.tokenize = AsyncMock(return_value=token_ids)
-            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client_a, 'agent_client': None})()
-            backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': mock_client_b, 'agent_client': None})()
+            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client_a, 'agent_client': None, 'cache_dir': None, 'cache_dir': None})()
+            backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': mock_client_b, 'agent_client': None, 'cache_dir': None, 'cache_dir': None})()
 
             # Set up app state (normally done in startup event)
             from slot_manager import SlotManager
@@ -1899,7 +2072,6 @@ def test_chat_any_with_cache_hit():
             assert body["model"] == "model-a", f"Expected model-a (best cache), got {body['model']}"
         finally:
             config.META_DIR = old_meta_dir
-            config.CACHE_DIR = old_cache_dir
 
     print("PASS: test_chat_any_with_cache_hit")
 
@@ -1968,7 +2140,7 @@ def test_chat_save_skipped_when_ratio_above_threshold():
     mock_client.apply_chat_template = AsyncMock(return_value="user: hello world\nassistant:")
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
     mock_client.get_slot_status = AsyncMock(return_value={"cached_tokens": 3})
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
         name="test-model", backends=["10.0.0.1:8000"], n_ctx=32768,
@@ -2021,7 +2193,7 @@ def test_chat_save_performed_when_ratio_below_threshold():
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
     mock_client.tokenize = AsyncMock(return_value=list(range(600)))
     mock_client.apply_chat_template = AsyncMock(return_value="user: big prompt for testing\nassistant:")
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
         name="test-model", backends=["10.0.0.1:8000"], n_ctx=32768,
@@ -2421,6 +2593,17 @@ if __name__ == "__main__":
 
     test_chat_save_skipped_when_ratio_above_threshold()
     test_chat_save_performed_when_ratio_below_threshold()
+
+    # ── Per-backend cache_dir tests ──────────────────────────────────────
+
+    test_backend_cache_dir_per_backend()
+    test_backend_cache_dir_mutual_exclusivity()
+    test_backend_cache_delete_via_agent()
+    test_backend_cache_delete_via_local()
+    test_backend_cache_get_size_via_local()
+    test_backend_cache_get_size_not_found()
+    test_backend_cache_exists_via_local()
+    test_backend_cache_get_mtime_via_local()
 
     # ── Cache hit wait queue tests ─────────────────────────────────────
 

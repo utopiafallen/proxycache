@@ -37,7 +37,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from config import (BACKENDS, WORDS_PER_BLOCK,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
-                    CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
+                    CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
                     SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD,
                     should_save_cache)
 
@@ -60,7 +60,7 @@ app = FastAPI(title="Simple KV Proxy")
 @app.on_event("startup")
 async def startup():
     sm = SlotManager()
-    await sm.init_from_disk(CACHE_DIR)
+    await sm.init_from_disk()
 
     app.state.sm = sm
     app.state.executor = ThreadPoolExecutor(max_workers=2)
@@ -68,17 +68,15 @@ async def startup():
 
     # Reconcile meta files on startup (remove corrupted/orphaned entries)
     backend_keys = list(backend_manager._backends.keys())
-    backend_agents = {k: v.agent_client.base_url if v.agent_client else None for k, v in backend_manager._backends.items()}
-    backend_agents = {k: v for k, v in backend_agents.items() if v is not None}
-    reconciled = await kv_meta.reconcile(CACHE_DIR, backend_keys, backend_agents)
+    reconciled = await kv_meta.reconcile(backend_keys)
     if reconciled > 0:
         log.info("Cleaned up %d orphaned/corrupted meta files at startup", reconciled)
 
     # Log startup sanity summary
-    if CACHE_DIR and os.path.isdir(CACHE_DIR):
-        cache_files = len(os.listdir(CACHE_DIR))
-        meta_count = sum(len(kv_meta.list_keys(k)) for k in backend_keys)
-        log.info("After startup reconcile: %d meta files, %d cache files on disk", meta_count, cache_files)
+    meta_count = sum(len(kv_meta.list_keys(k)) for k in backend_keys)
+    cache_dirs = [k for k in backend_keys if backend_manager.get_cache_dir(k)]
+    cache_files = sum(1 for k in cache_dirs for f in os.listdir(backend_manager.get_cache_dir(k)) if os.path.isfile(os.path.join(backend_manager.get_cache_dir(k), f)))
+    log.info("After startup reconcile: %d meta files, %d cache files on disk", meta_count, cache_files)
 
     # Start liveness checker
     await backend_manager.start_liveness_checker()

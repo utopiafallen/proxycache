@@ -39,6 +39,7 @@ class DiscoveredModel:
 class BackendInfo:
     client: LlamaClient
     agent_client: CacheAgentClient | None
+    cache_dir: str | None
 
 
 class BackendManager:
@@ -65,10 +66,21 @@ class BackendManager:
             key = sanitize_backend_dir(raw_key)  # "10-0-0-1-8000"
             client = LlamaClient(url)
             agent_client = None
+            cache_dir = be.get("cache_dir")
+            if "agent_port" in be and cache_dir:
+                raise ValueError(
+                    f"Backend {url}: cache_dir and agent_port are mutually exclusive. "
+                    "Use cache_dir for local cache management or agent_port for remote cache-agent."
+                )
+            if "agent_port" not in be and not cache_dir:
+                raise ValueError(
+                    f"Backend {url}: must specify either cache_dir or agent_port. "
+                    "cache_dir for local filesystem cache management, agent_port for remote cache-agent."
+                )
             if "agent_port" in be:
                 host = raw_key.rsplit(":", 1)[0]
                 agent_client = CacheAgentClient(f"http://{host}:{be['agent_port']}")
-            self._backends[key] = BackendInfo(client=client, agent_client=agent_client)
+            self._backends[key] = BackendInfo(client=client, agent_client=agent_client, cache_dir=cache_dir)
             if self._first_key is None:
                 self._first_key = key
 
@@ -88,6 +100,80 @@ class BackendManager:
         if be is None:
             raise KeyError(f"Unknown backend key: {key}")
         return be.agent_client
+
+    def get_cache_dir(self, key: str) -> str | None:
+        be = self._backends.get(key)
+        if be is None:
+            raise KeyError(f"Unknown backend key: {key}")
+        return be.cache_dir
+
+    def has_cache_config(self, key: str) -> bool:
+        be = self._backends.get(key)
+        if be is None:
+            raise KeyError(f"Unknown backend key: {key}")
+        return be.agent_client is not None or be.cache_dir is not None
+
+    async def cache_delete(self, backend_id: str, key: str) -> bool:
+        """Delete a cache file via agent or local filesystem."""
+        be = self._backends.get(backend_id)
+        if be is None:
+            return False
+        if be.agent_client:
+            return await be.agent_client.delete(key)
+        if be.cache_dir:
+            import os
+            cache_path = os.path.join(be.cache_dir, key)
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+                return True
+        return False
+
+    async def cache_get_size(self, backend_id: str, key: str) -> int:
+        """Get cache file size via agent or local filesystem."""
+        be = self._backends.get(backend_id)
+        if be is None:
+            return 0
+        if be.agent_client:
+            from cache_agent_client import get_file_size
+            result = await get_file_size(be.agent_client.base_url, key)
+            if result and result.get("exists", False):
+                return result.get("size", 0)
+            return 0
+        if be.cache_dir:
+            import os
+            cache_path = os.path.join(be.cache_dir, key)
+            if os.path.exists(cache_path):
+                return os.stat(cache_path).st_size
+        return 0
+
+    def cache_get_mtime(self, backend_id: str, key: str) -> float:
+        """Get cache file last-modified time via local filesystem.
+        Agent does not provide mtime, so this only works with cache_dir."""
+        be = self._backends.get(backend_id)
+        if be is None:
+            return time.time()
+        if be.cache_dir:
+            import os
+            cache_path = os.path.join(be.cache_dir, key)
+            if os.path.exists(cache_path):
+                return os.path.getmtime(cache_path)
+        return time.time()
+
+    async def cache_exists(self, backend_id: str, key: str) -> bool:
+        """Check if a cache file exists via agent or local filesystem."""
+        be = self._backends.get(backend_id)
+        if be is None:
+            return False
+        if be.agent_client:
+            result = await be.agent_client.get_file_size(key)
+            if result is not None:
+                return result.get("exists", False)
+            return False
+        if be.cache_dir:
+            import os
+            cache_path = os.path.join(be.cache_dir, key)
+            return os.path.exists(cache_path)
+        return False
 
     def keys(self) -> list[str]:
         return list(self._backends.keys())

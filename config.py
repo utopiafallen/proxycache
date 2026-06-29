@@ -19,7 +19,7 @@ except Exception:
     BACKENDS = []
 
 if not BACKENDS:
-    BACKENDS = [{"url": "http://127.0.0.1:8000"}]
+    BACKENDS = [{"url": "http://127.0.0.1:8000", "cache_dir": "/tmp/llama-cache"}]
 
 # Words per block for LCP
 WORDS_PER_BLOCK = int(os.getenv("WORDS_PER_BLOCK", "100"))
@@ -44,7 +44,6 @@ BACKEND_MODE = os.getenv("BACKEND_MODE", "llama-cpp")
 PORT = int(os.getenv("PORT", "8081"))
 
 # Cache cleanup settings
-CACHE_DIR = os.getenv("CACHE_DIR", "")  # llama.cpp --slot-save-path directory
 CACHE_MAX_AGE_HOURS = int(os.getenv("CACHE_MAX_AGE_HOURS", "168"))  # 7 days default
 CACHE_MAX_SIZE_GB = float(os.getenv("CACHE_MAX_SIZE_GB", "25"))
 

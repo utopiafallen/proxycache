@@ -43,10 +43,9 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8081` | Proxy listen port |
-| `BACKENDS` | `[]` | JSON array `[{"url":"..."}]` of backend URLs. Empty defaults to `http://127.0.0.1:8000`. |
+| `BACKENDS` | `[]` | JSON array of backend configs (see below). Empty defaults to `[{"url":"http://127.0.0.1:8000"}]`. |
 | `BACKEND_MODE` | `llama-cpp` | `llama-cpp` or `llama-swap` (changes `/slots` URL paths) |
 | `META_DIR` | `./kv_meta` | Local metadata directory (organized by backend subdirectories) |
-| `CACHE_DIR` | — | `llama.cpp` `--slot-save-path` directory |
 | `CACHE_MAX_SIZE_GB` | `25` | Max total cache size per backend in GB |
 | `CACHE_MAX_AGE_HOURS` | `168` | Delete cache files older than this (0=disabled) |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
@@ -90,11 +89,23 @@ models:
     cmd: "llama-server -m model.gguf --slot-save-path /path/to/kv-cache ..."
 ```
 
-## Cache Agent
+## Cache Management
 
-When backends are on remote hosts, proxycache uses a lightweight Go HTTP server alongside each `llama.cpp` instance to delete cache files for eviction.
+Each backend can be configured with either `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). These options are mutually exclusive.
 
-### Building
+### Local cache management
+
+For backends on the same host, set `cache_dir` to the path matching llama.cpp's `--slot-save-path`:
+
+```bash
+BACKENDS='[{"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache"}]'
+```
+
+### Cache Agent
+
+For remote backends, use a lightweight Go HTTP server alongside each `llama.cpp` instance to manage cache files.
+
+#### Building
 
 ```bash
 ./build-cache-agent.sh
@@ -102,13 +113,13 @@ When backends are on remote hosts, proxycache uses a lightweight Go HTTP server 
 
 Requires Go 1.21+. Produces a `cache-agent.exe` binary in the project root.
 
-### Running
+#### Running
 
 ```bash
 ./cache-agent.exe -cache-dir /var/kvcache -port 8082
 ```
 
-### Configuration
+#### Configuration
 
 Add `agent_port` to the backend config in `BACKENDS`:
 
@@ -116,7 +127,21 @@ Add `agent_port` to the backend config in `BACKENDS`:
 BACKENDS='[{"url":"http://10.0.0.1:8000","agent_port":8082}]'
 ```
 
-When `agent_port` is set, eviction uses the agent's `POST /cache/delete?key=<basename>` endpoint. When unset, proxycache falls back to local filesystem deletion.
+When `agent_port` is set, cache operations use the agent's HTTP endpoints. When `cache_dir` is set, cache operations use the local filesystem directly. A backend without either has no cache management.
+
+### Mixed configuration
+
+You can mix both styles across backends:
+
+```bash
+BACKENDS='[
+  {"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache/b1"},
+  {"url":"http://10.0.0.2:8000","agent_port":8082},
+  {"url":"http://10.0.0.3:8000"}
+]'
+```
+
+The first backend uses local filesystem, the second uses the cache agent, and the third has no cache management.
 
 ## Quick Start
 
