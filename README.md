@@ -63,6 +63,8 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `CACHE_HIT_WAIT_MAX_PENDING_REQS` | `3` | Max concurrent waiters per backend |
 | `DEFAULT_N_CTX` | `16384` | Fallback context length when backend doesn't report `n_ctx` |
 | `LOG_LEVEL` | `INFO` | Python logging level |
+| `METRICS_RETENTION` | `100` | Number of recent requests to keep in memory for metrics |
+| `DASHBOARD_ENABLED` | `true` | Enable the monitoring dashboard (`false`, `no`, `0` to disable) |
 
 ## Endpoints
 
@@ -70,6 +72,41 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | Main chat endpoint (proxied to backend) |
 | `GET` | `/v1/models` | Returns discovered models with `n_ctx`, plus `"any"` option |
+| `GET` | `/metrics/summary` | Full metrics summary (backends, slots, cache, performance, requests) |
+| `GET` | `/metrics/health` | Backend health: up/down, model info, slot counts |
+| `GET` | `/metrics/slots` | Per-slot state: in_use, last_used, KV block count |
+| `GET` | `/metrics/cache` | Per-backend cache utilization: ring size, bytes, utilization % |
+| `GET` | `/metrics/requests` | Recent requests with full JSON (`?limit=N&offset=M`) |
+| `GET` | `/metrics/performance` | Cache hit/mispredict/save rates, latency percentiles (`?model=X&backend=Y`) |
+| `GET` | `/dashboard` | Monitoring dashboard HTML page |
+
+## Monitoring
+
+proxycache includes an in-memory metrics collector and a single-page HTML dashboard (zero external dependencies) for real-time monitoring.
+
+### Metrics
+
+The metrics collector tracks the last N requests (default 100, configurable via `METRICS_RETENTION`) in a ring buffer. Each request record includes:
+
+- **Cache performance**: hit rate, mispredict rate (cache hit attempted but restore was partial/useless), utility rate, save rate, restore success rate
+- **Latency**: avg, p50, p95, p99 percentiles
+- **Per-model and per-backend breakdowns**
+
+Metrics are recorded at actual completion points — non-streaming requests are recorded in the `chat()` handler after save/restore completes; streaming requests are recorded in `StreamReader._cleanup()` after the full response lifecycle.
+
+### Dashboard
+
+The dashboard at `/dashboard` provides a real-time view of:
+
+- **Backend Health** — up/down status, discovered models, slot counts, last discovery time
+- **Cache Performance** — hit rate, mispredict rate, utility rate, save rate, restore success rate, latency percentiles
+- **Cache Utilization** — per-backend cache ring size, total bytes, utilization percentage, cache directory
+- **Slot Status** — per-model slot grid showing in-use (green), free (gray), and restoring (blue) states
+- **Recent Requests** — last N requests with expandable full JSON payloads, prompt previews, and filters by type (hit/miss/recompute) and backend
+
+The dashboard auto-refreshes (configurable 2/5/10/30s), supports dark mode, and has collapsible panels. It is served as a single HTML file with no external dependencies.
+
+To disable the dashboard, set `DASHBOARD_ENABLED=false`.
 
 ## Multi-backend
 
@@ -162,32 +199,3 @@ uv run python proxycache.py
 ```
 
 Point clients at the proxy's `/v1/chat/completions` endpoint.
-
-## Deploying
-
-### Systemd service
-
-`~/.config/systemd/user/proxycache.service`:
-
-```ini
-[Unit]
-Description=ProxyCache for `llama.cpp` KV Cache Management
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/path/to/proxycache
-Environment="META_DIR=/path/to/proxycache-meta"
-Environment="PORT=5000"
-Environment="BACKENDS=[{\"url\":\"http://127.0.0.1:8000\"}]"
-ExecStart=/path/to/proxycache/venv/bin/python proxycache.py
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-systemctl --user daemon-reload && systemctl --user enable --now proxycache
-```
