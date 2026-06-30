@@ -556,6 +556,21 @@ async def chat(req: Request):
                     log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
                              restore_key[:16], canonical_name, restore_backend, best_ratio)
 
+                # Check pending (in-flight) slots for cache hits during the save window
+                for g, kv_blocks in sm._slot_kv_state.items():
+                    if g[0] != opt.name or g[1] != be_id:
+                        continue
+                    lcp = hs.lcp_blocks(opt_blocks, kv_blocks)
+                    denom = max(1, min(len(opt_blocks), len(kv_blocks)))
+                    ratio = lcp / denom
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        restore_key = hs.meta_key(opt.name, opt_token_ids)
+                        restore_backend = be_id
+                        canonical_name = opt.name
+                        log.info("Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
+                                 canonical_name, restore_backend, g[2], ratio)
+
         log.info(
             "Chat request from %s: model '%s', %d tokens, restore key=%s on backend %s",
             client_ip, client_model, prompt_tokens,
@@ -694,11 +709,19 @@ async def chat(req: Request):
                     kv_meta.increment_recompute_penalty(restore_key, restore_backend)
 
             save_ok = False
+            cache_size = 0
             if should_save_cache(best_ratio, recompute_happened):
-                ok, cache_size = await sm.save_after(
-                    model_name, be_id, slot_id, key, blocks, prompt_tokens,
-                )
-                save_ok = ok
+                try:
+                    ok, cache_size = await sm.save_after(
+                        model_name, be_id, slot_id, key, blocks, prompt_tokens,
+                    )
+                    save_ok = ok
+                except asyncio.CancelledError:
+                    log.warning("Cache save cancelled for model '%s' on backend '%s' slot %d",
+                                model_name, be_id, slot_id)
+                except Exception as e:
+                    log.warning("Cache save failed for model '%s' on backend '%s' slot %d: %s",
+                                model_name, be_id, slot_id, e)
             else:
                 sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens, restored, best_ratio, recompute_happened)
 

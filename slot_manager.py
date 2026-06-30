@@ -244,7 +244,7 @@ class SlotManager:
                 model_name, backend_id, old_count, n_slots,
             )
 
-    def _should_skip_restore(self, g: GSlot, req_blocks: List[str]) -> bool:
+    def _should_skip_restore(self, g: GSlot, req_blocks: List[str], prev_blocks: Optional[List[str]] = None) -> bool:
         """Check if the slot's current KV cache already matches the request well enough.
 
         Only applies when the backend has a single slot. With multiple slots, skipping a
@@ -252,19 +252,22 @@ class SlotManager:
         from serving concurrent requests. A single-slot backend is safe because the proxy
         knows exactly what traffic goes to the backend and the slot's state is predictable.
 
+        If prev_blocks is provided (the slot's KV state before the current acquisition),
+        it is used for the comparison. When prev_blocks is None, the slot has never been
+        saved — its contents are unknown, so a restore must be attempted.
+
         Returns True if the slot's tracked KV cache blocks overlap >= KV_CACHE_SKIP_THRESHOLD
-        with the request blocks, meaning no restore is needed.
+        with the request blocks, meaning no restore is required.
         """
-        kv_blocks = self._slot_kv_state.get(g)
-        if not kv_blocks:
+        if not prev_blocks:
             return False
 
         pool = self._slot_pools.get((g[0], g[1]))
         if pool is not None and len(pool) > 1:
             return False
 
-        lcp = hs.lcp_blocks(req_blocks, kv_blocks)
-        denom = max(1, min(len(req_blocks), len(kv_blocks)))
+        lcp = hs.lcp_blocks(req_blocks, prev_blocks)
+        denom = max(1, min(len(req_blocks), len(prev_blocks)))
         ratio = lcp / denom
         log.warn(
             "Checking skip restore for model '%s' on backend '%s' slot %d: ratio=%.3f",
@@ -330,9 +333,11 @@ class SlotManager:
                         if prompt_tokens < min_ctx and self._try_acquire(canonical_name, cache_backend, slot_id):
                             g = (canonical_name, cache_backend, slot_id)
                             self._slot_acquired_at[g] = time.time()
+                            prev_kv = self._slot_kv_state.get(g)
+                            self._slot_kv_state[g] = blocks or []
                             return await self._restore_and_return(
                                 canonical_name, cache_backend, slot_id,
-                                restore_key, blocks,
+                                restore_key, blocks, prev_kv,
                             )
                 except asyncio.TimeoutError:
                     pass
@@ -354,9 +359,11 @@ class SlotManager:
                         cache_acquired = True
                         g = (canonical_name, cache_backend, slot_id)
                         self._slot_acquired_at[g] = time.time()
+                        prev_kv = self._slot_kv_state.get(g)
+                        self._slot_kv_state[g] = blocks or []
                         return await self._restore_and_return(
                             canonical_name, cache_backend, slot_id,
-                            restore_key, blocks,
+                            restore_key, blocks, prev_kv,
                         )
 
             # Phase 2: check all fallback candidate backends
@@ -372,9 +379,11 @@ class SlotManager:
                 if self._try_acquire(canonical_name, backend_id, slot_id):
                     g = (canonical_name, backend_id, slot_id)
                     self._slot_acquired_at[g] = time.time()
+                    prev_kv = self._slot_kv_state.get(g)
+                    self._slot_kv_state[g] = blocks or []
                     return await self._restore_and_return(
                         canonical_name, backend_id, slot_id,
-                        None, blocks,
+                        None, blocks, prev_kv,
                     )
 
             # No slot available — exponential backoff before retrying (last iteration skips sleep)
@@ -392,8 +401,13 @@ class SlotManager:
         slot_id: int,
         effective_restore_key: Optional[str],
         blocks: Optional[List[str]],
+        prev_kv: Optional[List[str]] = None,
     ) -> Tuple[GSlot, Optional[bool]]:
-        """Restore KV cache and return (g, restored)."""
+        """Restore KV cache and return (g, restored).
+
+        prev_kv: the slot's KV state before the current acquisition (captured at
+            acquisition time before _slot_kv_state[g] was overwritten with request blocks).
+        """
         g = (model_name, backend_id, slot_id)
         restored: Optional[bool] = None
 
@@ -431,7 +445,7 @@ class SlotManager:
                 )
 
         if blocks:
-            if self._should_skip_restore(g, blocks):
+            if self._should_skip_restore(g, blocks, prev_kv):
                 log.info(
                     "Skipping restore for model '%s' on backend '%s' slot %d: slot cache already matches",
                     model_name, backend_id, slot_id,

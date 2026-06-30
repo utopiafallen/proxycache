@@ -561,7 +561,7 @@ def test_should_skip_restore_perfect_match():
     sm._slot_kv_state[g] = kv_blocks
 
     req_blocks = ["a", "b", "c", "d", "e"]
-    assert sm._should_skip_restore(g, req_blocks) is True
+    assert sm._should_skip_restore(g, req_blocks, prev_blocks=kv_blocks) is True
     print("PASS: test_should_skip_restore_perfect_match")
 
 
@@ -577,7 +577,7 @@ def test_should_skip_restore_high_overlap():
 
     # 9 out of 10 blocks match LCP → ratio = 9/10 = 0.9
     req_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "x"]
-    assert sm._should_skip_restore(g, req_blocks) is True
+    assert sm._should_skip_restore(g, req_blocks, prev_blocks=kv_blocks) is True
     print("PASS: test_should_skip_restore_high_overlap")
 
 
@@ -593,7 +593,7 @@ def test_should_skip_restore_low_overlap():
 
     # Only 4 out of 5 blocks match LCP → ratio = 4/5 = 0.8
     req_blocks = ["a", "b", "c", "d", "x"]
-    assert sm._should_skip_restore(g, req_blocks) is False
+    assert sm._should_skip_restore(g, req_blocks, prev_blocks=kv_blocks) is False
     print("PASS: test_should_skip_restore_low_overlap")
 
 
@@ -608,7 +608,7 @@ def test_should_skip_restore_zero_lcp():
     sm._slot_kv_state[g] = kv_blocks
 
     req_blocks = ["x", "y", "z"]
-    assert sm._should_skip_restore(g, req_blocks) is False
+    assert sm._should_skip_restore(g, req_blocks, prev_blocks=kv_blocks) is False
     print("PASS: test_should_skip_restore_zero_lcp")
 
 
@@ -624,7 +624,7 @@ def test_should_skip_restore_shorter_kv_cache():
 
     # KV cache has 3 blocks, request has 10. LCP = 3. ratio = 3/3 = 1.0
     req_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
-    assert sm._should_skip_restore(g, req_blocks) is True
+    assert sm._should_skip_restore(g, req_blocks, prev_blocks=kv_blocks) is True
     print("PASS: test_should_skip_restore_shorter_kv_cache")
 
 
@@ -640,7 +640,7 @@ def test_should_skip_restore_longer_kv_cache():
 
     # Request has 3 blocks, KV cache has 10. LCP = 3. ratio = 3/3 = 1.0
     req_blocks = ["a", "b", "c"]
-    assert sm._should_skip_restore(g, req_blocks) is True
+    assert sm._should_skip_restore(g, req_blocks, prev_blocks=kv_blocks) is True
     print("PASS: test_should_skip_restore_longer_kv_cache")
 
 
@@ -655,7 +655,7 @@ def test_should_skip_restore_multi_slot():
     sm._slot_kv_state[g] = kv_blocks
 
     req_blocks = ["a", "b", "c", "d", "e"]
-    assert sm._should_skip_restore(g, req_blocks) is False
+    assert sm._should_skip_restore(g, req_blocks, prev_blocks=kv_blocks) is False
     print("PASS: test_should_skip_restore_multi_slot")
 
 
