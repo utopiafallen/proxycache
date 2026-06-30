@@ -337,7 +337,7 @@ class StreamReader:
                 self.best_ratio,
             )
             self.sm._slot_save_skipped[(self.model_name, self.backend_id, self.slot_id)] = (self.key, self.blocks, self.n_tokens, self.restored, self.best_ratio, recompute_happened)
-            return False
+            return False, 0
         ok = False
         cache_size = 0
         try:
