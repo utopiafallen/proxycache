@@ -51,3 +51,13 @@ python test_smoke.py                           # smoke tests (no framework, uses
 - **Backend config validation**: each backend MUST specify exactly one of `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). Mutually exclusive. Missing either raises `ValueError` at startup.
 - **BACKENDS default**: when empty, defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`.
 - `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, `run-proxycache.ps1`, `uv.lock`, and `cache-agent.exe`.
+
+## Writing Skills
+
+When creating or updating skills under `.opencode/skills/`, follow these guidelines:
+
+- **Never use line numbers** — they change as code is modified. Reference functions by name and file location instead (e.g., `find_best_restore_candidate()` in `kv_meta_manager.py` not "line 284").
+- **Focus on architecture and concepts** — document *why* things work, not *where* they are. Implementation details change; reasoning endures.
+- **Use tables for function registries** — a table of key functions with their location and role is more durable than scattered references.
+- **Call out gotchas explicitly** — unusual constraints, edge cases, and "only works with" conditions are the most valuable parts of a skill.
+- **Mark planned vs current behavior** — when a skill documents work-in-progress, clearly separate what exists now from what's planned. When there's planned behavior, review the skill each time it is loaded to see if planned behavior has been implemented and rewrite the skill as needed.
