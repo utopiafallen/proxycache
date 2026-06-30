@@ -100,21 +100,20 @@ class MetricsCollector:
                                     prompt_preview = c["text"][:200]
                         break
 
-        # Build request record
+        # Build request record from ctx, overriding with computed values
         record = {
             "timestamp": time.time(),
             "model": model,
             "backend": backend,
-            "slot_id": ctx.get("slot_id", -1),
             "cache_hit": cache_hit,
             "restored": restored,
             "recompute": recompute,
             "saved": saved,
             "latency_ms": latency_ms,
-            "n_tokens": ctx.get("n_tokens", 0),
-            "cache_size_bytes": ctx.get("cache_size_bytes", 0),
-            "prompt_preview": prompt_preview,
         }
+        record.update(ctx)
+        record["slot_id"] = ctx.get("slot_id", -1)
+        record["prompt_preview"] = prompt_preview
 
         # Store full request JSON for last N/5 entries
         with self._lock:
@@ -122,13 +121,11 @@ class MetricsCollector:
 
             # Add full_request_json to the record (for last ~20 entries)
             max_full = max(1, self._retention // 5)
-            if len(self._requests) >= max_full:
-                idx = len(self._requests) - max_full
-                for i, r in enumerate(self._requests):
-                    if i >= len(self._requests) - max_full:
-                        r["full_request_json"] = ctx.get("request_json", {})
-                    else:
-                        r.pop("full_request_json", None)
+            for i, r in enumerate(self._requests):
+                if i >= len(self._requests) - max_full:
+                    r["full_request_json"] = ctx.get("request_json", {})
+                else:
+                    r.pop("full_request_json", None)
 
             # Increment global counters
             self._total_requests += 1

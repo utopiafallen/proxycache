@@ -190,7 +190,7 @@ class StreamReader:
                         for t in pending:
                             t.cancel()
                         break
-                    except (httpx.RemoteProtocolError, httpx.ConnectError):
+                    except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError):
                         log.warning(
                             "Backend disconnected for model '%s' on backend '%s' slot %d (key %s): incomplete body (%d chunks, %d bytes)",
                             self.model_name, self.backend_id, self.slot_id, self.key_short,
@@ -339,6 +339,7 @@ class StreamReader:
             self.sm._slot_save_skipped[(self.model_name, self.backend_id, self.slot_id)] = (self.key, self.blocks, self.n_tokens, self.restored, self.best_ratio, recompute_happened)
             return False
         ok = False
+        cache_size = 0
         try:
             ok, cache_size = await self.sm.save_after(
                 self.model_name, self.backend_id, self.slot_id,
@@ -352,7 +353,7 @@ class StreamReader:
         except Exception as e:
             log.warning("Cache save failed for model '%s' on backend '%s' slot %d: %s",
                         self.model_name, self.backend_id, self.slot_id, e)
-        return ok
+        return ok, cache_size
 
     async def _cleanup(self):
         log.info("Starting cleanup for model '%s' on backend '%s' slot %d (key %s): cancelled=%s, stream_complete=%s",
@@ -365,12 +366,13 @@ class StreamReader:
             log.info("Error closing response for model '%s' on backend '%s' slot %d (key %s): %s",
                       self.model_name, self.backend_id, self.slot_id, self.key_short, e)
         ok = False
+        cache_size = 0
         if self._stream_complete:
             log.info("Saving cache for model '%s' on backend '%s' slot %d (key %s)",
                       self.model_name, self.backend_id, self.slot_id, self.key_short)
-            ok = await self._save()
-            log.info("Cache save completed for model '%s' on backend '%s' slot %d (key %s): %s",
-                      self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
+            ok, cache_size = await self._save()
+            log.info("Cache save completed for model '%s' on backend '%s' slot %d (key %s): %s, %d bytes",
+                      self.model_name, self.backend_id, self.slot_id, self.key_short, ok, cache_size)
         else:
             log.info("Skipping cache save for model '%s' on backend '%s' slot %d (key %s): stream incomplete",
                       self.model_name, self.backend_id, self.slot_id, self.key_short)
@@ -399,7 +401,7 @@ class StreamReader:
             prompt_preview = ""
             if self._request_json:
                 messages = self._request_json.get("messages", [])
-                for msg in messages:
+                for msg in reversed(messages):
                     if msg.get("role") == "user":
                         content = msg.get("content", "")
                         if isinstance(content, str):
@@ -420,8 +422,10 @@ class StreamReader:
                 "recompute": recompute_happened,
                 "saved": ok,
                 "latency_ms": (time.time() - self._t0) * 1000,
-                "n_tokens": self.n_tokens,
-                "cache_size_bytes": 0,
+                "n_tokens": self._sse_prompt_tokens or self.n_tokens,
+                "cached_tokens": self._sse_cached_tokens or 0,
+                "stream": True,
+                "cache_size_bytes": cache_size,
                 "prompt_preview": prompt_preview,
             })
 
@@ -666,6 +670,8 @@ async def chat(req: Request):
             # Track recompute penalty: if restore was attempted and cached_tokens < request length,
             # the KV cache restore was partial/useless (llama.cpp had to recompute)
             recompute_happened = False
+            llm_prompt_tokens = 0
+            cached_tokens = 0
             if restored and restore_key and restore_backend:
                 usage = out.get("usage") or {}
                 pt_details = usage.get("prompt_tokens_details") or {}
@@ -700,7 +706,7 @@ async def chat(req: Request):
             from metrics import metrics as _metrics
             prompt_preview = ""
             messages = request_json.get("messages", [])
-            for msg in messages:
+            for msg in reversed(messages):
                 if msg.get("role") == "user":
                     content = msg.get("content", "")
                     if isinstance(content, str):
@@ -721,7 +727,9 @@ async def chat(req: Request):
                 "recompute": recompute_happened,
                 "saved": save_ok,
                 "latency_ms": (time.time() - t0) * 1000,
-                "n_tokens": prompt_tokens,
+                "n_tokens": llm_prompt_tokens,
+                "cached_tokens": cached_tokens,
+                "stream": False,
                 "cache_size_bytes": cache_size if ok else 0,
                 "prompt_preview": prompt_preview,
             })
@@ -768,6 +776,13 @@ async def metrics_summary():
     summary["backends"] = _get_backend_health()
     summary["slots"] = _get_slot_status()
     summary["cache"] = _get_cache_stats()
+    # Per-backend performance
+    backend_perf = {}
+    for be_id in summary["backends"]:
+        bp = _metrics.get_performance(backend=be_id)
+        if bp.get("total_requests", 0) > 0:
+            backend_perf[be_id] = bp
+    summary["backend_performance"] = backend_perf
     return summary
 
 

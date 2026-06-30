@@ -969,7 +969,7 @@ def test_streaming_save_after_exception():
         reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
                               "test_key", 10, ["blk1"], sm)
 
-        ok = await reader._save()
+        ok, cache_size = await reader._save()
         assert not ok, "_save should return False on exception"
     asyncio.run(_run())
     print("PASS: test_streaming_save_after_exception")

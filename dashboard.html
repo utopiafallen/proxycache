@@ -82,7 +82,6 @@ header .controls select, header .controls button {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;
-  overflow: hidden;
 }
 .panel-header {
   display: flex;
@@ -128,7 +127,40 @@ header .controls select, header .controls button {
   align-items: center;
   padding: 4px 0;
 }
-.perf-label { font-size: 13px; color: var(--text-secondary); }
+.perf-label { font-size: 13px; color: var(--text-secondary); min-width: 130px; display: flex; align-items: center; gap: 4px; }
+.perf-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--text-secondary);
+  font-size: 10px;
+  color: var(--text-secondary);
+  cursor: help;
+  position: relative;
+}
+.perf-info:hover::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 6px;
+  background: var(--text);
+  color: var(--bg);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 400;
+  white-space: normal;
+  width: max-content;
+  max-width: 280px;
+  z-index: 100;
+  pointer-events: none;
+  line-height: 1.4;
+}
 .perf-bar-container {
   flex: 1;
   margin: 0 12px;
@@ -145,6 +177,7 @@ header .controls select, header .controls button {
 .perf-bar.green, .cache-bar-fill.green { background: var(--green); }
 .perf-bar.yellow, .cache-bar-fill.yellow { background: var(--yellow); }
 .perf-bar.red, .cache-bar-fill.red { background: var(--red); }
+.perf-bar.gray, .cache-bar-fill.gray { background: var(--gray); }
 .perf-value { font-family: var(--mono); font-size: 13px; min-width: 60px; text-align: right; }
 .latency-stats {
   margin-top: 8px;
@@ -211,17 +244,6 @@ header .controls select, header .controls button {
 .slot-cell.in-use { background: var(--green); color: white; }
 .slot-cell.free { background: var(--gray-bg); color: var(--gray); border: 1px solid var(--border); }
 .slot-cell.restoring { background: var(--blue); color: white; }
-.slot-cell:hover::after {
-  content: attr(data-tooltip);
-  position: absolute;
-  bottom: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--text);
-  color: var(--bg);
-  padding: 4px 8px;
-  border-radius: 4px;
-  font-size: 11px;
   white-space: nowrap;
   z-index: 10;
   pointer-events: none;
@@ -326,6 +348,7 @@ header .controls select, header .controls button {
   margin-top: 8px;
 }
 .show-all-btn:hover { background: var(--bg); }
+.copy-json-btn:hover { background: var(--bg); }
 
 /* Full width panel */
 .panel.full-width { grid-column: 1 / -1; }
@@ -354,8 +377,8 @@ header .controls select, header .controls button {
 </header>
 
 <div class="grid">
-  <!-- Backend Health -->
-  <div class="panel">
+  <!-- Backend Health + Cache Utilization + Slot Status -->
+  <div class="panel full-width">
     <div class="panel-header" onclick="togglePanel(this)">
       <h2>Backend Health</h2>
       <span class="toggle">&#9660;</span>
@@ -364,30 +387,12 @@ header .controls select, header .controls button {
   </div>
 
   <!-- Cache Performance -->
-  <div class="panel">
+  <div class="panel full-width">
     <div class="panel-header" onclick="togglePanel(this)">
       <h2>Cache Performance</h2>
       <span class="toggle">&#9660;</span>
     </div>
     <div class="panel-body" id="cachePerformance"></div>
-  </div>
-
-  <!-- Cache Utilization -->
-  <div class="panel">
-    <div class="panel-header" onclick="togglePanel(this)">
-      <h2>Cache Utilization</h2>
-      <span class="toggle">&#9660;</span>
-    </div>
-    <div class="panel-body" id="cacheUtilization"></div>
-  </div>
-
-  <!-- Slot Status -->
-  <div class="panel">
-    <div class="panel-header" onclick="togglePanel(this)">
-      <h2>Slot Status</h2>
-      <span class="toggle">&#9660;</span>
-    </div>
-    <div class="panel-body" id="slotStatus"></div>
   </div>
 
   <!-- Recent Requests -->
@@ -407,7 +412,12 @@ header .controls select, header .controls button {
         </select>
       </div>
       <div id="requestsList"></div>
-      <button class="show-all-btn" id="showAllBtn" onclick="showAllRequests()">Show all 100</button>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="show-all-btn" id="refreshBtn" onclick="refreshRequests()" style="flex:0 0 auto;width:auto;">Refresh</button>
+        <button class="show-all-btn" id="prevPageBtn" onclick="changePage(-1)" style="flex:0 0 auto;width:auto;">Prev</button>
+        <span id="pageInfo" style="font-size:12px;color:var(--text-secondary);display:flex;align-items:center;height:29px;">Page 1</span>
+        <button class="show-all-btn" id="nextPageBtn" onclick="changePage(1)" style="flex:0 0 auto;width:auto;">Next</button>
+      </div>
     </div>
   </div>
 </div>
@@ -419,6 +429,10 @@ let currentFilter = 'all';
 let currentBackendFilter = '';
 let allRequests = [];
 let expandedRequests = new Set();
+let currentPage = 1;
+const PAGE_SIZE = 20;
+let totalRequestCount = 0;
+let scrollPositions = {};
 
 function togglePanel(header) {
   const body = header.nextElementSibling;
@@ -463,15 +477,45 @@ async function fetchMetrics() {
     const resp = await fetch(API_BASE + '/metrics/summary');
     if (!resp.ok) return;
     const data = await resp.json();
-    renderBackendHealth(data.backends || {});
-    renderCachePerformance(data.performance || {});
-    renderCacheUtilization(data.cache || {});
-    renderSlotStatus(data.slots || {});
-    renderRequests(data.requests || [], data.requests_summary?.length || 0);
+    renderBackendHealth(data.backends || {}, data.cache || {}, data.slots || {});
+    renderCachePerformance(data.performance || {}, data.backend_performance || {});
     updateBackendFilter(data.backends || {});
+    if (!expandedRequests.size) {
+      const savedPage = currentPage;
+      currentPage = 1;
+      refreshRequests();
+      currentPage = savedPage;
+    }
   } catch (e) {
     console.error('Failed to fetch metrics:', e);
   }
+}
+
+async function refreshRequests() {
+  try {
+    const offset = (currentPage - 1) * PAGE_SIZE;
+    const resp = await fetch(API_BASE + `/metrics/requests?limit=${PAGE_SIZE}&offset=${offset}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    totalRequestCount = data.total || 0;
+    renderRequests(data.requests || [], totalRequestCount);
+    updatePageInfo();
+  } catch (e) {
+    console.error('Failed to fetch requests:', e);
+  }
+}
+
+function changePage(delta) {
+  const maxPage = Math.ceil(totalRequestCount / PAGE_SIZE);
+  currentPage = Math.max(1, Math.min(currentPage + delta, maxPage));
+  refreshRequests();
+}
+
+function updatePageInfo() {
+  const maxPage = Math.max(1, Math.ceil(totalRequestCount / PAGE_SIZE));
+  document.getElementById('pageInfo').textContent = `Page ${currentPage} of ${maxPage}`;
+  document.getElementById('prevPageBtn').disabled = currentPage <= 1;
+  document.getElementById('nextPageBtn').disabled = currentPage >= maxPage;
 }
 
 function updateBackendFilter(backends) {
@@ -484,56 +528,81 @@ function updateBackendFilter(backends) {
   sel.innerHTML = options.join('');
 }
 
-function renderBackendHealth(backends) {
+function renderBackendHealth(backends, cache, slots) {
   const el = document.getElementById('backendHealth');
   if (!Object.keys(backends).length) {
     el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No backends configured</p>';
     return;
   }
-  let html = '';
+  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(350px, 1fr));gap:24px;">';
+  const now = Date.now() / 1000;
   for (const [key, info] of Object.entries(backends)) {
     const uptime = info.up ? 'UP' : 'DOWN';
-    const dotClass = info.up ? 'up' : 'down';
-    const lastDiscovery = info.models ? Object.values(info.models)[0]?.last_discovered : 0;
-    const now = Date.now() / 1000;
-    if (info.up && lastDiscovery && (now - lastDiscovery) > 300) {
-      dotClass = 'warning';
-    }
-    html += `<div class="backend-item">
+    let dotClass = info.up ? 'up' : 'down';
+    const cacheInfo = cache && cache[key];
+    const cacheHtml = cacheInfo ? `<div class="cache-bar-container" style="margin:6px 0 4px;">
+      <div class="cache-bar">
+        <div class="cache-bar-fill ${getBarColor(cacheInfo.utilization_pct / 100)}" style="width:${Math.min(100, cacheInfo.utilization_pct)}%"></div>
+      </div>
+      <div class="cache-backend">${cacheInfo.total_gb} / ${cacheInfo.max_gb} GB &middot; ${cacheInfo.ring_size} files${cacheInfo.cache_dir ? ` &middot; ${cacheInfo.cache_dir}` : ''}</div>
+    </div>` : '';
+    html += `<div style="flex:1;min-width:250px;">`;
+    html += `<div class="backend-item" style="margin-bottom:4px;">
       <span class="backend-dot ${dotClass}"></span>
       <span class="backend-name">${key}</span>
       <span class="backend-status">${uptime}</span>
-    </div>`;
+    </div>
+    ${cacheHtml}`;
     if (info.models) {
       for (const [modelName, modelInfo] of Object.entries(info.models)) {
+        // Get slot status for this model/backend
+        let slotCells = '';
+        if (slots && slots[key] && slots[key].models && slots[key].models[modelName]) {
+          const modelSlots = slots[key].models[modelName].slots || {};
+          for (const [slotId, slotInfo] of Object.entries(modelSlots)) {
+            let cls = 'free';
+            if (slotInfo.in_use) cls = 'in-use';
+            else if (slotInfo.last_restore && (now - slotInfo.last_used) < 5) cls = 'restoring';
+            const status = slotInfo.in_use ? 'in-use' : (slotInfo.kv_blocks > 0 ? `${slotInfo.kv_blocks} cached` : 'free');
+            slotCells += `<div class="slot-cell ${cls}" data-tooltip="S${slotId}: ${status}" style="width:24px;height:18px;font-size:9px;">${slotId}</div>`;
+          }
+        }
         html += `<div class="backend-models">
           ${modelName} | ${modelInfo.total_slots} slots (${modelInfo.in_use} in use), n_ctx=${modelInfo.n_ctx}
+          <div style="display:flex;flex-wrap:wrap;gap:2px;margin-top:4px;margin-left:22px;align-items:center;">
+            <span style="font-size:11px;color:var(--text-secondary);margin-right:4px;">slots:</span>${slotCells}
+          </div>
         </div>`;
       }
     }
+    html += `</div>`;
   }
+  html += '</div>';
   el.innerHTML = html;
 }
 
 function renderCachePerformance(perf) {
   const el = document.getElementById('cachePerformance');
-  const g = perf.global || {};
+  const g = perf;
   if (!g.total_requests) {
     el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No requests yet</p>';
     return;
   }
+
+  // Global performance
+  let html = '<div style="margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid var(--border);">';
   const rows = [
-    ['Hit Rate', g.cache_hit_rate, 'green'],
-    ['Mispredict Rate', g.cache_mispredict_rate, 'red'],
-    ['Utility Rate', g.cache_utility_rate, 'green'],
-    ['Save Rate', g.save_rate, 'yellow'],
-    ['Restore OK', g.restore_success_rate, 'green'],
+    ['Hit Rate', g.cache_hit_rate, 'green', false, 'Percentage of requests that resulted in a cache hit. Higher is better.'],
+    ['Mispredict Rate', g.cache_mispredict_rate, 'red', true, 'Percentage of cache hits that triggered a recompute. Lower is better.'],
+    ['Utility Rate', g.cache_utility_rate, 'green', false, 'Percentage of requests that benefited from cache (hits minus recomputes). Higher is better.'],
+    ['Save Rate', g.save_rate, 'gray', false, 'Percentage of cache hits where the KV state was worth saving to disk.'],
+    ['Restore OK', g.restore_success_rate, 'green', false, 'Percentage of cache restore attempts that succeeded (excludes requests that skipped restore). Higher is better.'],
   ];
-  let html = '';
-  for (const [label, value, color] of rows) {
+  for (const [label, value, defaultColor, invert, description] of rows) {
     const pct = getBarPct(value);
+    const color = defaultColor === 'gray' ? 'gray' : (invert ? getBarColor(1 - value) : getBarColor(value));
     html += `<div class="perf-row">
-      <span class="perf-label">${label}</span>
+      <span class="perf-label">${label}<span class="perf-info" data-tooltip="${description}">?</span></span>
       <div class="perf-bar-container">
         <div class="perf-bar ${color}" style="width:${pct}%"></div>
       </div>
@@ -543,7 +612,44 @@ function renderCachePerformance(perf) {
   const lat = g.latency || {};
   html += `<div class="latency-stats">
     avg=${lat.avg_ms}ms &nbsp; p50=${lat.p50_ms}ms &nbsp; p95=${lat.p95_ms}ms &nbsp; p99=${lat.p99_ms}ms
-  </div>`;
+  </div></div>`;
+
+  // Per-backend performance
+  const backendPerf = arguments[1] || {};
+  const backends = Object.keys(backendPerf);
+  if (backends.length) {
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(350px, 1fr));gap:24px;">';
+    for (const [beId, bp] of Object.entries(backendPerf)) {
+      html += `<div style="padding-bottom:12px;border-bottom:1px solid var(--border);">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;font-family:var(--mono);">${beId} <span style="font-weight:400;color:var(--text-secondary);">(${bp.total_requests} requests)</span></div>`;
+      const bRows = [
+        ['Hit Rate', bp.cache_hit_rate, 'green', false, 'Percentage of requests that resulted in a cache hit.'],
+        ['Mispredict Rate', bp.cache_mispredict_rate, 'red', true, 'Percentage of cache hits that triggered a recompute.'],
+        ['Utility Rate', bp.cache_utility_rate, 'green', false, 'Percentage of requests that benefited from cache.'],
+        ['Save Rate', bp.save_rate, 'gray', false, 'Percentage of cache hits where KV state was worth saving.'],
+        ['Restore OK', bp.restore_success_rate, 'green', false, 'Percentage of restore attempts that succeeded.'],
+      ];
+      for (const [label, value, defaultColor, invert, description] of bRows) {
+        const pct = getBarPct(value);
+        const color = defaultColor === 'gray' ? 'gray' : (invert ? getBarColor(1 - value) : getBarColor(value));
+        html += `<div class="perf-row">
+          <span class="perf-label">${label}<span class="perf-info" data-tooltip="${description}">?</span></span>
+          <div class="perf-bar-container">
+            <div class="perf-bar ${color}" style="width:${pct}%"></div>
+          </div>
+          <span class="perf-value">${(value * 100).toFixed(1)}%</span>
+        </div>`;
+      }
+      const blat = bp.latency || {};
+      if (blat.avg_ms) {
+        html += `<div class="latency-stats">
+          avg=${blat.avg_ms}ms &nbsp; p50=${blat.p50_ms}ms &nbsp; p95=${blat.p95_ms}ms &nbsp; p99=${blat.p99_ms}ms
+        </div>`;
+      }
+      html += `</div>`;
+    }
+    html += '</div>';
+  }
   el.innerHTML = html;
 }
 
@@ -587,7 +693,8 @@ function renderSlotStatus(slots) {
         let cls = 'free';
         if (slotInfo.in_use) cls = 'in-use';
         else if (slotInfo.last_restore && (now - slotInfo.last_used) < 5) cls = 'restoring';
-        const tooltip = `S${slotId}: ${slotInfo.in_use ? 'in-use' : 'free'}, kv=${slotInfo.kv_blocks} blocks`;
+        const status = slotInfo.in_use ? 'in-use' : (slotInfo.kv_blocks > 0 ? `${slotInfo.kv_blocks} cached blocks` : 'free');
+        const tooltip = `S${slotId}: ${status}`;
         html += `<div class="slot-cell ${cls}" data-tooltip="${tooltip}">${slotId}</div>`;
       }
       html += '</div>';
@@ -604,11 +711,19 @@ function renderSlotStatus(slots) {
 function renderRequests(requests, total) {
   allRequests = requests;
   renderFilteredRequests();
-  document.getElementById('showAllBtn').textContent = `Show all ${total}`;
 }
 
 function renderFilteredRequests() {
+  _doRenderFilteredRequests();
+}
+
+function _doRenderFilteredRequests() {
   const el = document.getElementById('requestsList');
+  // Save scroll positions of expanded request bodies
+  const bodies = el.querySelectorAll('.request-body.open');
+  for (const body of bodies) {
+    scrollPositions[body.dataset.timestamp] = body.scrollTop;
+  }
   let filtered = allRequests;
   if (currentBackendFilter) {
     filtered = filtered.filter(r => r.backend === currentBackendFilter);
@@ -635,12 +750,16 @@ function renderFilteredRequests() {
     const arrowOpen = expanded ? 'open' : '';
     const preview = req.prompt_preview ? `<div class="request-preview">"${req.prompt_preview}${req.prompt_preview.length >= 200 ? '...' : ''}"</div>` : '';
     const metricsParts = [];
-    if (req.n_tokens) metricsParts.push(`${req.n_tokens} tokens`);
-    if (req.cache_size_bytes) metricsParts.push(formatBytes(req.cache_size_bytes));
-    if (req.restored) metricsParts.push('restored');
-    if (req.saved) metricsParts.push('saved');
+    if (req.cache_hit && req.n_tokens) metricsParts.push(`${req.cached_tokens || 0}/${req.n_tokens} cached`);
+    if (req.n_tokens && !req.cache_hit) metricsParts.push(`${req.n_tokens} prompt tokens`);
+    if (req.saved) metricsParts.push(req.cache_size_bytes ? `saved (${formatBytes(req.cache_size_bytes)})` : 'saved');
+    if (req.restored && !req.saved) metricsParts.push('restored');
     const metricsHtml = metricsParts.length ? `<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">${metricsParts.join(' &middot; ')}</div>` : '';
-    const fullJson = req.full_request_json ? `<pre>${JSON.stringify(req.full_request_json, null, 2)}</pre>` : '<p style="color:var(--text-secondary);font-size:12px;">No request body available</p>';
+    const fullJson = req.full_request_json ? (() => {
+      const obj = JSON.parse(JSON.stringify(req.full_request_json));
+      if (obj.tools) delete obj.tools;
+      return `<pre>${JSON.stringify(obj, null, 2).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
+    })() : '<p style="color:var(--text-secondary);font-size:12px;">No request body available</p>';
     html += `<div class="request-item">
       <div class="request-header" onclick="toggleRequest(${req.timestamp})">
         <span class="request-expand ${arrowOpen}">&#9654;</span>
@@ -651,11 +770,22 @@ function renderFilteredRequests() {
         <span class="request-badge ${badgeClass}">${badgeText}</span>
         <span class="request-latency">${req.latency_ms.toFixed(0)}ms</span>
       </div>
-      ${preview}
-      <div class="request-body ${bodyOpen}">${metricsHtml}${fullJson}</div>
+      ${req.full_request_json ? (() => {
+        const obj = JSON.parse(JSON.stringify(req.full_request_json));
+        if (obj.tools) delete obj.tools;
+        const jsonStr = JSON.stringify(obj, null, 2);
+        return `<div class="request-preview" style="display:flex;align-items:center;gap:8px;"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">"${req.prompt_preview || ''}${(req.prompt_preview || '').length >= 200 ? '...' : ''}"</span><button class="copy-json-btn" data-json="${encodeURIComponent(jsonStr)}" style="font-size:11px;padding:2px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--text);cursor:pointer;flex-shrink:0;">Copy</button></div>`;
+      })() : preview}
+      ${metricsHtml ? `<div class="request-footer" style="font-size:12px;color:var(--text-secondary);padding:4px 10px;border-top:1px solid var(--border);">${metricsHtml}</div>` : ''}
+      <div class="request-body ${bodyOpen}" data-timestamp="${req.timestamp}">${fullJson}</div>
     </div>`;
   }
   el.innerHTML = html;
+  // Restore scroll positions for expanded request bodies
+  for (const [ts, pos] of Object.entries(scrollPositions)) {
+    const body = el.querySelector(`.request-body[data-timestamp="${ts}"]`);
+    if (body) body.scrollTop = pos;
+  }
 }
 
 function toggleRequest(ts) {
@@ -665,16 +795,6 @@ function toggleRequest(ts) {
     expandedRequests.add(ts);
   }
   renderFilteredRequests();
-}
-
-function showAllRequests() {
-  // Fetch all requests from API
-  fetch(API_BASE + '/metrics/requests?limit=100&offset=0')
-    .then(r => r.json())
-    .then(data => {
-      allRequests = data.requests || [];
-      renderFilteredRequests();
-    });
 }
 
 // Dark mode toggle
@@ -706,8 +826,60 @@ function startAutoRefresh(interval) {
   refreshTimer = setInterval(fetchMetrics, interval || 5000);
 }
 
+// Slot tooltip
+const slotTooltip = document.createElement('div');
+slotTooltip.style.cssText = 'position:fixed;padding:4px 8px;border-radius:4px;font-size:11px;font-family:var(--mono);white-space:nowrap;pointer-events:none;z-index:9999;opacity:0;transition:opacity 0.15s;';
+document.body.appendChild(slotTooltip);
+
+document.addEventListener('mouseenter', (e) => {
+  if (!(e.target instanceof Element)) return;
+  const cell = e.target.closest('.slot-cell');
+  if (!cell || !cell.dataset.tooltip) return;
+  slotTooltip.textContent = cell.dataset.tooltip;
+  slotTooltip.style.background = 'var(--text)';
+  slotTooltip.style.color = 'var(--bg)';
+  slotTooltip.style.opacity = '1';
+  requestAnimationFrame(() => {
+    const rect = cell.getBoundingClientRect();
+    const tooltipRect = slotTooltip.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+    let top = rect.bottom + 4;
+    if (left < 4) left = 4;
+    if (left + tooltipRect.width > window.innerWidth - 4) {
+      left = window.innerWidth - tooltipRect.width - 4;
+    }
+    if (top + tooltipRect.height > window.innerHeight - 4) {
+      top = rect.top - tooltipRect.height - 4;
+    }
+    slotTooltip.style.left = left + 'px';
+    slotTooltip.style.top = top + 'px';
+  });
+}, true);
+
+document.addEventListener('mouseout', (e) => {
+  if (!(e.target instanceof Element)) return;
+  const cell = e.target.closest('.slot-cell');
+  if (!cell) return;
+  const related = e.relatedTarget;
+  if (!related || !related.closest || !related.closest('.slot-cell')) {
+    slotTooltip.style.opacity = '0';
+  }
+}, true);
+
+// Copy JSON button
+document.addEventListener('click', (e) => {
+  if (e.target.classList.contains('copy-json-btn')) {
+    const json = decodeURIComponent(e.target.dataset.json);
+    navigator.clipboard.writeText(json).then(() => {
+      e.target.textContent = 'Copied!';
+      setTimeout(() => { e.target.textContent = 'Copy'; }, 1500);
+    });
+  }
+});
+
 // Initial fetch and start auto-refresh
 fetchMetrics();
+refreshRequests();
 startAutoRefresh(5000);
 </script>
 </body>
