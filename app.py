@@ -410,7 +410,7 @@ class StreamReader:
                 "model": self.model_name,
                 "backend": self.backend_id,
                 "slot_id": self.slot_id,
-                "cache_hit": bool(self.restore_key),
+                 "cache_hit": bool(self.restore_key) or self._routing_reason == "pending_slot_hit",
                 "restored": self.restored,
                 "recompute": recompute_happened,
                 "saved": ok,
@@ -621,11 +621,10 @@ async def chat(req: Request):
     client = backend_manager.get_client(be_id)
 
     # Determine routing reason for metrics
-    if restore_key and restore_backend and be_id == restore_backend:
-        if pending_slot_hit:
-            routing_reason = "pending_slot_hit"
-        else:
-            routing_reason = "cache_hit"
+    if pending_slot_hit:
+        routing_reason = "pending_slot_hit"
+    elif restore_key and restore_backend and be_id == restore_backend:
+        routing_reason = "cache_hit"
     elif key is None:
         # No cache entry found at all (key generated from first_token_ids as fallback)
         routing_reason = "no_cache_entry"
@@ -764,7 +763,7 @@ async def chat(req: Request):
                 "model": model_name,
                 "backend": be_id,
                 "slot_id": slot_id,
-                "cache_hit": bool(restore_key),
+                "cache_hit": bool(restore_key) or pending_slot_hit,
                 "restored": restored,
                 "recompute": recompute_happened,
                 "saved": save_ok,
