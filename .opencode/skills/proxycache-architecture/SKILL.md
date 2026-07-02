@@ -1,6 +1,6 @@
 ---
 name: proxycache-architecture
-description: Proxycache KV cache slot management, cache hit scanning, and pending cache optimization. Use when modifying slot_manager.py, app.py cache hit logic, or kv_meta_manager.py.
+description: Proxycache KV cache slot management, cache hit scanning, pending cache optimization, and metrics collection. Use when modifying slot_manager.py, app.py cache hit logic, kv_meta_manager.py, or metrics.py.
 ---
 
 # Proxycache Architecture
@@ -82,6 +82,40 @@ When a request completes and starts saving, subsequent requests that arrive duri
 4. **During steps 1-2:** Pending slot scan finds the in-flight slot's KV state and uses it as a cache hit candidate
 5. **After step 3:** Disk scan picks up the new meta file
 
+## Metrics Collector (`metrics.py`)
+
+Two-phase recording with in-place updates via `request_id` matching:
+
+1. **Arrival**: `chat()` generates `request_id` (UUID), calls `record()` with `status="incomplete"`, `prompt_preview`, and `request_json`. The entry is appended to the ring buffer.
+2. **Completion**: Both streaming (`_cleanup()`) and non-streaming paths call `record()` with the same `request_id`, `status="complete"`, and performance metrics. The existing entry is updated in-place.
+
+**Key behavior:**
+- `_by_id: Dict[str, int]` maps request_id → index in ring buffer, rebuilt after every append (deque auto-evicts without notification, leaving stale indices)
+- Arrival timestamp, `prompt_preview`, and `full_request_json` are preserved when updating existing records
+- Counters only increment on completion (status="complete"), not arrival
+- `get_performance()` only uses complete requests; `get_summary()` includes `incomplete_count`
+- Defaults to `status="complete"` for backward compatibility with code that doesn't use two-phase recording
+
+**Routing reasons** (set after slot acquisition in `app.py`):
+- `cache_hit` — disk cache hit found, routed to that backend
+- `pending_slot_hit` — in-flight slot found with better ratio, routed to that backend
+- `no_cache_entry` — no cache entry found, first available backend
+- `cache_backend_unavailable` — cache hit found but desired backend was busy/unavailable, fell back
+
+**Gotchas:**
+- `save_after()` exceptions in the non-streaming path are wrapped in try/except so they don't bypass metrics recording
+- `pending_slot_hit` flag must be reset to `False` when a disk cache hit supersedes it in the per-backend loop
+- Ring buffer pagination: use `get_total_count()` for the total, not `len(requests)` (which is the length of the returned slice)
+
+## Gotchas
+
+- **Tokenization is backend-specific**: Each backend applies its own chat template and tokenizer. Different backends may produce different token IDs for the same messages.
+- **Cache key = prompt tokens only**: The key is computed from `opt_token_ids` (prompt), not the full request+response. This is known at acquisition time.
+- **`_slot_kv_state` is keyed by `(model, backend, slot_id)`**: Use the full GSlot tuple, not just the backend.
+- **`invalidate_slot()` clears `_slot_kv_state`**: Called on cancellation/failure in `app.py:_cleanup()` before `release()`.
+- **Ring buffer eviction is per-backend**: Uses `CACHE_MAX_SIZE_GB` per backend (default 25 GB). Evicts age-first, then LRU.
+- **Pending slot scan uses per-backend blocks**: The scan runs inside the per-backend loop in `app.py`, so `blocks` always matches the current backend's tokenizer output.
+
 ## Key Functions
 
 | Function | Location | Role |
@@ -98,12 +132,6 @@ When a request completes and starts saving, subsequent requests that arrive duri
 | `save_after()` | `slot_manager.py` | Save KV cache to disk, write meta file, update ring buffer, update `_slot_kv_state` |
 | `StreamReader._save()` | `app.py` | Detect recompute, call `save_after()`, return ok/cache_size |
 | `StreamReader._cleanup()` | `app.py` | Stream lifecycle: save, invalidate_slot, release slot, record metrics |
-
-## Gotchas
-
-- **Tokenization is backend-specific**: Each backend applies its own chat template and tokenizer. Different backends may produce different token IDs for the same messages (different quantization variants can have different tokenizers).
-- **Cache key = prompt tokens only**: The key is computed from `opt_token_ids` (prompt), not the full request+response. This is known at acquisition time.
-- **`_slot_kv_state` is keyed by `(model, backend, slot_id)`**: Use the full GSlot tuple, not just the backend.
-- **`invalidate_slot()` clears `_slot_kv_state`**: Called on cancellation/failure in `app.py:_cleanup()` before `release()`.
-- **Ring buffer eviction is per-backend**: Uses `CACHE_MAX_SIZE_GB` per backend (default 25 GB). Evicts age-first, then LRU.
-- **Pending slot scan uses per-backend blocks**: The scan runs inside the per-backend loop in `app.py`, so `blocks` always matches the current backend's tokenizer output.
+| `MetricsCollector.record()` | `metrics.py` | Two-phase record/update by request_id |
+| `MetricsCollector.get_performance()` | `metrics.py` | Compute metrics from complete requests only |
+| `MetricsCollector.get_total_count()` | `metrics.py` | Return actual ring buffer size for pagination |
