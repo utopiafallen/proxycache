@@ -406,7 +406,7 @@ class StreamReader:
             if self._request_json:
                 messages = self._request_json.get("messages", [])
                 for msg in reversed(messages):
-                    if msg.get("role") == "user":
+                    if msg.get("role") in ("user", "assistant"):
                         content = msg.get("content", "")
                         if isinstance(content, str):
                             prompt_preview = content[:200]
@@ -512,8 +512,8 @@ async def chat(req: Request):
     request_id = str(uuid.uuid4())
     # Extract prompt preview for initial record
     prompt_preview = ""
-    for msg in messages:
-        if msg.get("role") == "user":
+    for msg in reversed(messages):
+        if msg.get("role") in ("user", "assistant"):
             content = msg.get("content", "")
             if isinstance(content, str):
                 prompt_preview = content[:200]
@@ -781,7 +781,7 @@ async def chat(req: Request):
             prompt_preview = ""
             messages = request_json.get("messages", [])
             for msg in reversed(messages):
-                if msg.get("role") == "user":
+                if msg.get("role") in ("user", "assistant"):
                     content = msg.get("content", "")
                     if isinstance(content, str):
                         prompt_preview = content[:200]

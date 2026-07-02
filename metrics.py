@@ -117,8 +117,8 @@ class MetricsCollector:
             request_json = ctx.get("request_json", {})
             if request_json:
                 messages = request_json.get("messages", [])
-                for msg in messages:
-                    if msg.get("role") == "user":
+                for msg in reversed(messages):
+                    if msg.get("role") in ("user", "assistant"):
                         content = msg.get("content", "")
                         if isinstance(content, str):
                             prompt_preview = content[:200]

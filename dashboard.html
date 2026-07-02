@@ -889,11 +889,12 @@ document.addEventListener('mouseout', (e) => {
 
 // Copy JSON button
 document.addEventListener('click', (e) => {
-  if (e.target.classList.contains('copy-json-btn')) {
-    const json = decodeURIComponent(e.target.dataset.json);
+  const btn = e.target.closest('.copy-json-btn');
+  if (btn) {
+    const json = decodeURIComponent(btn.dataset.json);
     navigator.clipboard.writeText(json).then(() => {
-      e.target.textContent = 'Copied!';
-      setTimeout(() => { e.target.textContent = 'Copy'; }, 1500);
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
     });
   }
 });
