@@ -45,6 +45,7 @@ The `pending_slot_hit` flag is set when the pending slot scan finds a better rat
 
 | Function | Location | Role |
 |----------|----------|------|
+| `extract_prompt_preview()` | `metrics.py` | Extract latest user/assistant message text from request JSON |
 | `MetricsCollector.record()` | `metrics.py` | Two-phase record/update by request_id |
 | `MetricsCollector.get_performance()` | `metrics.py` | Compute metrics from complete requests only |
 | `MetricsCollector.get_total_count()` | `metrics.py` | Return actual ring buffer size for pagination |
@@ -59,4 +60,4 @@ The `pending_slot_hit` flag is set when the pending slot scan finds a better rat
 - **Pagination total**: use `get_total_count()`, not `len(requests)` (which is the length of the returned slice)
 - **Arrival timestamp preserved**: when updating an existing record, the original timestamp is kept so requests show when they arrived, not when they completed
 - **Silent try/except on arrival**: the arrival record is wrapped in try/except to avoid blocking the request; if it fails, the error is logged (not silently swallowed)
-- **Prompt preview extraction**: looks for the most recent message with role "user" or "assistant", iterating messages in reverse order. Applied consistently in both `metrics.py:record()` and `app.py` (all three paths: streaming _cleanup, arrival, non-streaming)
+- **Prompt preview extraction**: `extract_prompt_preview()` in `metrics.py` — looks for the most recent message with role "user" or "assistant", iterating messages in reverse order, skipping empty content. Called from `record()`, streaming `_cleanup()`, arrival recording, and non-streaming completion.

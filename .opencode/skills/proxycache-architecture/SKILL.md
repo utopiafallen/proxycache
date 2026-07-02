@@ -32,10 +32,12 @@ This means the cache key is **known at slot acquisition time**, before the respo
 1. **Tokenize on each backend**: Each backend applies its chat template and tokenizes the messages
 2. **Compute block hashes**: `hs.block_hashes_from_tokens(opt_token_ids, WORDS_PER_BLOCK)`
 3. **Disk scan**: `kv_meta.find_best_restore_candidate()` scans disk meta files for best cache hit
-4. **Pending slot scan**: Iterate `_slot_kv_state` for the same model+backend, compute LCP ratio against request blocks. If a pending slot has a better ratio than the disk hit, use it instead.
+4. **Pending slot scan**: Iterate `_slot_kv_state` for the same model+backend, compute LCP ratio against request blocks. If a pending slot has a better ratio than the disk hit, use it instead. **Clears `restore_key`** — the slot already has the KV content in its cache, so no restore is needed.
 5. **Select best match**: Use the candidate with the highest LCP ratio
 
 The cache hit scan lives in the chat handler in `app.py`, between model resolution and slot acquisition. The pending slot scan runs inside the same per-backend loop as the disk scan, so it uses the correct `blocks` for each backend's tokenizer.
+
+**Pending slot hit semantics**: When a pending slot is found, the slot's KV cache already contains the relevant content (from the previous request that filled it). Setting `restore_key` would cause a failed restore attempt against a non-existent cache file. The code explicitly sets `restore_key = None` to skip the restore — the request proceeds directly with the slot's existing KV cache.
 
 ## Slot Acquisition Flow (`acquire_for_request`)
 
@@ -90,6 +92,7 @@ When a request completes and starts saving, subsequent requests that arrive duri
 - **`invalidate_slot()` clears `_slot_kv_state`**: Called on cancellation/failure in `app.py:_cleanup()` before `release()`.
 - **Ring buffer eviction is per-backend**: Uses `CACHE_MAX_SIZE_GB` per backend (default 25 GB). Evicts age-first, then LRU.
 - **Pending slot scan uses per-backend blocks**: The scan runs inside the per-backend loop in `app.py`, so `blocks` always matches the current backend's tokenizer output.
+- **Pending slot hit clears `restore_key`**: The cache hit scan iterates backends in a loop — a disk hit on backend A sets `restore_key`, then a pending slot hit on backend B must clear it. Leaving the stale key causes a failed restore attempt against a cache file that doesn't exist on backend B.
 
 ## Key Functions
 
