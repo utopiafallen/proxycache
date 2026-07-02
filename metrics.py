@@ -311,10 +311,9 @@ class MetricsCollector:
                     r.pop("full_request_json", None)
 
     def get_requests(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """Get recent requests with full JSON payload."""
+        """Get recent requests with full JSON payload. Newest first."""
         with self._lock:
-            requests = list(self._requests)
-        total = len(requests)
+            requests = list(reversed(self._requests))
         sliced = requests[offset:offset + limit]
         return sliced
 
@@ -324,10 +323,9 @@ class MetricsCollector:
             return len(self._requests)
 
     def get_requests_summary(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """Get recent requests without full JSON payload."""
+        """Get recent requests without full JSON payload. Newest first."""
         with self._lock:
-            requests = list(self._requests)
-        total = len(requests)
+            requests = list(reversed(self._requests))
         sliced = requests[offset:offset + limit]
         return [{"timestamp": r["timestamp"], "model": r["model"], "backend": r["backend"],
                   "slot_id": r["slot_id"], "cache_hit": r["cache_hit"],

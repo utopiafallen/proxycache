@@ -746,8 +746,6 @@ function _doRenderFilteredRequests() {
     el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No matching requests</p>';
     return;
   }
-  // Reverse to show newest first
-  filtered = [...filtered].reverse();
   let html = '';
   for (const req of filtered) {
     const badgeClass = req.recompute ? 'recompute' : (req.cache_hit ? 'hit' : 'miss');
