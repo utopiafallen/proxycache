@@ -401,20 +401,8 @@ class StreamReader:
                 if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
                     recompute_happened = True
 
-            from metrics import metrics as _metrics
-            prompt_preview = ""
-            if self._request_json:
-                messages = self._request_json.get("messages", [])
-                for msg in reversed(messages):
-                    if msg.get("role") in ("user", "assistant"):
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            prompt_preview = content[:200]
-                        elif isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "text":
-                                    prompt_preview = c["text"][:200]
-                        break
+            from metrics import metrics as _metrics, extract_prompt_preview
+            prompt_preview = extract_prompt_preview(self._request_json)
             _metrics.record({
                 "request_id": self._request_id,
                 "t0": self._t0,
@@ -510,18 +498,8 @@ async def chat(req: Request):
 
     # Generate request ID and record arrival immediately (two-phase metrics)
     request_id = str(uuid.uuid4())
-    # Extract prompt preview for initial record
-    prompt_preview = ""
-    for msg in reversed(messages):
-        if msg.get("role") in ("user", "assistant"):
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                prompt_preview = content[:200]
-            elif isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "text":
-                        prompt_preview = c["text"][:200]
-            break
+    from metrics import extract_prompt_preview
+    prompt_preview = extract_prompt_preview(request_json)
     try:
         from metrics import metrics as _metrics
         _metrics.record({
@@ -601,7 +579,7 @@ async def chat(req: Request):
                     ratio = lcp / denom
                     if ratio > best_ratio:
                         best_ratio = ratio
-                        restore_key = hs.meta_key(opt.name, opt_token_ids)
+                        restore_key = None  # clear — slot already has KV content, and old key may point to a different backend
                         restore_backend = be_id
                         canonical_name = opt.name
                         pending_slot_hit = True
@@ -777,19 +755,8 @@ async def chat(req: Request):
                 sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens, restored, best_ratio, recompute_happened)
 
             # Record metrics for non-streaming requests
-            from metrics import metrics as _metrics
-            prompt_preview = ""
-            messages = request_json.get("messages", [])
-            for msg in reversed(messages):
-                if msg.get("role") in ("user", "assistant"):
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        prompt_preview = content[:200]
-                    elif isinstance(content, list):
-                        for c in content:
-                            if isinstance(c, dict) and c.get("type") == "text":
-                                prompt_preview = c["text"][:200]
-                    break
+            from metrics import metrics as _metrics, extract_prompt_preview
+            prompt_preview = extract_prompt_preview(request_json)
             _metrics.record({
                 "request_id": request_id,
                 "t0": t0,
