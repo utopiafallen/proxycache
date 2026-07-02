@@ -892,12 +892,29 @@ document.addEventListener('click', (e) => {
   const btn = e.target.closest('.copy-json-btn');
   if (btn) {
     const json = decodeURIComponent(btn.dataset.json);
-    navigator.clipboard.writeText(json).then(() => {
+    const copy = () => {
       btn.textContent = 'Copied!';
       setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
-    });
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(json).then(copy).catch(() => {
+        fallbackCopy(json, copy);
+      });
+    } else {
+      fallbackCopy(json, copy);
+    }
   }
 });
+
+function fallbackCopy(text, onSuccess) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); onSuccess(); } catch { /* ignore */ }
+  document.body.removeChild(ta);
+}
 
 // Initial fetch and start auto-refresh
 fetchMetrics();
