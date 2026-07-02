@@ -29,6 +29,38 @@ from config import METRICS_RETENTION
 
 log = logging.getLogger(__name__)
 
+EXTRACT_PREVIEW_MAX_LEN = 200
+
+
+def extract_prompt_preview(request_json: dict) -> str:
+    """Extract a prompt preview string from a chat request JSON.
+
+    Scans messages in reverse order, returning the text content of the most
+    recent user or assistant message with non-empty content. Skips assistant
+    messages with empty content (e.g. model turn completions).
+
+    Args:
+        request_json: The full request body containing a "messages" list.
+
+    Returns:
+        A preview string (up to 200 chars), or empty string if no suitable
+        message is found.
+    """
+    if not request_json:
+        return ""
+    messages = request_json.get("messages", [])
+    for msg in reversed(messages):
+        if msg.get("role") in ("user", "assistant"):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if content.strip():
+                    return content[:EXTRACT_PREVIEW_MAX_LEN]
+            elif isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip():
+                        return c["text"][:EXTRACT_PREVIEW_MAX_LEN]
+    return ""
+
 
 class MetricsCollector:
     """Thread-safe in-memory metrics collector.
@@ -114,19 +146,7 @@ class MetricsCollector:
         # Extract prompt_preview from request_json if not provided
         prompt_preview = ctx.get("prompt_preview", "")
         if not prompt_preview:
-            request_json = ctx.get("request_json", {})
-            if request_json:
-                messages = request_json.get("messages", [])
-                for msg in reversed(messages):
-                    if msg.get("role") in ("user", "assistant"):
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            prompt_preview = content[:200]
-                        elif isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "text":
-                                    prompt_preview = c["text"][:200]
-                        break
+            prompt_preview = extract_prompt_preview(ctx.get("request_json", {}))
 
         # Build request record from ctx, overriding with computed values
         record = {
