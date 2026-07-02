@@ -2658,6 +2658,68 @@ def test_metrics_collector_per_backend():
     print("PASS: test_metrics_collector_per_backend")
 
 
+def test_metrics_collector_two_phase_recording():
+    """MetricsCollector should support two-phase recording with request_id matching."""
+    from metrics import MetricsCollector
+
+    m = MetricsCollector(retention=10)
+
+    # Phase 1: arrival record (incomplete) with request_json and prompt_preview
+    m.record({
+        "request_id": "req-1",
+        "request_json": {"model": "test", "messages": [{"role": "user", "content": "hello world"}]},
+        "model": "test",
+        "stream": True,
+        "status": "incomplete",
+        "prompt_preview": "hello world",
+    })
+
+    # Phase 2: completion record (complete) — should update in-place
+    m.record({
+        "request_id": "req-1",
+        "t0": 1000.0,
+        "model": "test", "backend": "be1", "slot_id": 0,
+        "cache_hit": True, "restored": True, "recompute": False,
+        "saved": True, "latency_ms": 100.0, "n_tokens": 10, "cache_size_bytes": 1024,
+        "status": "complete",
+    })
+
+    # Should have exactly 1 request (updated in-place, not appended)
+    requests = m.get_requests()
+    assert len(requests) == 1, f"Expected 1 request, got {len(requests)}"
+    assert requests[0]["request_id"] == "req-1"
+    assert requests[0]["status"] == "complete"
+    assert requests[0]["cache_hit"] is True
+    assert requests[0]["latency_ms"] == 100.0
+    assert requests[0]["stream"] is True
+    # prompt_preview should be preserved from arrival record
+    assert requests[0]["prompt_preview"] == "hello world"
+
+    # Performance should count this request
+    perf = m.get_performance()
+    assert perf["total_requests"] == 1
+    assert perf["cache_hits"] == 1
+
+    # Incomplete request should be visible
+    incomplete = [r for r in requests if r.get("status") != "complete"]
+    assert len(incomplete) == 0
+
+    # Add an incomplete request and verify it's counted
+    m.record({
+        "request_id": "req-2",
+        "request_json": {"model": "test", "messages": [{"role": "user", "content": "incomplete request"}]},
+        "model": "test",
+        "stream": False,
+        "status": "incomplete",
+        "prompt_preview": "incomplete request",
+    })
+
+    summary = m.get_summary()
+    assert summary["incomplete_count"] == 1
+
+    print("PASS: test_metrics_collector_two_phase_recording")
+
+
 def test_dashboard_endpoint():
     """Dashboard endpoint should return HTML when enabled."""
     from unittest.mock import patch
@@ -2805,6 +2867,7 @@ if __name__ == "__main__":
     test_metrics_collector_ring_overflow()
     test_metrics_collector_per_model()
     test_metrics_collector_per_backend()
+    test_metrics_collector_two_phase_recording()
     test_dashboard_endpoint()
 
     print("\nAll smoke tests passed.")

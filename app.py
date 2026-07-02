@@ -27,6 +27,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 import logging
 from collections import deque
 from typing import List, Dict, AsyncGenerator, Optional
@@ -109,7 +110,8 @@ class StreamReader:
                  key: str, n_tokens: int, blocks: List[str],
                  sm: SlotManager, best_ratio: float = 0.0, restored: bool = False,
                  restore_key: Optional[str] = None, restore_backend: Optional[str] = None,
-                 t0: float = 0, request_json: Optional[Dict] = None):
+                 t0: float = 0, request_json: Optional[Dict] = None,
+                 request_id: Optional[str] = None, routing_reason: str = "cache_miss"):
         self.resp = resp
         self.req = req
         self.model_name = model_name
@@ -125,6 +127,8 @@ class StreamReader:
         self.restore_backend = restore_backend
         self._t0 = t0
         self._request_json = request_json
+        self._request_id = request_id
+        self._routing_reason = routing_reason
         self.queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
         self._cancelled = False
         self._stream_complete = False
@@ -412,6 +416,7 @@ class StreamReader:
                                     prompt_preview = c["text"][:200]
                         break
             _metrics.record({
+                "request_id": self._request_id,
                 "t0": self._t0,
                 "request_json": self._request_json or {},
                 "model": self.model_name,
@@ -427,6 +432,8 @@ class StreamReader:
                 "stream": True,
                 "cache_size_bytes": cache_size,
                 "prompt_preview": prompt_preview,
+                "routing_reason": self._routing_reason,
+                "status": "complete",
             })
 
         log.info("Stream reader finished for model '%s' on backend '%s' slot %d (key %s): saved=%s",
@@ -501,6 +508,33 @@ async def chat(req: Request):
     stream = bool(data.get("stream", False))
     client_model = data.get("model") or MODEL_ID
 
+    # Generate request ID and record arrival immediately (two-phase metrics)
+    request_id = str(uuid.uuid4())
+    # Extract prompt preview for initial record
+    prompt_preview = ""
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                prompt_preview = content[:200]
+            elif isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        prompt_preview = c["text"][:200]
+            break
+    try:
+        from metrics import metrics as _metrics
+        _metrics.record({
+            "request_id": request_id,
+            "request_json": request_json,
+            "model": client_model,
+            "stream": stream,
+            "status": "incomplete",
+            "prompt_preview": prompt_preview,
+        })
+    except Exception as e:
+        log.warning("Failed to record request arrival for request_id=%s: %s", request_id, e)
+
     try:
         # 1. Resolve model name
         options = backend_manager.get_discovered_models(client_model)
@@ -534,6 +568,7 @@ async def chat(req: Request):
         best_ratio = 0.0
         key = None
         blocks = None
+        pending_slot_hit = False
         for opt in options:
             for be_id in opt.backends:
                 opt_client = backend_manager.get_client(be_id)
@@ -553,6 +588,7 @@ async def chat(req: Request):
                     canonical_name = opt.name
                     key = hs.meta_key(opt.name, opt_token_ids)
                     blocks = opt_blocks
+                    pending_slot_hit = False
                     log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
                              restore_key[:16], canonical_name, restore_backend, best_ratio)
 
@@ -568,6 +604,7 @@ async def chat(req: Request):
                         restore_key = hs.meta_key(opt.name, opt_token_ids)
                         restore_backend = be_id
                         canonical_name = opt.name
+                        pending_slot_hit = True
                         log.info("Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
                                  canonical_name, restore_backend, g[2], ratio)
 
@@ -604,6 +641,19 @@ async def chat(req: Request):
 
     model_name, be_id, slot_id = g
     client = backend_manager.get_client(be_id)
+
+    # Determine routing reason for metrics
+    if restore_key and restore_backend and be_id == restore_backend:
+        if pending_slot_hit:
+            routing_reason = "pending_slot_hit"
+        else:
+            routing_reason = "cache_hit"
+    elif key is None:
+        # No cache entry found at all (key generated from first_token_ids as fallback)
+        routing_reason = "no_cache_entry"
+    else:
+        # Cache hit found but different backend was used (backend unavailable/busy)
+        routing_reason = "cache_backend_unavailable"
 
     # Fallback: if no cache hit found, generate key/blocks from the serving backend's model name
     if key is None:
@@ -654,7 +704,8 @@ async def chat(req: Request):
 
             reader = StreamReader(resp, req, model_name, be_id, slot_id,
                                   key, prompt_tokens, blocks, sm, best_ratio, restored,
-                                  restore_key, restore_backend, t0=t0, request_json=request_json)
+                                  restore_key, restore_backend, t0=t0, request_json=request_json,
+                                  request_id=request_id, routing_reason=routing_reason)
             gen = reader.stream()
             _reader_created = True
 
@@ -740,6 +791,7 @@ async def chat(req: Request):
                                 prompt_preview = c["text"][:200]
                     break
             _metrics.record({
+                "request_id": request_id,
                 "t0": t0,
                 "request_json": request_json,
                 "model": model_name,
@@ -755,6 +807,8 @@ async def chat(req: Request):
                 "stream": False,
                 "cache_size_bytes": cache_size if ok else 0,
                 "prompt_preview": prompt_preview,
+                "routing_reason": routing_reason,
+                "status": "complete",
             })
 
             # log.info(
@@ -832,7 +886,7 @@ async def metrics_requests(limit: int = 100, offset: int = 0):
     """Recent requests with full JSON payload."""
     from metrics import metrics as _metrics
     requests = _metrics.get_requests(limit=limit, offset=offset)
-    return {"requests": requests, "total": len(requests)}
+    return {"requests": requests, "total": _metrics.get_total_count()}
 
 
 @app.get("/metrics/performance")
