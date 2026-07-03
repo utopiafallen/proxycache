@@ -939,6 +939,15 @@ async def metrics_requests(limit: int = 100, offset: int = 0):
     return {"requests": requests, "total": metrics.get_total_count()}
 
 
+@app.get("/metrics/request/{request_id}")
+async def metrics_request_by_id(request_id: str):
+    """Fetch a single request by its UUID."""
+    req = metrics.get_request_by_id(request_id)
+    if req is None:
+        return JSONResponse({"error": "Request not found"}, status_code=404)
+    return req
+
+
 @app.get("/metrics/performance")
 async def metrics_performance(model: str = None, backend: str = None):
     """Cache performance metrics."""

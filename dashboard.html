@@ -814,6 +814,10 @@ function _doRenderFilteredRequests() {
         return `<div class="request-preview" style="display:flex;align-items:center;gap:8px;"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">"${req.prompt_preview || ''}${(req.prompt_preview || '').length >= 200 ? '...' : ''}"</span><button class="copy-json-btn" data-json="${encodeURIComponent(jsonStr)}" style="font-size:11px;padding:2px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--text);cursor:pointer;flex-shrink:0;">Copy</button></div>`;
       })() : preview}
       ${metricsHtml ? `<div class="request-footer" style="font-size:12px;color:var(--text-secondary);padding:4px 10px;border-top:1px solid var(--border);">${metricsHtml}</div>` : ''}
+      <div class="request-footer" style="font-size:11px;color:var(--text-secondary);padding:3px 10px;border-top:1px solid var(--border);display:flex;align-items:center;gap:6px;">
+        <span style="font-family:var(--mono);opacity:0.7;">${req.request_id || '-'}</span>
+        <button class="copy-json-btn" data-json="${encodeURIComponent(req.request_id || '')}" style="font-size:10px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--text);cursor:pointer;flex-shrink:0;">Copy UUID</button>
+      </div>
       <div class="request-body ${bodyOpen}" data-timestamp="${req.timestamp}">${fullJson}</div>
     </div>`;
   }

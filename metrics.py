@@ -304,6 +304,14 @@ class MetricsCollector:
                         bc["save_skipped"] += 1
 
 
+    def get_request_by_id(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single request by its UUID."""
+        with self._lock:
+            idx = self._by_id.get(request_id)
+            if idx is not None:
+                return self._requests[idx]
+        return None
+
     def get_requests(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """Get recent requests with full JSON payload. Newest first."""
         with self._lock:
