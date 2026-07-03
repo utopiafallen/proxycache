@@ -23,12 +23,15 @@ python test_smoke.py                           # smoke tests (no framework, uses
 |------|------|
 | `proxycache.py` | 13-line uvicorn entry point — **not** where main logic lives |
 | `app.py` | FastAPI app, routes, streaming pipeline, request handling |
-| `backend_manager.py` | Singleton: backend registry, LlamaClient/CacheAgentClient instances, model-to-backend mapping, refresh cooldowns |
+| `backend_manager.py` | Singleton: backend registry, LlamaClient/CacheAgentClient instances, model-to-backend mapping, refresh cooldowns, liveness checker |
 | `config.py` | All config via env vars (no .env file) |
-| `hashing.py` | Text → word-block hashing, LCP matching, meta I/O, reconciliation |
+| `hashing.py` | Hashing primitives: block hashes from tokens, LCP matching, cache key generation, backend key sanitization |
+| `kv_meta_manager.py` | All meta I/O: read/write/delete `.meta.json`, scan, reconcile, find restore candidates |
 | `llama_client.py` | httpx client to llama.cpp; slot save/restore, router mode slot discovery |
 | `slot_manager.py` | Per-model slot pools, ring buffer eviction, KV cache skip logic, cache hit wait queue |
 | `cache_agent_client.py` | HTTP client for remote cache file deletion |
+| `metrics.py` | In-memory metrics collector with two-phase recording (arrival/completion), ring buffer, per-model/backend counters |
+| `dashboard.html` | Metrics dashboard served at `/dashboard` (toggle via `DASHBOARD_ENABLED`) |
 | `cache-agent/` | Go cache agent (lightweight HTTP server for remote cache deletion) |
 | `kv_meta/` | Per-cache `.meta.json` files (gitignored) |
 
@@ -45,11 +48,14 @@ python test_smoke.py                           # smoke tests (no framework, uses
 - **Slot timeout**: `SLOT_TIMEOUT` (default 30s) wraps `/slots/{id}?action=save|restore`. Separate from `REQUEST_TIMEOUT` (600s).
 - **Cache hit wait queue**: when a cache-hit request's backend has no free slots, Phase 0 waits up to an EMA-derived timeout (`CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT`, default 30s) on a per-backend semaphore. On slot release, the EMA is updated with actual occupancy duration and one waiter is woken. Clamped between `CACHE_HIT_WAIT_EMA_MIN_TIMEOUT` (10s) and `CACHE_HIT_WAIT_EMA_MAX_TIMEOUT` (300s). Max concurrent waiters per backend: `CACHE_HIT_WAIT_MAX_PENDING_REQS` (3). Falls through to normal retry loop on timeout.
 - **KV cache skip**: `acquire_for_request` checks `_slot_kv_state` before restoring. If slot's tracked KV cache blocks have LCP ratio >= `KV_CACHE_SKIP_THRESHOLD` (default 0.9), restore is skipped — llama.cpp appends to existing cache. Only safe on single-slot backends.
+- **Cache save skip**: `should_save_cache()` in `config.py` skips save when restore candidate ratio >= `CACHE_SAVE_RATIO_THRESHOLD` (default 0.8) and no recompute happened — avoids saving redundant cache entries.
 - **Ring buffer eviction**: `SlotManager` evicts expired entries (age-first) then LRU when `_total_bytes > backend.cache_max_size_gb * 1024**3`. Per-backend, defaults to 25 GB. Only triggers on saves.
 - **Slot refresh cooldown**: 300s per (model, backend) pair on success, 30s on failure. On-demand discovery via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode). Falls back to 1 slot if discovery fails.
 - **Meta reconciliation**: on startup, orphaned/corrupted `.meta.json` files are deleted via `reconcile_meta()`.
 - **Backend config validation**: each backend MUST specify exactly one of `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). Mutually exclusive. Missing either raises `ValueError` at startup.
 - **BACKENDS default**: when empty, defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`.
+- **Liveness checker**: pings backends every 5s, triggers model discovery and slot refresh on state change.
+- **Model resolution**: exact match → substring match (case-insensitive) → `"any"` matches all discovered models.
 - `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, `run-proxycache.ps1`, `uv.lock`, and `cache-agent.exe`.
 
 ## Writing Skills
