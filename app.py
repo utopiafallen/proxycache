@@ -875,7 +875,7 @@ async def metrics_summary():
     # Per-backend performance
     backend_perf = {}
     for be_id in summary["backends"]:
-        bp = _metrics.get_performance(backend=be_id)
+        bp = metrics.get_performance(backend=be_id)
         if bp.get("total_requests", 0) > 0:
             backend_perf[be_id] = bp
     summary["backend_performance"] = backend_perf
