@@ -448,8 +448,10 @@ let scrollPositions = {};
 function togglePanel(header) {
   const body = header.nextElementSibling;
   const toggle = header.querySelector('.toggle');
+  const title = header.querySelector('h2').textContent;
   body.classList.toggle('collapsed');
   toggle.classList.toggle('collapsed');
+  localStorage.setItem('proxycache_panel_' + title, body.classList.contains('collapsed') ? '1' : '0');
 }
 
 function setFilter(filter, btn) {
@@ -928,6 +930,18 @@ function fallbackCopy(text, onSuccess) {
   try { document.execCommand('copy'); onSuccess(); } catch { /* ignore */ }
   document.body.removeChild(ta);
 }
+
+// Restore panel open/closed state
+document.querySelectorAll('.panel-header').forEach(header => {
+  const title = header.querySelector('h2').textContent;
+  const collapsed = localStorage.getItem('proxycache_panel_' + title) === '1';
+  if (collapsed) {
+    const body = header.nextElementSibling;
+    const toggle = header.querySelector('.toggle');
+    body.classList.add('collapsed');
+    toggle.classList.add('collapsed');
+  }
+});
 
 // Initial fetch and start auto-refresh
 fetchMetrics();
