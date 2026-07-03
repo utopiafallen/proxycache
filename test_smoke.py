@@ -2540,9 +2540,11 @@ def test_metrics_collector_basic():
 
     requests = m.get_requests()
     assert len(requests) == 3
-    assert requests[0]["prompt_preview"] == "hello"
-    # full_request_json is only stored for last ~20% of entries (2 of 3 with retention=10)
-    assert requests[2]["full_request_json"] == {"model": "test", "messages": [{"role": "user", "content": "foo"}]}
+    # get_requests() returns newest-first
+    assert requests[0]["prompt_preview"] == "foo"
+    assert requests[2]["prompt_preview"] == "hello"
+    assert requests[0]["full_request_json"] == {"model": "test", "messages": [{"role": "user", "content": "foo"}]}
+    assert requests[2]["full_request_json"] == {"model": "test", "messages": [{"role": "user", "content": "hello"}]}
 
     print("PASS: test_metrics_collector_basic")
 
@@ -2589,9 +2591,9 @@ def test_metrics_collector_ring_overflow():
 
     requests = m.get_requests()
     assert len(requests) == 5
-    # Should have the last 5 entries (i=5..9)
-    # With retention=5, max_full=1, so only the last entry has full_request_json
-    assert requests[4]["full_request_json"]["i"] == 9
+    # Should have the last 5 entries (i=5..9), newest-first
+    assert requests[0]["full_request_json"]["i"] == 9
+    assert requests[4]["full_request_json"]["i"] == 5
 
     # Total counters should reflect all 10 records
     perf = m.get_performance()
