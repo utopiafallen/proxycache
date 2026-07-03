@@ -418,7 +418,7 @@ header .controls select, header .controls button {
         <span style="color:var(--text-secondary);font-weight:600;">Routing:</span>
         <span class="request-badge hit" style="font-size:10px;">DISK HIT</span><span style="color:var(--text-secondary);">cache restored</span>
         <span class="request-badge hit" style="font-size:10px;">PENDING HIT</span><span style="color:var(--text-secondary);">in-flight slot</span>
-        <span class="request-badge recompute" style="font-size:10px;">DISK HIT · RECOMPUTE</span><span style="color:var(--text-secondary);">restore was useless</span>
+        <span class="request-badge recompute" style="font-size:10px;">DISK HIT / RECOMPUTE</span><span style="color:var(--text-secondary);">restore was useless</span>
         <span class="request-badge miss" style="font-size:10px;">NO ENTRY</span><span style="color:var(--text-secondary);">no cache entry</span>
         <span class="request-badge miss" style="font-size:10px;">BACKEND UNAVAIL</span><span style="color:var(--text-secondary);">backend busy</span>
       </div>
@@ -767,7 +767,7 @@ function _doRenderFilteredRequests() {
     const statusBadge = req.status && req.status !== 'complete' ? `<span class="request-badge ${req.status}" style="font-size:10px;">${req.status.toUpperCase().replace('_', ' ')}</span>` : '';
     const routingReason = req.routing_reason || 'no_cache_entry';
     const routingLabel = {
-      'cache_hit': req.recompute ? 'DISK HIT · RECOMPUTE' : 'DISK HIT',
+      'cache_hit': req.recompute ? 'DISK HIT / RECOMPUTE' : 'DISK HIT',
       'pending_slot_hit': 'PENDING HIT',
       'no_cache_entry': 'NO ENTRY',
       'cache_backend_unavailable': 'BACKEND UNAVAIL',
