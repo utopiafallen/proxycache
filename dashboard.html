@@ -436,7 +436,7 @@ let currentFilter = 'all';
 let currentBackendFilter = '';
 let allRequests = [];
 let expandedRequests = new Set();
-let currentPage = 1;
+let currentPage = parseInt(localStorage.getItem('proxycache_requests_page')) || 1;
 const PAGE_SIZE = 20;
 let totalRequestCount = 0;
 let scrollPositions = {};
@@ -505,6 +505,19 @@ async function refreshRequests() {
     if (!resp.ok) return;
     const data = await resp.json();
     totalRequestCount = data.total || 0;
+    const maxPage = Math.max(1, Math.ceil(totalRequestCount / PAGE_SIZE));
+    if (currentPage > maxPage) {
+      currentPage = maxPage;
+      localStorage.setItem('proxycache_requests_page', currentPage);
+      const newOffset = (currentPage - 1) * PAGE_SIZE;
+      const resp2 = await fetch(API_BASE + `/metrics/requests?limit=${PAGE_SIZE}&offset=${newOffset}`);
+      if (resp2.ok) {
+        const data2 = await resp2.json();
+        renderRequests(data2.requests || [], totalRequestCount);
+        updatePageInfo();
+        return;
+      }
+    }
     renderRequests(data.requests || [], totalRequestCount);
     updatePageInfo();
   } catch (e) {
@@ -515,6 +528,7 @@ async function refreshRequests() {
 function changePage(delta) {
   const maxPage = Math.ceil(totalRequestCount / PAGE_SIZE);
   currentPage = Math.max(1, Math.min(currentPage + delta, maxPage));
+  localStorage.setItem('proxycache_requests_page', currentPage);
   refreshRequests();
 }
 
