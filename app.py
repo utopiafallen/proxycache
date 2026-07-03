@@ -45,6 +45,7 @@ from config import (BACKENDS, WORDS_PER_BLOCK,
 
 import hashing as hs
 from slot_manager import SlotManager
+from metrics import metrics, extract_prompt_preview
 
 log = logging.getLogger(__name__)
 
@@ -401,9 +402,8 @@ class StreamReader:
                 if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
                     recompute_happened = True
 
-            from metrics import metrics as _metrics, extract_prompt_preview
             prompt_preview = extract_prompt_preview(self._request_json)
-            _metrics.record({
+            metrics.record({
                 "request_id": self._request_id,
                 "t0": self._t0,
                 "request_json": self._request_json or {},
@@ -498,11 +498,9 @@ async def chat(req: Request):
 
     # Generate request ID and record arrival immediately (two-phase metrics)
     request_id = str(uuid.uuid4())
-    from metrics import extract_prompt_preview
     prompt_preview = extract_prompt_preview(request_json)
     try:
-        from metrics import metrics as _metrics
-        _metrics.record({
+        metrics.record({
             "request_id": request_id,
             "request_json": request_json,
             "model": client_model,
@@ -641,6 +639,21 @@ async def chat(req: Request):
     log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s, save_key='%s', canonical_name='%s'",
              model_name, be_id, slot_id, restored, key[:16], canonical_name)
 
+    # Update arrival record with routing decision
+    try:
+        metrics.record({
+            "request_id": request_id,
+            "model": model_name,
+            "backend": be_id,
+            "slot_id": slot_id,
+            "routing_reason": routing_reason,
+            "cache_hit": bool(restore_key) or pending_slot_hit,
+            "restored": restored,
+            "status": "incomplete",
+        })
+    except Exception as e:
+        log.warning("Failed to record routing decision for request_id=%s: %s", request_id, e)
+
     # Forward canonical name to backend
     body = dict(data)
     body["model"] = canonical_name
@@ -754,9 +767,8 @@ async def chat(req: Request):
                 sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens, restored, best_ratio, recompute_happened)
 
             # Record metrics for non-streaming requests
-            from metrics import metrics as _metrics, extract_prompt_preview
             prompt_preview = extract_prompt_preview(request_json)
-            _metrics.record({
+            metrics.record({
                 "request_id": request_id,
                 "t0": t0,
                 "request_json": request_json,
@@ -814,8 +826,7 @@ async def chat(req: Request):
 @app.get("/metrics/summary")
 async def metrics_summary():
     """Full summary for the dashboard."""
-    from metrics import metrics as _metrics
-    summary = _metrics.get_summary()
+    summary = metrics.get_summary()
     summary["backends"] = _get_backend_health()
     summary["slots"] = _get_slot_status()
     summary["cache"] = _get_cache_stats()
@@ -850,16 +861,14 @@ async def metrics_cache():
 @app.get("/metrics/requests")
 async def metrics_requests(limit: int = 100, offset: int = 0):
     """Recent requests with full JSON payload."""
-    from metrics import metrics as _metrics
-    requests = _metrics.get_requests(limit=limit, offset=offset)
-    return {"requests": requests, "total": _metrics.get_total_count()}
+    requests = metrics.get_requests(limit=limit, offset=offset)
+    return {"requests": requests, "total": metrics.get_total_count()}
 
 
 @app.get("/metrics/performance")
 async def metrics_performance(model: str = None, backend: str = None):
     """Cache performance metrics."""
-    from metrics import metrics as _metrics
-    perf = _metrics.get_performance(model=model, backend=backend)
+    perf = metrics.get_performance(model=model, backend=backend)
     return perf
 
 
