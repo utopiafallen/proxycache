@@ -524,6 +524,12 @@ async def chat(req: Request):
             await backend_manager.discover_models()
             options = backend_manager.get_discovered_models(client_model)
             if not options:
+                metrics.record({
+                    "request_id": request_id,
+                    "model": client_model,
+                    "latency_ms": (time.time() - t0) * 1000,
+                    "status": "backend_error",
+                })
                 return JSONResponse({"error": f"model '{client_model}' not found"}, status_code=400)
 
         # 2. Apply chat template + tokenize, then scan for cache hits
@@ -535,10 +541,22 @@ async def chat(req: Request):
         except httpx.ConnectError:
             log.error("Failed to connect to backend %s for model '%s' from client %s",
                       first_opt.backends[0], client_model, client_ip)
+            metrics.record({
+                "request_id": request_id,
+                "model": client_model,
+                "latency_ms": (time.time() - t0) * 1000,
+                "status": "backend_error",
+            })
             return JSONResponse({"error": "backend unreachable"}, status_code=503)
         prompt_tokens = len(first_token_ids)
         min_ctx = min(opt.n_ctx for opt in options)
         if prompt_tokens >= min_ctx:
+            metrics.record({
+                "request_id": request_id,
+                "model": client_model,
+                "latency_ms": (time.time() - t0) * 1000,
+                "status": "backend_error",
+            })
             return JSONResponse(
                 {"error": f"prompt too long (tokens={prompt_tokens}, n_ctx={min_ctx})"},
                 status_code=400,
@@ -619,6 +637,12 @@ async def chat(req: Request):
         )
     except (asyncio.TimeoutError, RuntimeError) as e:
         log.error("Could not acquire slot from client %s for model '%s': %s", client_ip, client_model, e)
+        metrics.record({
+            "request_id": request_id,
+            "model": client_model,
+            "latency_ms": (time.time() - t0) * 1000,
+            "status": "backend_error",
+        })
         return JSONResponse({"error": "all slots busy, please retry later"}, status_code=503)
 
     model_name, be_id, slot_id = g
@@ -731,6 +755,15 @@ async def chat(req: Request):
                 stream=False,
             )
             if not isinstance(out, dict):
+                metrics.record({
+                    "request_id": request_id,
+                    "model": model_name,
+                    "backend": be_id,
+                    "slot_id": slot_id,
+                    "latency_ms": (time.time() - t0) * 1000,
+                    "routing_reason": routing_reason,
+                    "status": "backend_error",
+                })
                 return JSONResponse(
                     {"error": "provider non-JSON body"},
                     status_code=502,

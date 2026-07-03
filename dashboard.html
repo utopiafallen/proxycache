@@ -312,6 +312,7 @@ header .controls select, header .controls button {
 .request-badge.hit { background: var(--green-bg); color: var(--green); }
 .request-badge.miss { background: var(--yellow-bg); color: var(--yellow); }
 .request-badge.recompute { background: var(--red-bg); color: var(--red); }
+.request-badge.backend_unavail { background: var(--blue-bg); color: var(--blue); }
 .request-badge.incomplete { background: var(--blue-bg); color: var(--blue); }
 .request-badge.cancelled { background: var(--gray-bg); color: var(--gray); }
 .request-badge.backend_error { background: var(--red-bg); color: var(--red); }
@@ -420,7 +421,7 @@ header .controls select, header .controls button {
         <span class="request-badge hit" style="font-size:10px;">PENDING HIT</span><span style="color:var(--text-secondary);">in-flight slot</span>
         <span class="request-badge recompute" style="font-size:10px;">DISK HIT / RECOMPUTE</span><span style="color:var(--text-secondary);">restore was useless</span>
         <span class="request-badge miss" style="font-size:10px;">NO ENTRY</span><span style="color:var(--text-secondary);">no cache entry</span>
-        <span class="request-badge miss" style="font-size:10px;">BACKEND UNAVAIL</span><span style="color:var(--text-secondary);">backend busy</span>
+        <span class="request-badge backend_unavail" style="font-size:10px;">BACKEND UNAVAIL</span><span style="color:var(--text-secondary);">cache hit but backend busy, fell back</span>
       </div>
       <div id="requestsList"></div>
       <div style="display:flex;gap:8px;align-items:center;">
@@ -774,11 +775,11 @@ function _doRenderFilteredRequests() {
       'no_cache_entry': 'NO ENTRY',
       'cache_backend_unavailable': 'BACKEND UNAVAIL',
     }[routingReason] || routingReason.toUpperCase();
-    const routingClass = req.recompute ? 'recompute' : ({
-      'cache_hit': 'hit',
+    const routingClass = ({
+      'cache_hit': req.recompute ? 'recompute' : 'hit',
       'pending_slot_hit': 'hit',
       'no_cache_entry': 'miss',
-      'cache_backend_unavailable': 'miss',
+      'cache_backend_unavailable': 'backend_unavail',
     }[routingReason] || 'miss');
     const expanded = expandedRequests.has(req.timestamp) ? 'open' : '';
     const bodyOpen = expanded ? 'open' : '';
