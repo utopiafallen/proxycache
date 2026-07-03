@@ -403,6 +403,12 @@ class StreamReader:
                     recompute_happened = True
 
             prompt_preview = extract_prompt_preview(self._request_json)
+            if self._stream_complete:
+                stream_status = "complete"
+            elif self._cancelled:
+                stream_status = "cancelled"
+            else:
+                stream_status = "backend_error"
             metrics.record({
                 "request_id": self._request_id,
                 "t0": self._t0,
@@ -421,7 +427,7 @@ class StreamReader:
                 "cache_size_bytes": cache_size,
                 "prompt_preview": prompt_preview,
                 "routing_reason": self._routing_reason,
-                "status": "complete",
+                "status": stream_status,
             })
 
         log.info("Stream reader finished for model '%s' on backend '%s' slot %d (key %s): saved=%s",
@@ -687,6 +693,15 @@ async def chat(req: Request):
             if resp.status_code != 200:
                 err_txt = await resp.aread()
                 await resp.aclose()
+                metrics.record({
+                    "request_id": request_id,
+                    "model": model_name,
+                    "backend": be_id,
+                    "slot_id": slot_id,
+                    "latency_ms": (time.time() - t0) * 1000,
+                    "routing_reason": routing_reason,
+                    "status": "backend_error",
+                })
                 return JSONResponse(
                     {"error": err_txt.decode("utf-8", "ignore")},
                     status_code=resp.status_code,
@@ -806,15 +821,42 @@ async def chat(req: Request):
     except httpx.TimeoutException as e:
         log.exception("Chat timeout for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)
+        metrics.record({
+            "request_id": request_id,
+            "model": model_name,
+            "backend": be_id,
+            "slot_id": slot_id,
+            "latency_ms": (time.time() - t0) * 1000,
+            "routing_reason": routing_reason,
+            "status": "backend_error",
+        })
         return JSONResponse({"error": str(e)}, status_code=504)
     except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
         log.exception("Backend connection error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                       client_ip, model_name, be_id, slot_id, key[:16], e)
         sm.invalidate_slot(model_name, be_id, slot_id)
+        metrics.record({
+            "request_id": request_id,
+            "model": model_name,
+            "backend": be_id,
+            "slot_id": slot_id,
+            "latency_ms": (time.time() - t0) * 1000,
+            "routing_reason": routing_reason,
+            "status": "backend_error",
+        })
         return JSONResponse({"error": "backend connection failed"}, status_code=503)
     except Exception as e:
         log.exception("Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)
+        metrics.record({
+            "request_id": request_id,
+            "model": model_name,
+            "backend": be_id,
+            "slot_id": slot_id,
+            "latency_ms": (time.time() - t0) * 1000,
+            "routing_reason": routing_reason,
+            "status": "backend_error",
+        })
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
         if not _reader_created:

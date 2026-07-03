@@ -312,6 +312,9 @@ header .controls select, header .controls button {
 .request-badge.hit { background: var(--green-bg); color: var(--green); }
 .request-badge.miss { background: var(--yellow-bg); color: var(--yellow); }
 .request-badge.recompute { background: var(--red-bg); color: var(--red); }
+.request-badge.incomplete { background: var(--blue-bg); color: var(--blue); }
+.request-badge.cancelled { background: var(--gray-bg); color: var(--gray); }
+.request-badge.backend_error { background: var(--red-bg); color: var(--red); }
 .request-latency { color: var(--text-secondary); margin-left: auto; }
 .request-body {
   display: none;
@@ -413,8 +416,9 @@ header .controls select, header .controls button {
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0;padding:8px;background:var(--surface);border-radius:6px;font-size:11px;align-items:center;">
         <span style="color:var(--text-secondary);font-weight:600;">Routing:</span>
-        <span class="request-badge hit" style="font-size:10px;">DISK HIT</span><span style="color:var(--text-secondary);">disk cache hit</span>
+        <span class="request-badge hit" style="font-size:10px;">DISK HIT</span><span style="color:var(--text-secondary);">cache restored</span>
         <span class="request-badge hit" style="font-size:10px;">PENDING HIT</span><span style="color:var(--text-secondary);">in-flight slot</span>
+        <span class="request-badge recompute" style="font-size:10px;">DISK HIT · RECOMPUTE</span><span style="color:var(--text-secondary);">restore was useless</span>
         <span class="request-badge miss" style="font-size:10px;">NO ENTRY</span><span style="color:var(--text-secondary);">no cache entry</span>
         <span class="request-badge miss" style="font-size:10px;">BACKEND UNAVAIL</span><span style="color:var(--text-secondary);">backend busy</span>
       </div>
@@ -488,10 +492,7 @@ async function fetchMetrics() {
     renderCachePerformance(data.performance || {}, data.backend_performance || {});
     updateBackendFilter(data.backends || {});
     if (!expandedRequests.size) {
-      const savedPage = currentPage;
-      currentPage = 1;
       refreshRequests();
-      currentPage = savedPage;
     }
   } catch (e) {
     console.error('Failed to fetch metrics:', e);
@@ -763,21 +764,20 @@ function _doRenderFilteredRequests() {
   filtered.sort((a, b) => b.timestamp - a.timestamp);
   let html = '';
   for (const req of filtered) {
-    const badgeClass = req.recompute ? 'recompute' : (req.cache_hit ? 'hit' : 'miss');
-    const badgeText = req.recompute ? 'RECOMPUTE' : (req.cache_hit ? 'HIT' : 'MISS');
-    const routingReason = req.routing_reason || 'cache_miss';
+    const statusBadge = req.status && req.status !== 'complete' ? `<span class="request-badge ${req.status}" style="font-size:10px;">${req.status.toUpperCase().replace('_', ' ')}</span>` : '';
+    const routingReason = req.routing_reason || 'no_cache_entry';
     const routingLabel = {
-      'cache_hit': 'DISK HIT',
+      'cache_hit': req.recompute ? 'DISK HIT · RECOMPUTE' : 'DISK HIT',
       'pending_slot_hit': 'PENDING HIT',
       'no_cache_entry': 'NO ENTRY',
       'cache_backend_unavailable': 'BACKEND UNAVAIL',
     }[routingReason] || routingReason.toUpperCase();
-    const routingClass = {
+    const routingClass = req.recompute ? 'recompute' : ({
       'cache_hit': 'hit',
       'pending_slot_hit': 'hit',
       'no_cache_entry': 'miss',
       'cache_backend_unavailable': 'miss',
-    }[routingReason] || 'miss';
+    }[routingReason] || 'miss');
     const expanded = expandedRequests.has(req.timestamp) ? 'open' : '';
     const bodyOpen = expanded ? 'open' : '';
     const arrowOpen = expanded ? 'open' : '';
@@ -800,8 +800,8 @@ function _doRenderFilteredRequests() {
         <span class="request-model">${req.model}</span>
         <span class="request-backend">${req.backend}</span>
         <span class="request-slot">S${req.slot_id}</span>
-        <span class="request-badge ${badgeClass}">${badgeText}</span>
         <span class="request-badge ${routingClass}" style="font-size:10px;">${routingLabel}</span>
+        ${statusBadge}
         <span class="request-latency">${req.latency_ms.toFixed(0)}ms</span>
       </div>
       ${req.full_request_json ? (() => {
