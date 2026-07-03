@@ -597,8 +597,7 @@ async def chat(req: Request):
                     if g[0] != opt.name or g[1] != be_id:
                         continue
                     lcp = hs.lcp_blocks(opt_blocks, kv_blocks)
-                    denom = max(1, min(len(opt_blocks), len(kv_blocks)))
-                    ratio = lcp / denom
+                    ratio = lcp / len(opt_blocks)
                     if ratio > best_ratio:
                         best_ratio = ratio
                         restore_key = None  # clear — slot already has KV content, and old key may point to a different backend
