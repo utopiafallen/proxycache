@@ -302,13 +302,8 @@ class MetricsCollector:
                     elif saved is False:
                         bc["save_skipped"] += 1
 
-            # Add full_request_json to the record (for last ~20 entries)
-            max_full = max(1, self._retention // 5)
-            for i, r in enumerate(self._requests):
-                if i >= len(self._requests) - max_full:
-                    r["full_request_json"] = ctx.get("request_json", {})
-                else:
-                    r.pop("full_request_json", None)
+            # Add full_request_json to the new record
+            new_record["full_request_json"] = ctx.get("request_json", {})
 
     def get_requests(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """Get recent requests with full JSON payload. Newest first."""
@@ -458,7 +453,7 @@ class MetricsCollector:
     def get_summary(self) -> Dict[str, Any]:
         """Get a full summary for the dashboard."""
         perf = self.get_performance()
-        requests_full = self.get_requests(limit=self._retention // 5)
+        requests_full = self.get_requests(limit=self._retention)
         requests_summary = self.get_requests_summary(limit=self._retention)
 
         # Count incomplete requests
