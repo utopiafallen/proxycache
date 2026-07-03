@@ -238,6 +238,7 @@ class MetricsCollector:
                         bc["save_skipped"] += 1
             else:
                 # New request — append to ring buffer (deque auto-evicts oldest if full)
+                record["full_request_json"] = ctx.get("request_json", {})
                 self._requests.append(record)
 
                 # Rebuild _by_id indices after every append since deque auto-evicts
@@ -302,8 +303,6 @@ class MetricsCollector:
                     elif saved is False:
                         bc["save_skipped"] += 1
 
-            # Add full_request_json to the new record
-            new_record["full_request_json"] = ctx.get("request_json", {})
 
     def get_requests(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """Get recent requests with full JSON payload. Newest first."""
