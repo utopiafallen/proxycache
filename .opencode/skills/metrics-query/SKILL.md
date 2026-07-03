@@ -1,4 +1,9 @@
-# Skill: metrics-query
+---
+name: metrics-query
+description: Querying and parsing proxycache request history from the metrics dashboard. Use when querying metrics endpoints, analyzing request routing, or debugging cache hit/miss behavior.
+---
+
+# Metrics Query
 
 Querying and parsing proxycache request history from the metrics dashboard.
 
