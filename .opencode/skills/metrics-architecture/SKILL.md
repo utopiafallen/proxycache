@@ -10,11 +10,13 @@ description: Metrics collector with multi-phase request recording, routing reaso
 Requests flow through multiple recording phases, all updating the same ring buffer entry in-place via `request_id` matching.
 
 1. **Arrival**: `chat()` generates `request_id` (UUID), calls `record()` with `status="incomplete"`, `prompt_preview`, and `request_json`. The entry is appended to the ring buffer.
-2. **Routing**: After slot acquisition, `record()` updates the entry with resolved `model` (canonical name), `backend`, `slot_id`, `routing_reason`, `cache_hit`, `restored`. Status remains `"incomplete"`.
+2. **Routing**: After slot acquisition, `record()` updates the entry with resolved `model` (canonical name), `backend`, `slot_id`, `routing_reason`, `cache_hit`, `restored`, and `routing_diagnostics`. Status remains `"incomplete"`.
 3. **Terminal**: The request reaches a final status:
    - **`"complete"`** — normal finish (streaming `_cleanup()` with `_stream_complete=True`, or non-streaming success). Includes latency, tokens, save status, recompute.
    - **`"cancelled"`** — streaming request where client disconnected (`_cancelled=True`, `_stream_complete=False`).
    - **`"backend_error"`** — backend timeout, connection error, streaming response non-200, or generic exception. Recorded by error handlers and streaming `_cleanup()` (backend disconnect case).
+
+**Liveness events**: The backend manager's `_liveness_loop()` records `event="liveness_change"` entries when backend state changes (up/down) or models are missing from discovery. These use synthetic `request_id` values (`liveness:<timestamp_ms>`) and `status="complete"`.
 
 **Key behavior:**
 - `_by_id: Dict[str, int]` maps request_id → index in ring buffer, rebuilt after every append (deque auto-evicts without notification, leaving stale indices)
@@ -36,14 +38,67 @@ Set after slot acquisition in `app.py`, explains why each request was dispatched
 
 The `pending_slot_hit` flag is set when the pending slot scan finds a better ratio than the disk cache hit. It must be reset to `False` when a disk cache hit supersedes it in the per-backend loop.
 
+## Routing Diagnostics
+
+Captured during the routing phase (phase 2) and stored as `routing_diagnostics` on the request record. Provides a full trace of the cache scan for post-hoc analysis.
+
+**Structure:**
+```python
+{
+    "best_ratio": 0.992,
+    "restore_key": "abc123..." or None,
+    "restore_backend": "backend.lan-1234" or None,
+    "restore_info_backend": "backend.lan-1234" or None,
+    "candidate_backends": ["other.lan-1234"],
+    "scan": [
+        {
+            "model": "unsloth/...",
+            "backend": "backend.lan-1234",
+            "n_blocks": 519,
+            "n_tokens": 51838,
+            "cache_file_key": "abc123..." or None,
+            "cache_file_ratio": 0.85 or None,
+            "pending_slots": [
+                {"slot": 0, "lcp_blocks": 515, "slot_blocks": 515, "ratio": 0.992}
+            ]
+        }
+    ]
+}
+```
+
+**Key fields:**
+- `restore_key` is None when a pending slot hit won (no disk restore needed)
+- `restore_info_backend` is None when `restore_key` is None (no priority routing)
+- `candidate_backends` excludes the restore backend ONLY when `restore_key` is set (pending slot hits don't exclude)
+- `scan` entries with `status="unreachable"` mean the backend was down during the cache scan
+- `pending_slots` lists all matching slots per backend with their LCP details
+
 ## Ring Buffer
 
-`deque(maxlen=retention)` (default 100). When full, the oldest entry is auto-evicted on append.
+Single `deque(maxlen=retention)` (default 200) holds both request records and diagnostic events. Events are distinguished by the `event` field (e.g. `"liveness_change"`). When full, the oldest entry is auto-evicted on append.
 
-- `get_requests(limit, offset)` — returns sliced list **newest-first** (ring buffer is reversed before slicing)
-- `get_total_count()` — returns actual ring buffer size (use this for pagination total, not `len(requests)`)
-- `get_requests_summary()` — returns entries without full JSON payload, **newest-first**, includes `status`, `request_id`, `routing_reason`
+**Request queries** (events filtered out automatically):
+- `get_requests(limit, offset)` — returns request records **newest-first**
+- `get_total_count()` — returns request count only (use for pagination)
+- `get_requests_summary()` — returns entries without full JSON payload, **newest-first**
 - `get_performance()` — computes metrics from complete requests only
+
+**Event queries**:
+- `get_events(event_type, limit)` — returns events, optionally filtered by type, **newest-first**
+- `get_timeline(limit)` — returns unified timeline (requests + events), **newest-first**
+
+**Recording**:
+- `record(ctx)` — if `ctx` has `event` key, appends as event (append-only). Otherwise, treats as request (two-phase with in-place update via `request_id`).
+
+## Diagnostics Endpoint
+
+`GET /metrics/diagnostics` provides routing and liveness diagnostics:
+
+| Query Param | Returns |
+|-------------|---------|
+| `?request_id=UUID` | `routing_diagnostics` for a specific request |
+| `?liveness=true` | Recent `liveness_change` events with `state_changes` and `discovered_models` |
+| (no params) | `routing_diagnostics` for all recent requests |
 
 ## Dashboard
 
@@ -62,6 +117,7 @@ The `pending_slot_hit` flag is set when the pending slot scan finds a better rat
 | `MetricsCollector.get_total_count()` | `metrics.py` | Return actual ring buffer size for pagination |
 | `MetricsCollector.get_summary()` | `metrics.py` | Full summary including incomplete_count |
 | `StreamReader._cleanup()` | `app.py` | Stream lifecycle: save, invalidate_slot, release slot, record metrics with terminal status |
+| `BackendManager._liveness_loop()` | `backend_manager.py` | Ping backends every 5s, record state changes as liveness events |
 
 ## Gotchas
 
@@ -74,3 +130,6 @@ The `pending_slot_hit` flag is set when the pending slot scan finds a better rat
 - **Arrival timestamp preserved**: when updating an existing record, the original timestamp is kept so requests show when they arrived, not when they completed
 - **Silent try/except on arrival**: the arrival record is wrapped in try/except to avoid blocking the request; if it fails, the error is logged (not silently swallowed)
 - **Prompt preview extraction**: `extract_prompt_preview()` in `metrics.py` — looks for the most recent message with role "user" or "assistant", iterating messages in reverse order, skipping empty content. Called from `record()`, streaming `_cleanup()`, arrival recording, and non-streaming completion.
+- **`cached_tokens=0` on pending slot hit**: Indicates `_slot_kv_state` was stale — the proxy's block tracking didn't match llama.cpp's actual KV cache. The slot may have been evicted or served a different conversation.
+- **`routing_diagnostics.scan` may skip backends**: If a backend goes down during the cache scan, it appears with `status="unreachable"` and no ratio data. Cross-reference with liveness events to determine if the backend was dropped from the model registry.
+- **Pending slot exclusion fix**: `candidate_backends` excludes `restore_backend` only when `restore_key` is truthy. When a pending slot hit overrides a cache hit, `restore_key` becomes None, so the pending-hit backend stays in the candidate list (prevents the "backend excluded but not prioritized" bug).

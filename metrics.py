@@ -15,6 +15,11 @@ Two-phase recording:
 
 Incomplete requests (status="incomplete") are visible in the dashboard
 and excluded from performance metric calculations.
+
+Single ring buffer holds all event types (requests, liveness events, etc.).
+Non-request events are distinguished by the `event` field and filtered out
+of request-oriented queries. The unified timeline supports post-mortem
+analysis where liveness events and requests are viewed together by timestamp.
 """
 
 import os
@@ -44,7 +49,7 @@ def extract_prompt_preview(request_json: dict) -> str:
 
     Returns:
         A preview string (up to 200 chars), or empty string if no suitable
-        message is found.
+        message was found.
     """
     if not request_json:
         return ""
@@ -62,26 +67,31 @@ def extract_prompt_preview(request_json: dict) -> str:
     return ""
 
 
+def _is_event(record: Dict[str, Any]) -> bool:
+    """Check if a ring buffer entry is a non-request event."""
+    return record.get("event") is not None and record.get("event") != ""
+
+
 class MetricsCollector:
     """Thread-safe in-memory metrics collector.
 
-    Ring buffer of recent requests (default 100). Counters are incremented
-    on each record(). Performance metrics are computed on-demand from the
-    ring buffer.
+    Single ring buffer holds requests and diagnostic events. Events are
+    distinguished by the `event` field. Request queries filter events out;
+    the raw buffer preserves the unified timeline for post-mortem analysis.
 
-    Supports two-phase recording: an initial record on request arrival
+    Supports two-phase recording for requests: an initial record on arrival
     (status="incomplete") followed by a completion record (status="complete")
     that updates the same entry in-place via request_id matching.
     """
 
-    def __init__(self, retention: int = 100):
+    def __init__(self, retention: int = 200):
         self._retention = retention
         self._lock = threading.Lock()
 
-        # Ring buffer of request records
-        self._requests: deque[Dict[str, Any]] = deque(maxlen=retention)
+        # Single ring buffer: requests + events
+        self._buffer: deque[Dict[str, Any]] = deque(maxlen=retention)
 
-        # request_id -> index in _requests (for in-place updates)
+        # request_id -> index in _buffer (for in-place updates)
         self._by_id: Dict[str, int] = {}
 
         # Counters
@@ -104,34 +114,32 @@ class MetricsCollector:
         self._start_time = time.time()
 
     def record(self, ctx: Dict[str, Any]) -> None:
-        """Record or update a request.
+        """Record or update a request, or append a diagnostic event.
 
-        Two-phase usage:
+        Request usage (two-phase):
           1. Arrival: record({"request_id": "...", "model": "...", "stream": True,
                               "status": "incomplete"})
           2. Completion: record({"request_id": "...", "model": "...", "latency_ms": ...,
                                  "cache_hit": ..., "status": "complete", ...})
                             -> updates the existing entry in-place
 
+        Event usage (append-only):
+          record({"event": "liveness_change", "state_changes": [...]})
+
         Args:
-            ctx: Dict with keys:
-                - request_id: unique ID for matching arrival/completion records
-                - t0: start timestamp
-                - request_json: the full request body
-                - model: model name
-                - backend: backend key
-                - slot_id: slot ID
-                - cache_hit: bool
-                - restored: bool or None
-                - recompute: bool
-                - saved: bool or None
-                - latency_ms: float
-                - n_tokens: int (optional)
-                - cache_size_bytes: int (optional)
-                - prompt_preview: str (optional)
-                - status: "incomplete" (arrival) or "complete" (completion)
-                - stream: bool (optional)
+            ctx: Dict with keys. If `event` is set, treated as an event.
         """
+        # Event path: append-only, no in-place update
+        if ctx.get("event"):
+            entry = {
+                "timestamp": time.time(),
+            }
+            entry.update(ctx)
+            with self._lock:
+                self._buffer.append(entry)
+            return
+
+        # Request path
         request_id = ctx.get("request_id")
         model = ctx.get("model", "unknown")
         backend = ctx.get("backend", "unknown")
@@ -168,7 +176,7 @@ class MetricsCollector:
             if request_id and request_id in self._by_id:
                 # Update existing record in-place
                 idx = self._by_id[request_id]
-                old_record = self._requests[idx]
+                old_record = self._buffer[idx]
                 old_prompt_preview = old_record.get("prompt_preview", "")
                 old_timestamp = old_record.get("timestamp")
                 old_record.update(record)
@@ -185,164 +193,157 @@ class MetricsCollector:
                     old_record["status"] = "complete"
                 # Increment counters only on completion
                 if is_complete:
-                    self._total_requests += 1
-                    if cache_hit:
-                        self._cache_hits += 1
-                        if recompute:
-                            self._cache_recomputes += 1
-                    else:
-                        self._cache_misses += 1
-                    if saved is True:
-                        self._cache_saved += 1
-                    elif saved is False:
-                        self._cache_save_skipped += 1
-                    if restored is True:
-                        self._restore_successes += 1
-                    elif restored is False:
-                        self._restore_failures += 1
-                    # Per-model counters
-                    if model not in self._model_counters:
-                        self._model_counters[model] = {
-                            "total": 0, "hits": 0, "misses": 0,
-                            "recomputes": 0, "saved": 0, "save_skipped": 0,
-                        }
-                    mc = self._model_counters[model]
-                    mc["total"] += 1
-                    if cache_hit:
-                        mc["hits"] += 1
-                        if recompute:
-                            mc["recomputes"] += 1
-                    else:
-                        mc["misses"] += 1
-                    if saved is True:
-                        mc["saved"] += 1
-                    elif saved is False:
-                        mc["save_skipped"] += 1
-                    # Per-backend counters
-                    if backend not in self._backend_counters:
-                        self._backend_counters[backend] = {
-                            "total": 0, "hits": 0, "misses": 0,
-                            "recomputes": 0, "saved": 0, "save_skipped": 0,
-                        }
-                    bc = self._backend_counters[backend]
-                    bc["total"] += 1
-                    if cache_hit:
-                        bc["hits"] += 1
-                        if recompute:
-                            bc["recomputes"] += 1
-                    else:
-                        bc["misses"] += 1
-                    if saved is True:
-                        bc["saved"] += 1
-                    elif saved is False:
-                        bc["save_skipped"] += 1
+                    self._increment_counters(model, backend, cache_hit, recompute, saved, restored)
             else:
-                # New request — append to ring buffer (deque auto-evicts oldest if full)
+                # New request — append to ring buffer
                 record["full_request_json"] = ctx.get("request_json", {})
-                self._requests.append(record)
+                self._buffer.append(record)
 
                 # Rebuild _by_id indices after every append since deque auto-evicts
                 # without notifying us, leaving stale indices
                 self._by_id = {}
-                for i, r in enumerate(self._requests):
+                for i, r in enumerate(self._buffer):
                     rid = r.get("request_id")
-                    if rid:
+                    if rid and not _is_event(r):
                         self._by_id[rid] = i
 
                 # Increment counters only on completion
                 if is_complete:
-                    self._total_requests += 1
-                    if cache_hit:
-                        self._cache_hits += 1
-                        if recompute:
-                            self._cache_recomputes += 1
-                    else:
-                        self._cache_misses += 1
-                    if saved is True:
-                        self._cache_saved += 1
-                    elif saved is False:
-                        self._cache_save_skipped += 1
-                    if restored is True:
-                        self._restore_successes += 1
-                    elif restored is False:
-                        self._restore_failures += 1
-                    # Per-model counters
-                    if model not in self._model_counters:
-                        self._model_counters[model] = {
-                            "total": 0, "hits": 0, "misses": 0,
-                            "recomputes": 0, "saved": 0, "save_skipped": 0,
-                        }
-                    mc = self._model_counters[model]
-                    mc["total"] += 1
-                    if cache_hit:
-                        mc["hits"] += 1
-                        if recompute:
-                            mc["recomputes"] += 1
-                    else:
-                        mc["misses"] += 1
-                    if saved is True:
-                        mc["saved"] += 1
-                    elif saved is False:
-                        mc["save_skipped"] += 1
-                    # Per-backend counters
-                    if backend not in self._backend_counters:
-                        self._backend_counters[backend] = {
-                            "total": 0, "hits": 0, "misses": 0,
-                            "recomputes": 0, "saved": 0, "save_skipped": 0,
-                        }
-                    bc = self._backend_counters[backend]
-                    bc["total"] += 1
-                    if cache_hit:
-                        bc["hits"] += 1
-                        if recompute:
-                            bc["recomputes"] += 1
-                    else:
-                        bc["misses"] += 1
-                    if saved is True:
-                        bc["saved"] += 1
-                    elif saved is False:
-                        bc["save_skipped"] += 1
+                    self._increment_counters(model, backend, cache_hit, recompute, saved, restored)
 
+    def _increment_counters(self, model: str, backend: str,
+                            cache_hit: bool, recompute: bool,
+                            saved, restored) -> None:
+        """Increment global, per-model, and per-backend counters.
+
+        Must be called while holding self._lock.
+        """
+        self._total_requests += 1
+        if cache_hit:
+            self._cache_hits += 1
+            if recompute:
+                self._cache_recomputes += 1
+        else:
+            self._cache_misses += 1
+        if saved is True:
+            self._cache_saved += 1
+        elif saved is False:
+            self._cache_save_skipped += 1
+        if restored is True:
+            self._restore_successes += 1
+        elif restored is False:
+            self._restore_failures += 1
+
+        # Per-model counters
+        if model not in self._model_counters:
+            self._model_counters[model] = {
+                "total": 0, "hits": 0, "misses": 0,
+                "recomputes": 0, "saved": 0, "save_skipped": 0,
+            }
+        mc = self._model_counters[model]
+        mc["total"] += 1
+        if cache_hit:
+            mc["hits"] += 1
+            if recompute:
+                mc["recomputes"] += 1
+        else:
+            mc["misses"] += 1
+        if saved is True:
+            mc["saved"] += 1
+        elif saved is False:
+            mc["save_skipped"] += 1
+
+        # Per-backend counters
+        if backend not in self._backend_counters:
+            self._backend_counters[backend] = {
+                "total": 0, "hits": 0, "misses": 0,
+                "recomputes": 0, "saved": 0, "save_skipped": 0,
+            }
+        bc = self._backend_counters[backend]
+        bc["total"] += 1
+        if cache_hit:
+            bc["hits"] += 1
+            if recompute:
+                bc["recomputes"] += 1
+        else:
+            bc["misses"] += 1
+        if saved is True:
+            bc["saved"] += 1
+        elif saved is False:
+            bc["save_skipped"] += 1
+
+    # ── Request queries (events filtered out) ──────────────────────
 
     def get_request_by_id(self, request_id: str) -> Optional[Dict[str, Any]]:
         """Get a single request by its UUID."""
         with self._lock:
             idx = self._by_id.get(request_id)
             if idx is not None:
-                return self._requests[idx]
+                return self._buffer[idx]
         return None
 
     def get_requests(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """Get recent requests with full JSON payload. Newest first."""
+        """Get recent request records (events excluded). Newest first."""
         with self._lock:
-            requests = list(reversed(self._requests))
-        sliced = requests[offset:offset + limit]
-        return sliced
+            entries = list(reversed(self._buffer))
+        requests = [r for r in entries if not _is_event(r)]
+        return requests[offset:offset + limit]
 
     def get_total_count(self) -> int:
-        """Return the total number of entries in the ring buffer."""
+        """Return the number of request entries (events excluded)."""
         with self._lock:
-            return len(self._requests)
+            return sum(1 for r in self._buffer if not _is_event(r))
 
     def get_requests_summary(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """Get recent requests without full JSON payload. Newest first."""
         with self._lock:
-            requests = list(reversed(self._requests))
+            entries = list(reversed(self._buffer))
+        requests = [r for r in entries if not _is_event(r)]
         sliced = requests[offset:offset + limit]
         return [{"timestamp": r["timestamp"], "model": r["model"], "backend": r["backend"],
                   "slot_id": r["slot_id"], "cache_hit": r["cache_hit"],
                   "restored": r["restored"], "recompute": r["recompute"],
                   "saved": r["saved"], "latency_ms": r["latency_ms"],
                   "n_tokens": r.get("n_tokens"), "cache_size_bytes": r.get("cache_size_bytes"),
+                  "cached_tokens": r.get("cached_tokens"),
                   "prompt_preview": r["prompt_preview"],
                   "routing_reason": r.get("routing_reason"),
+                  "routing_diagnostics": r.get("routing_diagnostics"),
                   "status": r.get("status", "incomplete"),
                   "request_id": r.get("request_id")} for r in sliced]
 
-    def get_performance(self, model: str = None, backend: str = None) -> Dict[str, Any]:
-        """Compute performance metrics from the ring buffer.
+    # ── Event queries ──────────────────────────────────────────────
 
-        Only uses requests with status="complete".
+    def get_events(self, event_type: str = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get events from the buffer. Newest first.
+
+        Args:
+            event_type: Filter by event type (e.g. "liveness_change"). None for all.
+            limit: Max events to return.
+        """
+        with self._lock:
+            entries = list(reversed(self._buffer))
+        events = [e for e in entries if _is_event(e)]
+        if event_type:
+            events = [e for e in events if e.get("event") == event_type]
+        return events[:limit]
+
+    def get_timeline(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Get the unified timeline (requests + events). Newest first.
+
+        Used for post-mortem analysis where the chronological sequence
+        of liveness events and requests matters.
+        """
+        with self._lock:
+            entries = list(reversed(self._buffer))
+        return entries[:limit]
+
+    # ── Performance ────────────────────────────────────────────────
+
+    def get_performance(self, model: str = None, backend: str = None) -> Dict[str, Any]:
+        """Compute performance metrics from the buffer.
+
+        Only uses requests with status="complete" (events excluded).
 
         Args:
             model: Filter by model name (optional)
@@ -353,13 +354,15 @@ class MetricsCollector:
         """
         with self._lock:
             if model or backend:
-                requests = [r for r in self._requests
-                            if (not model or r["model"] == model)
+                requests = [r for r in self._buffer
+                            if not _is_event(r)
+                            and (not model or r["model"] == model)
                             and (not backend or r["backend"] == backend)
                             and r.get("status") == "complete"]
                 counters = self._get_filtered_counters(model, backend)
             else:
-                requests = [r for r in self._requests if r.get("status") == "complete"]
+                requests = [r for r in self._buffer
+                            if not _is_event(r) and r.get("status") == "complete"]
                 counters = self._get_global_counters()
 
         total = counters["total"]
@@ -463,8 +466,10 @@ class MetricsCollector:
         requests_full = self.get_requests(limit=self._retention)
         requests_summary = self.get_requests_summary(limit=self._retention)
 
-        # Count incomplete requests
-        incomplete_count = sum(1 for r in self._requests if r.get("status") != "complete")
+        # Count incomplete requests (events excluded)
+        with self._lock:
+            incomplete_count = sum(1 for r in self._buffer
+                                   if not _is_event(r) and r.get("status") != "complete")
 
         return {
             "uptime_seconds": round(time.time() - self._start_time, 1),

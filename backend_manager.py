@@ -16,12 +16,13 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import BACKENDS, REFRESH_COOLDOWN_SECONDS, DEFAULT_N_CTX
 from llama_client import LlamaClient
 from cache_agent_client import CacheAgentClient
 from hashing import sanitize_backend_dir
+from metrics import metrics
 
 log = logging.getLogger(__name__)
 
@@ -361,6 +362,7 @@ class BackendManager:
         while True:
             await asyncio.sleep(5.0)
             changed = False
+            state_changes: List[Dict[str, Any]] = []
             for backend_key in self.keys():
                 client = self.get_client(backend_key)
                 is_up = False
@@ -373,14 +375,26 @@ class BackendManager:
                 if is_up != old_state:
                     self._backend_state[backend_key] = is_up
                     changed = True
+                    state_changes.append({
+                        "backend": backend_key,
+                        "old_state": old_state,
+                        "new_state": is_up,
+                    })
             # Also trigger if an up backend has no models in the registry
             # (discovery previously failed or never ran for that backend)
             up_keys = {k for k, v in self._backend_state.items() if v}
             discovered_backends = {be
                                     for info in self._discovered_models.values()
                                     for be in info.backends}
-            if up_keys - discovered_backends:
+            missing_models = up_keys - discovered_backends
+            if missing_models:
                 changed = True
+                for be in missing_models:
+                    state_changes.append({
+                        "backend": be,
+                        "old_state": "up_no_models",
+                        "new_state": "up",
+                    })
             if changed:
                 try:
                     await self.discover_models()
@@ -390,6 +404,15 @@ class BackendManager:
                     await self.refresh_slot_counts()
                 except Exception:
                     log.exception("Failed to refresh slot counts after backend state change")
+
+                # Record liveness event for diagnostics
+                discovered_models = {name: list(info.backends)
+                                      for name, info in self._discovered_models.items()}
+                metrics.record({
+                    "event": "liveness_change",
+                    "state_changes": state_changes,
+                    "discovered_models": discovered_models,
+                })
 
 
 # Module-level singleton

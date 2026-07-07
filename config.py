@@ -84,8 +84,8 @@ CACHE_HIT_WAIT_EMA_ALPHA = float(os.getenv("CACHE_HIT_WAIT_EMA_ALPHA", "0.2"))
 CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT = float(os.getenv("CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT", "30"))
 CACHE_HIT_WAIT_EMA_MAX_TIMEOUT = float(os.getenv("CACHE_HIT_WAIT_EMA_MAX_TIMEOUT", "300"))
 
-# Metrics retention (number of recent requests to keep in memory)
-METRICS_RETENTION = int(os.getenv("METRICS_RETENTION", "100"))
+# Metrics retention (single ring buffer for requests + diagnostic events)
+METRICS_RETENTION = int(os.getenv("METRICS_RETENTION", "200"))
 
 # Dashboard
 DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() in ("true", "1", "yes")

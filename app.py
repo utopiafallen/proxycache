@@ -569,6 +569,9 @@ async def chat(req: Request):
         key = None
         blocks = None
         pending_slot_hit = False
+
+        # Routing diagnostics: per-backend scan results for post-hoc analysis
+        scan_diagnostics: List[Dict[str, Any]] = []
         for opt in options:
             for be_id in opt.backends:
                 opt_client = backend_manager.get_client(be_id)
@@ -578,26 +581,41 @@ async def chat(req: Request):
                 except httpx.ConnectError:
                     log.warning("Backend %s unreachable, skipping for model '%s' from client %s",
                                 be_id, opt.name, client_ip)
+                    scan_diagnostics.append({
+                        "model": opt.name, "backend": be_id,
+                        "status": "unreachable",
+                    })
                     continue
                 opt_blocks = hs.block_hashes_from_tokens(opt_token_ids, WORDS_PER_BLOCK)
+                diag_entry: Dict[str, Any] = {
+                    "model": opt.name, "backend": be_id,
+                    "n_blocks": len(opt_blocks), "n_tokens": len(opt_token_ids),
+                }
                 cand = kv_meta.find_best_restore_candidate(opt_blocks, WORDS_PER_BLOCK, LCP_TH, opt.name, be_id)
-                if cand and cand[1] > best_ratio:
-                    best_ratio = cand[1]
-                    restore_key = cand[0]
-                    restore_backend = be_id
-                    canonical_name = opt.name
-                    key = hs.meta_key(opt.name, opt_token_ids)
-                    blocks = opt_blocks
-                    pending_slot_hit = False
-                    log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
-                             restore_key[:16], canonical_name, restore_backend, best_ratio)
+                if cand:
+                    diag_entry["cache_file_key"] = cand[0][:16]
+                    diag_entry["cache_file_ratio"] = round(cand[1], 4)
+                    if cand[1] > best_ratio:
+                        best_ratio = cand[1]
+                        restore_key = cand[0]
+                        restore_backend = be_id
+                        canonical_name = opt.name
+                        key = hs.meta_key(opt.name, opt_token_ids)
+                        blocks = opt_blocks
+                        pending_slot_hit = False
+                        log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
+                                 restore_key[:16], canonical_name, restore_backend, best_ratio)
+                else:
+                    diag_entry["cache_file_ratio"] = None
 
                 # Check pending (in-flight) slots for cache hits during the save window
+                pending_ratios: List[Dict[str, Any]] = []
                 for g, kv_blocks in sm._slot_kv_state.items():
                     if g[0] != opt.name or g[1] != be_id:
                         continue
                     lcp = hs.lcp_blocks(opt_blocks, kv_blocks)
                     ratio = lcp / len(opt_blocks)
+                    pending_ratios.append({"slot": g[2], "lcp_blocks": lcp, "slot_blocks": len(kv_blocks), "ratio": round(ratio, 4)})
                     if ratio > best_ratio:
                         best_ratio = ratio
                         restore_key = None  # clear — slot already has KV content, and old key may point to a different backend
@@ -606,6 +624,8 @@ async def chat(req: Request):
                         pending_slot_hit = True
                         log.info("Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
                                  canonical_name, restore_backend, g[2], ratio)
+                diag_entry["pending_slots"] = pending_ratios
+                scan_diagnostics.append(diag_entry)
 
         log.info(
             "Chat request from %s: model '%s', %d tokens, restore key=%s on backend %s",
@@ -623,7 +643,7 @@ async def chat(req: Request):
         candidate_backends: list[tuple[str, str]] = []
         for opt in options:
             for be_id in opt.backends:
-                if be_id != restore_backend:
+                if not restore_key or be_id != restore_backend:
                     candidate_backends.append((be_id, opt.name))
 
         # 6. Acquire slot (cache backend tried first via restore_info, then fallback)
@@ -668,7 +688,7 @@ async def chat(req: Request):
     log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s, save_key='%s', canonical_name='%s'",
              model_name, be_id, slot_id, restored, key[:16], canonical_name)
 
-    # Update arrival record with routing decision
+    # Update arrival record with routing decision + diagnostics
     try:
         metrics.record({
             "request_id": request_id,
@@ -679,6 +699,14 @@ async def chat(req: Request):
             "cache_hit": bool(restore_key) or pending_slot_hit,
             "restored": restored,
             "status": "incomplete",
+            "routing_diagnostics": {
+                "best_ratio": round(best_ratio, 4),
+                "restore_key": restore_key[:16] if restore_key else None,
+                "restore_backend": restore_backend,
+                "restore_info_backend": restore_info[1] if restore_info else None,
+                "candidate_backends": [cb[0] for cb in candidate_backends],
+                "scan": scan_diagnostics,
+            },
         })
     except Exception as e:
         log.warning("Failed to record routing decision for request_id=%s: %s", request_id, e)
@@ -930,6 +958,32 @@ async def metrics_slots():
 async def metrics_cache():
     """Per-backend cache utilization stats."""
     return _get_cache_stats()
+
+
+@app.get("/metrics/diagnostics")
+async def metrics_diagnostics(request_id: str = None, liveness: bool = False, timeline: bool = False):
+    """Routing diagnostics, liveness events, and unified timeline.
+
+    Args:
+        request_id: Return routing diagnostics for a specific request.
+        liveness: Return recent liveness change events.
+        timeline: Return unified timeline (requests + events) for post-mortem analysis.
+    """
+    if timeline:
+        return {"timeline": metrics.get_timeline(limit=200)}
+    if liveness:
+        return {"liveness_events": metrics.get_events(event_type="liveness_change", limit=50)}
+    if request_id:
+        req = metrics.get_request_by_id(request_id)
+        if req is None:
+            return JSONResponse({"error": "Request not found"}, status_code=404)
+        return {"request_id": request_id, "routing_diagnostics": req.get("routing_diagnostics")}
+    # Return diagnostics for all recent requests
+    requests = metrics.get_requests(limit=100)
+    return {"diagnostics": [
+        {"request_id": r.get("request_id"), "routing_diagnostics": r.get("routing_diagnostics")}
+        for r in requests if r.get("routing_diagnostics")
+    ]}
 
 
 @app.get("/metrics/requests")
