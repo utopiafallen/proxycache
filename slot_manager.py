@@ -343,6 +343,7 @@ class SlotManager:
                     pass
                 finally:
                     self._cache_wait_pending[cache_backend] -= 1
+                    sem.release()
                     # Timeout — fall through to retry loop (Phase 1 + Phase 2)
 
         # Retry loop: check all backends, sleep 5s if none available

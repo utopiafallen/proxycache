@@ -137,6 +137,12 @@ class MetricsCollector:
             entry.update(ctx)
             with self._lock:
                 self._buffer.append(entry)
+                # Rebuild indices — append may have evicted oldest entry, shifting all indices
+                self._by_id = {}
+                for i, r in enumerate(self._buffer):
+                    rid = r.get("request_id")
+                    if rid and not _is_event(r):
+                        self._by_id[rid] = i
             return
 
         # Request path

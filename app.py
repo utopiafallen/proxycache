@@ -396,7 +396,7 @@ class StreamReader:
         # Record metrics for streaming requests
         if self._t0 > 0:
             recompute_happened = False
-            if self.restored and self.restore_key and self.restore_backend:
+            if self.restored and (self.restore_key or self._routing_reason == "pending_slot_hit"):
                 cached_tokens = self._sse_cached_tokens
                 llm_prompt_tokens = self._sse_prompt_tokens or self.n_tokens
                 if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
@@ -538,8 +538,8 @@ async def chat(req: Request):
         try:
             templated = await first_client.apply_chat_template(messages)
             first_token_ids = await first_client.tokenize(templated, add_special=True)
-        except httpx.ConnectError:
-            log.error("Failed to connect to backend %s for model '%s' from client %s",
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
+            log.error("Backend %s error for model '%s' from client %s",
                       first_opt.backends[0], client_model, client_ip)
             metrics.record({
                 "request_id": request_id,
@@ -572,14 +572,16 @@ async def chat(req: Request):
 
         # Routing diagnostics: per-backend scan results for post-hoc analysis
         scan_diagnostics: List[Dict[str, Any]] = []
+        # Track cache ratio per backend for save decision (use serving backend's ratio, not winning match)
+        backend_cache_ratios: Dict[str, float] = {}
         for opt in options:
             for be_id in opt.backends:
                 opt_client = backend_manager.get_client(be_id)
                 try:
                     opt_templated = await opt_client.apply_chat_template(messages)
                     opt_token_ids = await opt_client.tokenize(opt_templated, add_special=True)
-                except httpx.ConnectError:
-                    log.warning("Backend %s unreachable, skipping for model '%s' from client %s",
+                except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
+                    log.warning("Backend %s error, skipping for model '%s' from client %s",
                                 be_id, opt.name, client_ip)
                     scan_diagnostics.append({
                         "model": opt.name, "backend": be_id,
@@ -626,6 +628,13 @@ async def chat(req: Request):
                                  canonical_name, restore_backend, g[2], ratio)
                 diag_entry["pending_slots"] = pending_ratios
                 scan_diagnostics.append(diag_entry)
+                # Track best ratio for this backend (cache file or pending slot) for save decision
+                be_best = diag_entry.get("cache_file_ratio") or 0.0
+                for ps in pending_ratios:
+                    if ps["ratio"] > be_best:
+                        be_best = ps["ratio"]
+                if be_best > 0:
+                    backend_cache_ratios[be_id] = be_best
 
         log.info(
             "Chat request from %s: model '%s', %d tokens, restore key=%s on backend %s",
@@ -803,7 +812,7 @@ async def chat(req: Request):
             recompute_happened = False
             llm_prompt_tokens = 0
             cached_tokens = 0
-            if restored and restore_key and restore_backend:
+            if restored and (restore_key or pending_slot_hit):
                 usage = out.get("usage") or {}
                 pt_details = usage.get("prompt_tokens_details") or {}
                 cached_tokens = pt_details.get("cached_tokens", 0)
@@ -822,11 +831,14 @@ async def chat(req: Request):
                         model_name, be_id, slot_id, key[:16],
                         cached_tokens, llm_prompt_tokens,
                     )
-                    kv_meta.increment_recompute_penalty(restore_key, restore_backend)
+                    if restore_key and restore_backend:
+                        kv_meta.increment_recompute_penalty(restore_key, restore_backend)
 
             save_ok = False
             cache_size = 0
-            if should_save_cache(best_ratio, recompute_happened):
+            # Use serving backend's cache ratio, not the winning scan ratio (which may be from a different backend)
+            serving_be_ratio = backend_cache_ratios.get(be_id, best_ratio)
+            if should_save_cache(serving_be_ratio, recompute_happened):
                 try:
                     ok, cache_size = await sm.save_after(
                         model_name, be_id, slot_id, key, blocks, prompt_tokens,
@@ -839,7 +851,7 @@ async def chat(req: Request):
                     log.warning("Cache save failed for model '%s' on backend '%s' slot %d: %s",
                                 model_name, be_id, slot_id, e)
             else:
-                sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens, restored, best_ratio, recompute_happened)
+                sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens, restored, serving_be_ratio, recompute_happened)
 
             # Record metrics for non-streaming requests
             prompt_preview = extract_prompt_preview(request_json)
@@ -891,7 +903,7 @@ async def chat(req: Request):
             "status": "backend_error",
         })
         return JSONResponse({"error": str(e)}, status_code=504)
-    except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
+    except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
         log.exception("Backend connection error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                       client_ip, model_name, be_id, slot_id, key[:16], e)
         sm.invalidate_slot(model_name, be_id, slot_id)
