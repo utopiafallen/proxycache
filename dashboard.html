@@ -559,7 +559,7 @@ function renderBackendHealth(backends, cache, slots) {
     el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No backends configured</p>';
     return;
   }
-  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(350px, 1fr));gap:24px;">';
+  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(250px, 1fr));gap:24px;">';
   const now = Date.now() / 1000;
   for (const [key, info] of Object.entries(backends)) {
     const uptime = info.up ? 'UP' : 'DOWN';
