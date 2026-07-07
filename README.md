@@ -17,11 +17,11 @@ proxycache sits between clients and one or more `llama.cpp` backends. It interce
 
 - **Name resolution** — resolves client model names (e.g. "qwen3.6-32b") to canonical names discovered from backends. Exact match first, then case-insensitive substring match. The special name "any" matches all discovered models. Using a more generic name (e.g. "qwen3.6") matches multiple canonical models and distributes requests across all backends that serve them.
 
-- **Cache-first routing** — when multiple backends serve the same model, requests are routed to the backend that holds the matching cache file. If that backend's slots are busy, the proxy falls back to other backends.
+- **Cache-first routing** — when multiple backends serve the same model, requests are routed to the backend that holds the matching cache file. The proxy also scans in-flight (pending) slots for matches during the save window, allowing subsequent requests to reuse slots before the cache is persisted. If the preferred backend's slots are busy, the proxy falls back to other backends. Routing diagnostics capture the full per-backend scan trace for post-hoc analysis.
 
 - **Slot management** — per-model, per-backend slot pools with lazy discovery (300s cooldown on success, 30s on failure). Free slots are preferred; when none are available, the least-recently-used slot is reclaimed. For cache-hit requests whose backend is busy, the proxy waits on a per-backend semaphore (up to an EMA-derived timeout) before falling back. Slots with existing KV cache that already matches the incoming prompt skip restore entirely.
 
-- **Cache lifecycle** — KV state is saved to disk after a response completes, but only when the new state is worth persisting: skipped for cancelled streams, and skipped when the restored cache was already a good match (ratio >= threshold, no recompute). A per-backend ring buffer evicts expired entries (age-first) then LRU when cache exceeds the configured size. Orphaned/corrupted metadata is reconciled on startup.
+- **Cache lifecycle** — KV state is saved to disk after a response completes, but only when the new state is worth persisting: skipped for cancelled streams, and skipped when the serving backend's cache ratio >= threshold with no recompute. Recompute is detected by comparing llama.cpp's `cached_tokens` against request length, covering both disk cache restores and pending slot hits. A per-backend ring buffer evicts expired entries (age-first) then LRU when cache exceeds the configured size. Orphaned/corrupted metadata is reconciled on startup.
 
 ### Request flow
 
@@ -43,10 +43,9 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8081` | Proxy listen port |
-| `BACKENDS` | `[]` | JSON array of backend configs (see below). Empty defaults to `[{"url":"http://127.0.0.1:8000"}]`. |
+| `BACKENDS` | `[]` | JSON array of backend configs (see below). Empty defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`. Each backend must specify exactly one of `cache_dir` or `agent_port`. |
 | `BACKEND_MODE` | `llama-cpp` | `llama-cpp` or `llama-swap` (changes `/slots` URL paths) |
 | `META_DIR` | `./kv_meta` | Local metadata directory (organized by backend subdirectories) |
-
 | `CACHE_MAX_AGE_HOURS` | `168` | Delete cache files older than this (0=disabled) |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
 | `LCP_TH` | `0.2` | LCP similarity threshold for cache match (0–1) |
@@ -63,7 +62,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `CACHE_HIT_WAIT_MAX_PENDING_REQS` | `3` | Max concurrent waiters per backend |
 | `DEFAULT_N_CTX` | `16384` | Fallback context length when backend doesn't report `n_ctx` |
 | `LOG_LEVEL` | `INFO` | Python logging level |
-| `METRICS_RETENTION` | `100` | Number of recent requests to keep in memory for metrics |
+| `METRICS_RETENTION` | `200` | Single ring buffer size for requests + diagnostic events |
 | `DASHBOARD_ENABLED` | `true` | Enable the monitoring dashboard (`false`, `no`, `0` to disable) |
 
 ## Endpoints
@@ -78,6 +77,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `GET` | `/metrics/cache` | Per-backend cache utilization: ring size, bytes, utilization % |
 | `GET` | `/metrics/requests` | Recent requests with full JSON (`?limit=N&offset=M`) |
 | `GET` | `/metrics/performance` | Cache hit/mispredict/save rates, latency percentiles (`?model=X&backend=Y`) |
+| `GET` | `/metrics/diagnostics` | Routing diagnostics (`?request_id=UUID`), liveness events (`?liveness=true`), unified timeline (`?timeline=true`) |
 | `GET` | `/dashboard` | Monitoring dashboard HTML page |
 
 ## Monitoring
@@ -86,13 +86,18 @@ proxycache includes an in-memory metrics collector and a single-page HTML dashbo
 
 ### Metrics
 
-The metrics collector tracks the last N requests (default 100, configurable via `METRICS_RETENTION`) in a ring buffer. Each request record includes:
+The metrics collector uses a single ring buffer (default 200 entries, configurable via `METRICS_RETENTION`) that holds both request records and diagnostic events. Non-request events (backend liveness changes) are distinguished by an `event` field and filtered out of request-oriented queries.
+
+Each request record includes:
 
 - **Cache performance**: hit rate, mispredict rate (cache hit attempted but restore was partial/useless), utility rate, save rate, restore success rate
 - **Latency**: avg, p50, p95, p99 percentiles
 - **Per-model and per-backend breakdowns**
+- **Routing diagnostics**: per-backend cache scan results (cache file ratio, pending slot ratios, unreachable status), best match ratio, selected backend, and candidate fallback list
 
-Metrics are recorded at actual completion points — non-streaming requests are recorded in the `chat()` handler after save/restore completes; streaming requests are recorded in `StreamReader._cleanup()` after the full response lifecycle.
+Metrics are recorded in three phases: arrival (status=`incomplete`), routing decision (backend, slot, routing reason), and completion (latency, cache hit/miss, save status). Streaming requests record metrics in `StreamReader._cleanup()` after the full response lifecycle.
+
+Diagnostic events are recorded when backends change liveness state (up/down), capturing `state_changes` and `discovered_models` snapshots. The unified timeline (`GET /metrics/diagnostics?timeline=true`) preserves the chronological sequence of requests and events for post-mortem analysis.
 
 ### Dashboard
 
