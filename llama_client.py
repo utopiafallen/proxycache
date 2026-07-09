@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 class LlamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30)
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=REQUEST_TIMEOUT,
