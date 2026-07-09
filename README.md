@@ -19,7 +19,7 @@ proxycache sits between clients and one or more `llama.cpp` backends. It interce
 
 - **Cache-first routing** — when multiple backends serve the same model, requests are routed to the backend that holds the matching cache file. The proxy also scans in-flight (pending) slots for matches during the save window, allowing subsequent requests to reuse slots before the cache is persisted. If the preferred backend's slots are busy, the proxy falls back to other backends. Routing diagnostics capture the full per-backend scan trace for post-hoc analysis.
 
-- **Slot management** — per-model, per-backend slot pools with lazy discovery (300s cooldown on success, 30s on failure). Free slots are preferred; when none are available, the least-recently-used slot is reclaimed. For cache-hit requests whose backend is busy, the proxy waits on a per-backend semaphore (up to an EMA-derived timeout) before falling back. Slots with existing KV cache that already matches the incoming prompt skip restore entirely.
+- **Slot management** — per-model, per-backend slot pools with lazy discovery. Free slots are preferred; when none are available, the least-recently-used slot is reclaimed. For cache-hit requests whose backend is busy, the proxy waits on a per-backend semaphore (up to an EMA-derived timeout) before falling back. Slots with existing KV cache that already matches the incoming prompt skip restore entirely.
 
 - **Cache lifecycle** — KV state is saved to disk after a response completes, but only when the new state is worth persisting: skipped for cancelled streams, and skipped when the serving backend's cache ratio >= threshold with no recompute. Recompute is detected by comparing llama.cpp's `cached_tokens` against request length, covering both disk cache restores and pending slot hits. A per-backend ring buffer evicts expired entries (age-first) then LRU when cache exceeds the configured size. Orphaned/corrupted metadata is reconciled on startup.
 
@@ -54,7 +54,6 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `SLOT_TIMEOUT` | `30` | Timeout for slot save/restore operations (seconds) |
 | `REQUEST_TIMEOUT` | `600` | HTTP timeout to backend (seconds) |
 | `MODEL_ID` | `llama.cpp` | Default model ID when client omits it |
-| `REFRESH_COOLDOWN_SECONDS` | `300` | Cooldown between slot refreshes per (model, backend) |
 | `CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT` | `30` | Initial EMA timeout for cache-hit wait queue (seconds) |
 | `CACHE_HIT_WAIT_EMA_MIN_TIMEOUT` | `10` | Minimum wait queue timeout (seconds) |
 | `CACHE_HIT_WAIT_EMA_MAX_TIMEOUT` | `300` | Maximum wait queue timeout (seconds) |

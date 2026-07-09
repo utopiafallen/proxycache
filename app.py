@@ -19,7 +19,7 @@ Additionally:
     * stream()'s finally calls _cleanup() — save (if _stream_complete),
       release, and puts a sentinel in the queue;
     * heartbeat task checks is_disconnected() every 0.5s.
-- Slot pools are per-model with lazy discovery + refresh cooldown.
+- Slot pools are per-model with lazy discovery.
 - Cache eviction via ring buffer in SlotManager (age-first, then LRU).
 """
 
@@ -41,7 +41,7 @@ from config import (BACKENDS, WORDS_PER_BLOCK,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
                     CACHE_MAX_AGE_HOURS,
                     SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD,
-                    REFRESH_COOLDOWN_SECONDS, should_save_cache)
+                    should_save_cache)
 
 import hashing as hs
 from slot_manager import SlotManager
@@ -1066,19 +1066,14 @@ def _get_backend_health() -> dict:
                     for slot_id in pool:
                         if sm._in_use.get((model_name, key, slot_id), False):
                             in_use += 1
-            # Get refresh cooldown info
             refresh_key = (model_name, key)
-            last_ts, last_success, cached_n = backend_manager._refresh_state.get(refresh_key, (0.0, True, 0))
-            now = time.time()
-            cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
-            cooldown_remaining = max(0, cooldown - (now - last_ts))
+            last_ts, _, _ = backend_manager._refresh_state.get(refresh_key, (0.0, True, 0))
             info["models"][model_name] = {
                 "n_ctx": model_info.n_ctx,
                 "total_slots": model_info.total_slots,
                 "in_use": in_use,
                 "last_discovered": model_info.last_discovered,
                 "last_refresh": last_ts,
-                "refresh_cooldown_remaining": round(cooldown_remaining, 1),
             }
         result[key] = info
     return result

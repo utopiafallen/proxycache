@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import BACKENDS, REFRESH_COOLDOWN_SECONDS, DEFAULT_N_CTX
+from config import BACKENDS, DEFAULT_N_CTX
 from llama_client import LlamaClient
 from cache_agent_client import CacheAgentClient
 from hashing import sanitize_backend_dir
@@ -257,7 +257,7 @@ class BackendManager:
     async def refresh_slot_counts(self) -> dict[str, dict[str, int]]:
         """Query all backends for slot counts. Returns {backend_key: {model_name: n_slots}}.
         No longer registers models -- discover_models() handles that.
-        Tracks cooldown per (model, backend): 300s after success, 30s after failure.
+        Refreshes every call — no cooldown throttle.
         """
         backend_keys = self.keys()
         log.info(
@@ -282,16 +282,6 @@ class BackendManager:
                 client = self.get_client(backend_key)
                 refresh_key = (canonical_name, backend_key)
                 now = time.time()
-                last_ts, last_success, cached_n = self._refresh_state.get(refresh_key, (0.0, True, 0))
-                cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
-                if now - last_ts < cooldown:
-                    log.warn("Skipping refresh for model '%s' on backend '%s': last refresh was %.1f seconds ago",
-                              canonical_name, backend_key, now - last_ts)
-                    if cached_n > 0:
-                        if backend_key not in slot_counts:
-                            slot_counts[backend_key] = {}
-                        slot_counts[backend_key][canonical_name] = cached_n
-                    continue
 
                 try:
                     slots = await client.get_slots_info(canonical_name)
@@ -331,7 +321,7 @@ class BackendManager:
 
         if not refreshed_any:
             log.warning(
-                "No backends refreshed: all skipped due to cooldown or missing client",
+                "No backends refreshed: all failed or missing client",
             )
 
         # Update total_slots on each DiscoveredModel

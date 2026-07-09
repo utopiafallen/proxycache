@@ -23,7 +23,7 @@ python test_smoke.py                           # smoke tests (no framework, uses
 |------|------|
 | `proxycache.py` | 13-line uvicorn entry point — **not** where main logic lives |
 | `app.py` | FastAPI app, routes, streaming pipeline, request handling |
-| `backend_manager.py` | Singleton: backend registry, LlamaClient/CacheAgentClient instances, model-to-backend mapping, refresh cooldowns, liveness checker |
+| `backend_manager.py` | Singleton: backend registry, LlamaClient/CacheAgentClient instances, model-to-backend mapping, liveness checker |
 | `config.py` | All config via env vars (no .env file) |
 | `hashing.py` | Hashing primitives: block hashes from tokens, LCP matching, cache key generation, backend key sanitization |
 | `kv_meta_manager.py` | All meta I/O: read/write/delete `.meta.json`, scan, reconcile, find restore candidates |
@@ -52,7 +52,7 @@ python test_smoke.py                           # smoke tests (no framework, uses
 - **Cache save skip**: `should_save_cache()` in `config.py` skips save when restore candidate ratio > `CACHE_SAVE_RATIO_THRESHOLD` (default 0.8) and no recompute happened — avoids saving redundant cache entries.
 - **Recompute detection**: hardcoded `RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS = 0.92` in `app.py`. If `cached_tokens < llm_prompt_tokens * 0.92`, the restore was partial/useless. Increments `recompute_penalty` on the meta file, which degrades its candidate score.
 - **Ring buffer eviction**: `SlotManager` evicts expired entries (age-first) then LRU when `_total_bytes > backend.cache_max_size_gb * 1024**3`. Per-backend, defaults to 25 GB. Only triggers on saves.
-- **Slot refresh cooldown**: 300s per (model, backend) pair on success, 30s on failure. On-demand discovery via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode). Falls back to 1 slot if discovery fails.
+- **Slot refresh**: no cooldown throttle — every request triggers a refresh. On-demand discovery via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode). Falls back to 1 slot if discovery fails.
 - **Meta reconciliation**: on startup, orphaned/corrupted `.meta.json` files are deleted via `reconcile_meta()`.
 - **Backend config validation**: each backend MUST specify exactly one of `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). Mutually exclusive. Missing either raises `ValueError` at startup.
 - **BACKENDS default**: when empty, defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`.

@@ -3,10 +3,10 @@
 # -*- coding: utf-8 -*-
 
 """
-SlotManager: per-model slot pools with lazy discovery and refresh cooldown.
+SlotManager: per-model slot pools with lazy discovery.
 
 - Slot pools keyed by model name, not backend index.
-- refresh_slots() called inside acquire_for_request() with per-(model, backend) cooldown.
+- refresh_slots() called inside acquire_for_request() on every request (no cooldown).
 - Router mode: discovers slot counts via GET /models + child /slots.
 - Non-router mode: uses GET /slots as before.
 - Ring buffer: tracks cache size in memory, evicts expired entries first, then LRU.
@@ -303,7 +303,7 @@ class SlotManager:
             there, fallback candidates are tried — restore_key is only used if the
             cache backend was acquired (cache files are not shared between backends).
         """
-        # Refresh slot counts for all discovered models (with cooldown)
+        # Refresh slot counts for all discovered models
         try:
             slot_counts = await backend_manager.refresh_slot_counts()
         except Exception as e:
