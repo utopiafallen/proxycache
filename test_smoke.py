@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Smoke tests — no framework required. Run with: python test_smoke.py"""
 
+import io
 import os
 import sys
 import json
@@ -920,6 +921,8 @@ def test_streaming_save_after_skipped_on_cancel():
 
     async def _run():
         mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
         mock_resp.aiter_raw = MagicMock(return_value=iter([]))
         mock_resp.aclose = AsyncMock()
 
@@ -927,7 +930,7 @@ def test_streaming_save_after_skipped_on_cancel():
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
         reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                              "test_key", "prefix", ["blk1"], sm)
+                               "test_key", "prefix", ["blk1"], sm)
         reader._cancelled = True
         await reader._cleanup()
 
@@ -960,6 +963,8 @@ def test_streaming_save_after_exception():
         backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
 
         mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
         mock_resp.aiter_raw = MagicMock(return_value=iter([]))
         mock_resp.aclose = AsyncMock()
 
@@ -967,7 +972,7 @@ def test_streaming_save_after_exception():
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
         reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                              "test_key", 10, ["blk1"], sm)
+                               "test_key", 10, ["blk1"], sm)
 
         ok, cache_size = await reader._save()
         assert not ok, "_save should return False on exception"
@@ -1000,6 +1005,8 @@ def test_streaming_gen_sets_cancelled_flag():
                 await asyncio.sleep(100)
 
         mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
         mock_resp.aiter_raw = MagicMock(return_value=MockAIter())
         mock_resp.aclose = AsyncMock()
 
@@ -1007,7 +1014,7 @@ def test_streaming_gen_sets_cancelled_flag():
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
         reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                              "test_key", "prefix", ["blk1"], sm)
+                               "test_key", "prefix", ["blk1"], sm)
 
         # Start consuming the stream
         stream_gen = reader.stream()
@@ -1102,6 +1109,8 @@ def test_reader_polls_is_disconnected_on_timeout():
                 await asyncio.sleep(100)
 
         mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
         mock_resp.aiter_raw = MagicMock(return_value=MockAIter())
         mock_resp.aclose = AsyncMock()
 
@@ -1162,9 +1171,10 @@ def test_streaming_completion_releases_slot():
                 raise StopAsyncIteration()
 
         mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
         mock_resp.aiter_raw = MagicMock(return_value=DoneAIter())
         mock_resp.aclose = AsyncMock()
-        mock_resp.status_code = 200
 
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=False)
@@ -1754,6 +1764,47 @@ def test_no_cache_fallback_lru():
             config.META_DIR = old_meta_dir
 
     print("PASS: test_no_cache_fallback_lru")
+
+
+def test_no_cache_lru_backend_routing():
+    """When no cache hit, candidate backends are sorted by LRU — least recently used first."""
+    from slot_manager import SlotManager
+    import time
+
+    sm = SlotManager()
+
+    # Backend 1 used recently, backend 2 used long ago, backend 3 never used
+    now = time.time()
+    sm._backend_last_used["10.0.0.1:8000"] = now
+    sm._backend_last_used["10.0.0.2:8000"] = now - 1000
+    # backend 3 never used -> get_backend_last_used returns 0.0
+
+    # Verify accessor returns correct timestamps
+    assert sm.get_backend_last_used("10.0.0.3:8000") == 0.0, "Never-used backend should return 0.0"
+    assert sm.get_backend_last_used("10.0.0.1:8000") == now, "Recently used backend timestamp mismatch"
+
+    # Simulate the sorting logic from app.py: candidate_backends.sort(key=lambda cb: sm.get_backend_last_used(cb[0]))
+    candidate_backends = [
+        ("10.0.0.1:8000", "ModelA"),   # most recent
+        ("10.0.0.2:8000", "ModelA"),   # older
+        ("10.0.0.3:8000", "ModelA"),   # never used
+    ]
+    candidate_backends.sort(key=lambda cb: sm.get_backend_last_used(cb[0]))
+
+    # After sort: never-used first, then oldest, then most recent
+    assert candidate_backends[0][0] == "10.0.0.3:8000", f"Expected never-used first, got {candidate_backends[0][0]}"
+    assert candidate_backends[1][0] == "10.0.0.2:8000", f"Expected oldest second, got {candidate_backends[1][0]}"
+    assert candidate_backends[2][0] == "10.0.0.1:8000", f"Expected most recent last, got {candidate_backends[2][0]}"
+
+    # Verify _try_acquire updates _backend_last_used
+    sm._slot_pools[("ModelA", "10.0.0.1:8000")] = {0}
+    sm._in_use[("ModelA", "10.0.0.1:8000", 0)] = False
+    before = sm._backend_last_used.get("10.0.0.1:8000", 0.0)
+    acquired = sm._try_acquire("ModelA", "10.0.0.1:8000", 0)
+    assert acquired, "Should acquire free slot"
+    assert sm._backend_last_used["10.0.0.1:8000"] > before, "_backend_last_used should update on acquire"
+
+    print("PASS: test_no_cache_lru_backend_routing")
 
 
 def test_meta_key_uses_canonical_name():
@@ -2733,11 +2784,10 @@ def test_dashboard_endpoint():
 
     with patch.object(config, "DASHBOARD_ENABLED", True):
         with patch("os.path.exists", return_value=True):
-            mock_file = open("/dev/null", "r")
+            mock_file = io.StringIO("")
             with patch("builtins.open", return_value=mock_file):
                 resp = client.get("/dashboard")
                 assert resp.status_code in (200, 404)
-            mock_file.close()
 
     print("PASS: test_dashboard_endpoint")
 
@@ -2813,6 +2863,7 @@ if __name__ == "__main__":
     test_cache_hit_selects_best_ratio()
     test_cache_hit_across_canonical_models()
     test_no_cache_fallback_lru()
+    test_no_cache_lru_backend_routing()
     test_meta_key_uses_canonical_name()
 
     # ── Context length tests ───────────────────────────────────────────

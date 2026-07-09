@@ -655,6 +655,10 @@ async def chat(req: Request):
                 if not restore_key or be_id != restore_backend:
                     candidate_backends.append((be_id, opt.name))
 
+        # No cache hit — sort fallback backends by LRU (least recently used first)
+        if not restore_key:
+            candidate_backends.sort(key=lambda cb: sm.get_backend_last_used(cb[0]))
+
         # 6. Acquire slot (cache backend tried first via restore_info, then fallback)
         restore_info: Optional[tuple[str, str, str]] = None
         if restore_backend:

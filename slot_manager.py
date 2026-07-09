@@ -73,6 +73,9 @@ class SlotManager:
         # Slot acquisition timestamp: (model, backend, slot) -> float
         self._slot_acquired_at: Dict[GSlot, float] = {}
 
+        # Per-backend last-used timestamp: backend_id -> float
+        self._backend_last_used: Dict[str, float] = {}
+
         log.info("Cache entry expiry set to %d hours", CACHE_MAX_AGE_HOURS)
 
     async def _evict_cache_file(self, key: str, backend_id: str, log_msg: str, log_extra: str):
@@ -282,9 +285,15 @@ class SlotManager:
         g = (model_name, backend_id, slot_id)
         if self._in_use.get(g, False):
             return False
+        now = time.time()
         self._in_use[g] = True
-        self._last_used[g] = time.time()
+        self._last_used[g] = now
+        self._backend_last_used[backend_id] = now
         return True
+
+    def get_backend_last_used(self, backend_id: str) -> float:
+        """Return the last time any slot on the backend was acquired. 0.0 if never used."""
+        return self._backend_last_used.get(backend_id, 0.0)
 
     async def acquire_for_request(
         self,

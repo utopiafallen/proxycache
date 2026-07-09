@@ -43,7 +43,7 @@ The cache hit scan lives in the chat handler in `app.py`, between model resoluti
 
 **Phase 0 — Wait for cache backend:**
 - Uses EMA-derived timeout per backend
-- Waits for semaphore release (triggered by slot release)
+- Polls every 5s for a free slot
 - Max `CACHE_HIT_WAIT_MAX_PENDING_REQS` concurrent waiters per backend
 
 **Phase 1 — Try cache backend directly:**
