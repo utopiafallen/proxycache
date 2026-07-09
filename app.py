@@ -657,7 +657,7 @@ async def chat(req: Request):
 
         # 6. Acquire slot (cache backend tried first via restore_info, then fallback)
         restore_info: Optional[tuple[str, str, str]] = None
-        if restore_key and restore_backend:
+        if restore_backend:
             restore_info = (restore_key, restore_backend, canonical_name)
         g, restored = await asyncio.wait_for(
             sm.acquire_for_request(candidate_backends, restore_info, blocks, prompt_tokens),
