@@ -61,8 +61,7 @@ class SlotManager:
         # Per-slot save skip tracking — (key, blocks, n_tokens) if last save was intentionally skipped
         self._slot_save_skipped: Dict[GSlot, tuple] = {}
 
-        # Cache hit wait queue: per-backend semaphore and pending count
-        self._cache_wait_semaphores: Dict[str, asyncio.Semaphore] = {}
+        # Cache hit wait queue: per-backend pending waiter count
         self._cache_wait_pending: Dict[str, int] = {}
 
         # Per-backend save lock to protect ring buffer + eviction from concurrent saves
@@ -235,9 +234,12 @@ class SlotManager:
             # Remove old slots (only free ones)
             for s in old_pool - new_pool:
                 if self._is_free(model_name, backend_id, s):
+                    g = (model_name, backend_id, s)
                     self._slot_pools[key].discard(s)
-                    self._last_used.pop((model_name, backend_id, s), None)
-                    self._in_use.pop((model_name, backend_id, s), None)
+                    self._last_used.pop(g, None)
+                    self._in_use.pop(g, None)
+                    self._slot_kv_state.pop(g, None)
+                    self._slot_save_skipped.pop(g, None)
             self._slot_pools[key] = new_pool
             log.info(
                 "Updated slot pool for model '%s' on backend '%s': %d -> %d slots",
@@ -313,38 +315,49 @@ class SlotManager:
             for canonical_name, n_slots in model_slots.items():
                 self._ensure_pool(canonical_name, backend_key, n_slots)
 
-        # Phase 0: optionally wait for cache backend if slots are busy
+        # Phase 0: try cache backend first; if busy, poll every 5s up to EMA timeout
         if restore_info:
             restore_key, cache_backend, canonical_name = restore_info
-            pending = self._cache_wait_pending.get(cache_backend, 0)
-            if pending < CACHE_HIT_WAIT_MAX_PENDING_REQS:
-                sem = self._cache_wait_semaphores.setdefault(
-                    cache_backend, asyncio.Semaphore(CACHE_HIT_WAIT_MAX_PENDING_REQS)
-                )
-                ema = self._slot_duration_ema.get(cache_backend, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
-                wait_timeout = max(min(ema, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
-                try:
-                    self._cache_wait_pending[cache_backend] = pending + 1
-                    await asyncio.wait_for(sem.acquire(), timeout=wait_timeout)
-                    # Semaphore released → cache backend freed a slot, try to acquire it
-                    slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, cache_backend)
-                    if slot_id is not None:
-                        min_ctx = backend_manager.get_model_n_ctx(canonical_name)
-                        if prompt_tokens < min_ctx and self._try_acquire(canonical_name, cache_backend, slot_id):
-                            g = (canonical_name, cache_backend, slot_id)
-                            self._slot_acquired_at[g] = time.time()
-                            prev_kv = self._slot_kv_state.get(g)
-                            self._slot_kv_state[g] = blocks or []
-                            return await self._restore_and_return(
-                                canonical_name, cache_backend, slot_id,
-                                restore_key, blocks, prev_kv,
-                            )
-                except asyncio.TimeoutError:
-                    pass
-                finally:
-                    self._cache_wait_pending[cache_backend] -= 1
-                    sem.release()
-                    # Timeout — fall through to retry loop (Phase 1 + Phase 2)
+            min_ctx = backend_manager.get_model_n_ctx(canonical_name)
+            if prompt_tokens < min_ctx:
+                slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, cache_backend)
+                if slot_id is not None and self._try_acquire(canonical_name, cache_backend, slot_id):
+                    g = (canonical_name, cache_backend, slot_id)
+                    self._slot_acquired_at[g] = time.time()
+                    prev_kv = self._slot_kv_state.get(g)
+                    self._slot_kv_state[g] = blocks or []
+                    return await self._restore_and_return(
+                        canonical_name, cache_backend, slot_id,
+                        restore_key, blocks, prev_kv,
+                    )
+
+                # No free slot — poll every 5s up to EMA timeout (limited concurrency)
+                pending = self._cache_wait_pending.get(cache_backend, 0)
+                if pending < CACHE_HIT_WAIT_MAX_PENDING_REQS:
+                    ema = self._slot_duration_ema.get(cache_backend, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
+                    wait_timeout = max(min(ema, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
+                    log.info(
+                        "Cache backend '%s' busy for model '%s', polling up to %.1fs",
+                        cache_backend, canonical_name, wait_timeout,
+                    )
+                    try:
+                        self._cache_wait_pending[cache_backend] = pending + 1
+                        elapsed = 0.0
+                        while elapsed < wait_timeout:
+                            await asyncio.sleep(min(5.0, wait_timeout - elapsed))
+                            elapsed += 5.0
+                            slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, cache_backend)
+                            if slot_id is not None and self._try_acquire(canonical_name, cache_backend, slot_id):
+                                g = (canonical_name, cache_backend, slot_id)
+                                self._slot_acquired_at[g] = time.time()
+                                prev_kv = self._slot_kv_state.get(g)
+                                self._slot_kv_state[g] = blocks or []
+                                return await self._restore_and_return(
+                                    canonical_name, cache_backend, slot_id,
+                                    restore_key, blocks, prev_kv,
+                                )
+                    finally:
+                        self._cache_wait_pending[cache_backend] -= 1
 
         # Retry loop: check all backends, sleep 5s if none available
         RETRY_COUNT=11
@@ -388,7 +401,7 @@ class SlotManager:
                     )
 
             # No slot available — exponential backoff before retrying (last iteration skips sleep)
-            if attempt < RETRY_COUNT:
+            if attempt < RETRY_COUNT - 1:
                 backoff = (attempt + 1) * 5
                 log.info("No slots available across all backends, retrying in %ds (attempt %d/%d)", backoff, attempt + 1, RETRY_COUNT)
                 await asyncio.sleep(backoff)
@@ -641,10 +654,7 @@ class SlotManager:
             old = self._slot_duration_ema.get(backend_id, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
             self._slot_duration_ema[backend_id] = CACHE_HIT_WAIT_EMA_ALPHA * duration + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * old
 
-        # Wake up one waiting request for this backend (if any)
-        sem = self._cache_wait_semaphores.get(backend_id)
-        if sem:
-            sem.release()
+        # (waiters poll every 5s, no explicit signaling needed)
 
     def _touch_ring(self, key: str, backend_id: str):
         """Update the last_used timestamp for a cache entry in the ring buffer."""
