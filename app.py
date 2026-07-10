@@ -409,6 +409,7 @@ class StreamReader:
                 stream_status = "cancelled"
             else:
                 stream_status = "backend_error"
+            latency_ms = (time.time() - self._t0) * 1000
             metrics.record({
                 "request_id": self._request_id,
                 "t0": self._t0,
@@ -420,7 +421,7 @@ class StreamReader:
                 "restored": self.restored,
                 "recompute": recompute_happened,
                 "saved": ok,
-                "latency_ms": (time.time() - self._t0) * 1000,
+                "latency_ms": latency_ms,
                 "n_tokens": self._sse_prompt_tokens or self.n_tokens,
                 "cached_tokens": self._sse_cached_tokens or 0,
                 "stream": True,
@@ -429,6 +430,7 @@ class StreamReader:
                 "routing_reason": self._routing_reason,
                 "status": stream_status,
             })
+            self.sm.update_backend_latency(self.backend_id, latency_ms)
 
         log.info("Stream reader finished for model '%s' on backend '%s' slot %d (key %s): saved=%s",
                   self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
@@ -655,10 +657,17 @@ async def chat(req: Request):
                 if not restore_key or be_id != restore_backend:
                     candidate_backends.append((be_id, opt.name))
 
-        # Sort fallback backends by LRU (least recently used first).
-        # Safe always: the restore backend is excluded from candidates and
-        # tried first via restore_info in Phase 0/1.
-        candidate_backends.sort(key=lambda cb: sm.get_backend_last_used(cb[0]))
+        # Sort fallback backends by a composite score to minimize cache churn
+        # and latency. Safe always: the restore backend is excluded from
+        # candidates and tried first via restore_info in Phase 0/1.
+        candidate_backends.sort(
+            key=lambda cb: (
+                backend_cache_ratios.get(cb[0], 0.0),
+                len(sm._cache_ring.get(cb[0], [])),
+                sm.get_backend_latency_ema(cb[0]),
+                sm.get_backend_last_used(cb[0]),
+            ),
+        )
 
         # 6. Acquire slot (cache backend tried first via restore_info, then fallback)
         restore_info: Optional[tuple[str, str, str]] = None
@@ -860,6 +869,7 @@ async def chat(req: Request):
 
             # Record metrics for non-streaming requests
             prompt_preview = extract_prompt_preview(request_json)
+            latency_ms = (time.time() - t0) * 1000
             metrics.record({
                 "request_id": request_id,
                 "t0": t0,
@@ -871,7 +881,7 @@ async def chat(req: Request):
                 "restored": restored,
                 "recompute": recompute_happened,
                 "saved": save_ok,
-                "latency_ms": (time.time() - t0) * 1000,
+                "latency_ms": latency_ms,
                 "n_tokens": llm_prompt_tokens,
                 "cached_tokens": cached_tokens,
                 "stream": False,
@@ -880,6 +890,7 @@ async def chat(req: Request):
                 "routing_reason": routing_reason,
                 "status": "complete",
             })
+            sm.update_backend_latency(be_id, latency_ms)
 
             # log.info(
             #     "json_response\n%s",

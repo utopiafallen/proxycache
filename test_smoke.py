@@ -8,6 +8,7 @@ import json
 import tempfile
 import time
 import asyncio
+from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1767,34 +1768,58 @@ def test_no_cache_fallback_lru():
 
 
 def test_no_cache_lru_backend_routing():
-    """When no cache hit, candidate backends are sorted by LRU — least recently used first."""
+    """Cache-miss routing uses composite sort: cache ratio (lowest), ring size (fewest), latency (fastest), LRU (least recent)."""
     from slot_manager import SlotManager
     import time
 
     sm = SlotManager()
 
-    # Backend 1 used recently, backend 2 used long ago, backend 3 never used
+    # Backend state:
+    #   be1: ratio=0.0, ring=5, latency=200ms, last_used=recent
+    #   be2: ratio=0.0, ring=5, latency=50ms,  last_used=old
+    #   be3: ratio=0.8, ring=1, latency=100ms, last_used=never
     now = time.time()
     sm._backend_last_used["10.0.0.1:8000"] = now
     sm._backend_last_used["10.0.0.2:8000"] = now - 1000
-    # backend 3 never used -> get_backend_last_used returns 0.0
+    sm._cache_ring["10.0.0.1:8000"] = deque([(f"key_{i}", 1024, now - i) for i in range(5)])
+    sm._cache_ring["10.0.0.2:8000"] = deque([(f"key_{i}", 1024, now - i) for i in range(5)])
+    sm._cache_ring["10.0.0.3:8000"] = deque([("key_0", 1024, now)])
+    sm._backend_latency_ema["10.0.0.1:8000"] = 200.0
+    sm._backend_latency_ema["10.0.0.2:8000"] = 50.0
+    sm._backend_latency_ema["10.0.0.3:8000"] = 100.0
 
-    # Verify accessor returns correct timestamps
-    assert sm.get_backend_last_used("10.0.0.3:8000") == 0.0, "Never-used backend should return 0.0"
-    assert sm.get_backend_last_used("10.0.0.1:8000") == now, "Recently used backend timestamp mismatch"
+    backend_cache_ratios = {
+        "10.0.0.1:8000": 0.0,
+        "10.0.0.2:8000": 0.0,
+        "10.0.0.3:8000": 0.8,
+    }
 
-    # Simulate the sorting logic from app.py: candidate_backends.sort(key=lambda cb: sm.get_backend_last_used(cb[0]))
+    # Simulate the sorting logic from app.py
     candidate_backends = [
-        ("10.0.0.1:8000", "ModelA"),   # most recent
-        ("10.0.0.2:8000", "ModelA"),   # older
-        ("10.0.0.3:8000", "ModelA"),   # never used
+        ("10.0.0.1:8000", "ModelA"),
+        ("10.0.0.2:8000", "ModelA"),
+        ("10.0.0.3:8000", "ModelA"),
     ]
-    candidate_backends.sort(key=lambda cb: sm.get_backend_last_used(cb[0]))
+    candidate_backends.sort(
+        key=lambda cb: (
+            backend_cache_ratios.get(cb[0], 0.0),
+            len(sm._cache_ring.get(cb[0], [])),
+            sm.get_backend_latency_ema(cb[0]),
+            sm.get_backend_last_used(cb[0]),
+        ),
+    )
 
-    # After sort: never-used first, then oldest, then most recent
-    assert candidate_backends[0][0] == "10.0.0.3:8000", f"Expected never-used first, got {candidate_backends[0][0]}"
-    assert candidate_backends[1][0] == "10.0.0.2:8000", f"Expected oldest second, got {candidate_backends[1][0]}"
-    assert candidate_backends[2][0] == "10.0.0.1:8000", f"Expected most recent last, got {candidate_backends[2][0]}"
+    # Expected order:
+    # 1. be2 (ratio=0.0, ring=5, latency=50ms, last_used=old) — fastest of equal-ratio backends
+    # 2. be1 (ratio=0.0, ring=5, latency=200ms, last_used=recent) — slower of equal-ratio backends
+    # 3. be3 (ratio=0.8, ring=1, latency=100ms, last_used=0.0) — high ratio, always last
+    assert candidate_backends[0][0] == "10.0.0.2:8000", f"Expected be2 first (fastest), got {candidate_backends[0][0]}"
+    assert candidate_backends[1][0] == "10.0.0.1:8000", f"Expected be1 second (slower), got {candidate_backends[1][0]}"
+    assert candidate_backends[2][0] == "10.0.0.3:8000", f"Expected be3 last (high ratio), got {candidate_backends[2][0]}"
+
+    # Verify latency EMA tracking
+    sm.update_backend_latency("10.0.0.1:8000", 150.0)
+    assert sm.get_backend_latency_ema("10.0.0.1:8000") > 0, "EMA should be > 0 after update"
 
     # Verify _try_acquire updates _backend_last_used
     sm._slot_pools[("ModelA", "10.0.0.1:8000")] = {0}

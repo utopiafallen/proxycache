@@ -76,6 +76,9 @@ class SlotManager:
         # Per-backend last-used timestamp: backend_id -> float
         self._backend_last_used: Dict[str, float] = {}
 
+        # Per-backend average request latency (EMA): backend_id -> float in ms
+        self._backend_latency_ema: Dict[str, float] = {}
+
         log.info("Cache entry expiry set to %d hours", CACHE_MAX_AGE_HOURS)
 
     async def _evict_cache_file(self, key: str, backend_id: str, log_msg: str, log_extra: str):
@@ -294,6 +297,16 @@ class SlotManager:
     def get_backend_last_used(self, backend_id: str) -> float:
         """Return the last time any slot on the backend was acquired. 0.0 if never used."""
         return self._backend_last_used.get(backend_id, 0.0)
+
+    def update_backend_latency(self, backend_id: str, latency_ms: float) -> None:
+        """Update the EMA of average request latency for a backend (in ms)."""
+        alpha = CACHE_HIT_WAIT_EMA_ALPHA
+        old = self._backend_latency_ema.get(backend_id, latency_ms)
+        self._backend_latency_ema[backend_id] = alpha * latency_ms + (1 - alpha) * old
+
+    def get_backend_latency_ema(self, backend_id: str) -> float:
+        """Return the EMA of average request latency for a backend. 0.0 if no data."""
+        return self._backend_latency_ema.get(backend_id, 0.0)
 
     async def acquire_for_request(
         self,
