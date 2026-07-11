@@ -481,54 +481,25 @@ class SlotManager:
                 )
                 restored = False
             elif effective_restore_key:
-                client = backend_manager.get_client(backend_id)
-                try:
-                    restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
-                except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
-                    log.warning(
-                        "Restore failed for model '%s' on backend '%s' slot %d (key %s): %s — trying fallback",
-                        model_name, backend_id, slot_id, effective_restore_key[:16], e,
-                    )
-                    restored = False
-                except Exception as e:
-                    log.warning(
-                        "Unexpected error restoring cache for model '%s' on backend '%s' slot %d (key %s): %s",
-                        model_name, backend_id, slot_id, effective_restore_key[:16], e,
-                    )
-                    restored = False
-                log.info(
-                    "Restored cache for model '%s' on backend '%s' slot %d: ok=%s",
-                    model_name, backend_id, slot_id, restored,
+                restored = await self._do_restore(
+                    slot_id, effective_restore_key, model_name, backend_id,
+                    touch_ring=True,
                 )
                 if restored:
-                    self._touch_ring(effective_restore_key, backend_id)
                     blocks = kv_meta.get_blocks(effective_restore_key, backend_id)
                     if blocks is not None:
                         self._slot_kv_state[g] = blocks
             else:
-                client = backend_manager.get_client(backend_id)
                 cand = kv_meta.find_best_restore_candidate(
                     blocks, WORDS_PER_BLOCK, LCP_TH, model_name, backend_id,
                 )
                 if cand:
                     cand_key, cand_ratio = cand
-                    try:
-                        restored = await client.restore_slot(slot_id, cand_key, model_name)
-                    except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
-                        log.warning(
-                            "Dynamic restore failed for model '%s' on backend '%s' slot %d (key %s): %s — trying fallback",
-                            model_name, backend_id, slot_id, cand_key[:16], e,
-                        )
-                        restored = False
-                    except Exception as e:
-                        log.warning(
-                            "Unexpected error restoring cache for model '%s' on backend '%s' slot %d (key %s): %s",
-                            model_name, backend_id, slot_id, cand_key[:16], e,
-                        )
-                        restored = False
-                    log.info(
-                        "Dynamically restored cache for model '%s' on backend '%s' slot %d (key %s, ratio %.3f): ok=%s",
-                        model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
+                    restored = await self._do_restore(
+                        slot_id, cand_key, model_name, backend_id,
+                        touch_ring=False,
+                        log_prefix="Dynamic",
+                        log_extra=f", ratio {cand_ratio:.3f}",
                     )
                     if restored:
                         blocks = kv_meta.get_blocks(cand_key, backend_id)
@@ -542,29 +513,58 @@ class SlotManager:
                     restored = False
 
         elif effective_restore_key:
-            client = backend_manager.get_client(backend_id)
-            try:
-                restored = await client.restore_slot(slot_id, effective_restore_key, model_name)
-            except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
-                log.warning(
-                    "Restore failed for model '%s' on backend '%s' slot %d (key %s): %s — trying fallback",
-                    model_name, backend_id, slot_id, effective_restore_key[:16], e,
-                )
-                restored = False
-            except Exception as e:
-                log.warning(
-                    "Unexpected error restoring cache for model '%s' on backend '%s' slot %d (key %s): %s",
-                    model_name, backend_id, slot_id, effective_restore_key[:16], e,
-                )
-                restored = False
-            log.info(
-                "Restored cache for model '%s' on backend '%s' slot %d: ok=%s",
-                model_name, backend_id, slot_id, restored,
+            restored = await self._do_restore(
+                slot_id, effective_restore_key, model_name, backend_id,
+                touch_ring=True,
             )
-            if restored:
-                self._touch_ring(effective_restore_key, backend_id)
 
         return g, restored
+
+    async def _do_restore(
+        self,
+        slot_id: int,
+        key: str,
+        model_name: str,
+        backend_id: str,
+        touch_ring: bool = False,
+        log_prefix: str = "Restore",
+        log_extra: str = "",
+    ) -> bool:
+        """Perform a slot restore with standardized error handling.
+
+        Args:
+            slot_id: Target slot.
+            key: Cache file basename.
+            model_name: Model name for logging.
+            backend_id: Backend key for client lookup.
+            touch_ring: Update the ring buffer last_used timestamp on success.
+            update_kv: Update _slot_kv_state from the restored meta on success.
+            log_prefix: Prefix for the success log message (e.g. "Restore", "Dynamic").
+            log_extra: Extra text appended to the success log message.
+        """
+        client = backend_manager.get_client(backend_id)
+        try:
+            restored = await client.restore_slot(slot_id, key, model_name)
+        except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as e:
+            log.warning(
+                "%s failed for model '%s' on backend '%s' slot %d (key %s): %s",
+                log_prefix, model_name, backend_id, slot_id, key[:16], e,
+            )
+            restored = False
+        except Exception as e:
+            log.warning(
+                "Unexpected error %s cache for model '%s' on backend '%s' slot %d (key %s): %s",
+                log_prefix.lower(), model_name, backend_id, slot_id, key[:16], e,
+            )
+            restored = False
+        log.info(
+            "%s restored cache for model '%s' on backend '%s' slot %d (key %s): ok=%s%s",
+            log_prefix, model_name, backend_id, slot_id, key[:16], restored, log_extra,
+        )
+        if restored:
+            if touch_ring:
+                self._touch_ring(key, backend_id)
+        return restored
 
     async def save_after(
         self,

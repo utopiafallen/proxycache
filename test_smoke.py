@@ -14,6 +14,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+# ── Test helpers ──────────────────────────────────────────────────────
+
+async def _fast_sleep(*args, **kwargs):
+    """No-op sleep for tests that wait on asyncio.sleep (retries, polling)."""
+    pass
+
+
 # ── Compile check ─────────────────────────────────────────────────────
 
 def test_compile_all():
@@ -2188,7 +2195,8 @@ def test_acquire_for_request_retries_on_lock_timeout():
         assert slot_id == 0, f"Expected slot 0, got {slot_id}"
         return True
 
-    result = asyncio.run(_run())
+    with patch("asyncio.sleep", _fast_sleep):
+        result = asyncio.run(_run())
     assert result
     print("PASS: test_acquire_for_request_retries_on_lock_timeout")
 
@@ -2333,12 +2341,8 @@ def test_cache_hit_wait_phase0_success():
         restore_info = ("abc123", "backend1", "ModelA")
         candidate_backends = []
 
-        # Release the semaphore after a short delay to simulate slot freeing
-        async def release_after_delay():
-            await asyncio.sleep(0.1)
-            sm.release("ModelA", "backend1", 0)
-
-        asyncio.create_task(release_after_delay())
+        # Release the slot immediately (sleep mock makes this instant)
+        sm.release("ModelA", "backend1", 0)
 
         # Mock refresh_slot_counts and get_client to avoid backend setup
         mock_client = MagicMock()
@@ -2354,7 +2358,8 @@ def test_cache_hit_wait_phase0_success():
                 )
                 return g, restored
 
-    g, restored = asyncio.run(run_test())
+    with patch("asyncio.sleep", _fast_sleep):
+        g, restored = asyncio.run(run_test())
     assert g == ("ModelA", "backend1", 0), f"Expected ('ModelA', 'backend1', 0), got {g}"
     assert restored is True
     print("PASS: test_cache_hit_wait_phase0_success")
@@ -2414,7 +2419,8 @@ def test_cache_hit_wait_phase0_timeout():
                 )
                 return g, restored
 
-    g, restored = asyncio.run(run_test())
+    with patch("asyncio.sleep", _fast_sleep):
+        g, restored = asyncio.run(run_test())
     # Should fall through to Phase 2 after Phase 0 timeout
     assert g == ("ModelB", "backend2", 0), f"Expected ('ModelB', 'backend2', 0), got {g}"
     print("PASS: test_cache_hit_wait_phase0_timeout")
