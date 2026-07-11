@@ -336,16 +336,9 @@ class SlotManager:
             restore_key, cache_backend, canonical_name = restore_info
             min_ctx = backend_manager.get_model_n_ctx(canonical_name)
             if prompt_tokens < min_ctx:
-                slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, cache_backend)
-                if slot_id is not None and self._try_acquire(canonical_name, cache_backend, slot_id):
-                    g = (canonical_name, cache_backend, slot_id)
-                    self._slot_acquired_at[g] = time.time()
-                    prev_kv = self._slot_kv_state.get(g)
-                    self._slot_kv_state[g] = blocks or []
-                    return await self._restore_and_return(
-                        canonical_name, cache_backend, slot_id,
-                        restore_key, blocks, prev_kv,
-                    )
+                result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, blocks)
+                if result:
+                    return result
 
                 # No free slot — poll every 5s up to EMA timeout (limited concurrency)
                 pending = self._cache_wait_pending.get(cache_backend, 0)
@@ -362,16 +355,9 @@ class SlotManager:
                         while elapsed < wait_timeout:
                             await asyncio.sleep(min(5.0, wait_timeout - elapsed))
                             elapsed += 5.0
-                            slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, cache_backend)
-                            if slot_id is not None and self._try_acquire(canonical_name, cache_backend, slot_id):
-                                g = (canonical_name, cache_backend, slot_id)
-                                self._slot_acquired_at[g] = time.time()
-                                prev_kv = self._slot_kv_state.get(g)
-                                self._slot_kv_state[g] = blocks or []
-                                return await self._restore_and_return(
-                                    canonical_name, cache_backend, slot_id,
-                                    restore_key, blocks, prev_kv,
-                                )
+                            result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, blocks)
+                            if result:
+                                return result
                     finally:
                         self._cache_wait_pending[cache_backend] -= 1
 
@@ -383,17 +369,9 @@ class SlotManager:
                 restore_key, cache_backend, canonical_name = restore_info
                 min_ctx = backend_manager.get_model_n_ctx(canonical_name)
                 if prompt_tokens < min_ctx:
-                    slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, cache_backend)
-                    if slot_id is not None and self._try_acquire(canonical_name, cache_backend, slot_id):
-                        cache_acquired = True
-                        g = (canonical_name, cache_backend, slot_id)
-                        self._slot_acquired_at[g] = time.time()
-                        prev_kv = self._slot_kv_state.get(g)
-                        self._slot_kv_state[g] = blocks or []
-                        return await self._restore_and_return(
-                            canonical_name, cache_backend, slot_id,
-                            restore_key, blocks, prev_kv,
-                        )
+                    result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, blocks)
+                    if result:
+                        return result
 
             # Phase 2: check all fallback candidate backends
             for backend_id, canonical_name in candidate_backends:
@@ -402,18 +380,9 @@ class SlotManager:
                 min_ctx = backend_manager.get_model_n_ctx(canonical_name)
                 if prompt_tokens >= min_ctx:
                     continue
-                slot_id, _ = self._get_free_or_oldest_from_pool(canonical_name, backend_id)
-                if slot_id is None:
-                    continue
-                if self._try_acquire(canonical_name, backend_id, slot_id):
-                    g = (canonical_name, backend_id, slot_id)
-                    self._slot_acquired_at[g] = time.time()
-                    prev_kv = self._slot_kv_state.get(g)
-                    self._slot_kv_state[g] = blocks or []
-                    return await self._restore_and_return(
-                        canonical_name, backend_id, slot_id,
-                        None, blocks, prev_kv,
-                    )
+                result = await self._try_acquire_and_restore(canonical_name, backend_id, None, blocks)
+                if result:
+                    return result
 
             # No slot available — exponential backoff before retrying (last iteration skips sleep)
             if attempt < RETRY_COUNT - 1:
@@ -422,6 +391,31 @@ class SlotManager:
                 await asyncio.sleep(backoff)
 
         raise RuntimeError(f"No slots available for candidate_backends={len(candidate_backends)}")
+
+    async def _try_acquire_and_restore(
+        self,
+        model_name: str,
+        backend_id: str,
+        restore_key: Optional[str],
+        blocks: Optional[List[str]],
+    ) -> Optional[Tuple[GSlot, Optional[bool]]]:
+        """Try to acquire a slot on a backend and restore cache.
+
+        Returns (g, restored) on success, None if acquisition failed.
+        """
+        slot_id, _ = self._get_free_or_oldest_from_pool(model_name, backend_id)
+        if slot_id is None:
+            return None
+        if not self._try_acquire(model_name, backend_id, slot_id):
+            return None
+        g = (model_name, backend_id, slot_id)
+        self._slot_acquired_at[g] = time.time()
+        prev_kv = self._slot_kv_state.get(g)
+        self._slot_kv_state[g] = blocks or []
+        return await self._restore_and_return(
+            model_name, backend_id, slot_id,
+            restore_key, blocks, prev_kv,
+        )
 
     async def _restore_and_return(
         self,
