@@ -36,24 +36,17 @@ class KVMetaManager:
         """Path to a backend's meta directory."""
         return os.path.join(META_DIR, hs.sanitize_backend_dir(backend_key))
 
-    def scan_all_meta(self, backend_key: Optional[str] = None) -> List[Dict]:
-        """Scan meta files for a backend (or all backends) and return list of meta dicts."""
-        if backend_key:
-            search_dir = self.meta_dir(backend_key)
-            if not os.path.isdir(search_dir):
-                log.warn("Meta directory missing for backend '%s'", backend_key)
-                return []
-            files = sorted(
-                glob.glob(os.path.join(search_dir, "*" + hs.META_SUFFIX)),
-                key=os.path.getmtime,
-                reverse=True,
-            )
-        else:
-            files = sorted(
-                glob.glob(os.path.join(META_DIR, "*" + hs.META_SUFFIX)),
-                key=os.path.getmtime,
-                reverse=True,
-            )
+    def scan_all_meta(self, backend_key: str) -> List[Dict]:
+        """Scan meta files for a backend and return list of meta dicts."""
+        search_dir = self.meta_dir(backend_key)
+        if not os.path.isdir(search_dir):
+            log.warn("Meta directory missing for backend '%s'", backend_key)
+            return []
+        files = sorted(
+            glob.glob(os.path.join(search_dir, "*" + hs.META_SUFFIX)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
         metas: List[Dict] = []
         for f in files:
             try:
@@ -240,63 +233,21 @@ class KVMetaManager:
 
     async def reconcile(
         self,
-        backend_keys: Optional[List[str]] = None,
+        backend_keys: List[str],
     ) -> int:
         """Reconcile meta files with cache store. Returns count deleted."""
         deleted = 0
         deleted_backends = set()
 
-        if backend_keys:
-            for backend_key in backend_keys:
-                backend_dir = self.meta_dir(backend_key)
-                if not os.path.isdir(backend_dir):
-                    continue
+        for backend_key in backend_keys:
+            backend_dir = self.meta_dir(backend_key)
+            if not os.path.isdir(backend_dir):
+                continue
 
-                meta_files = sorted(glob.glob(os.path.join(backend_dir, "*" + hs.META_SUFFIX)))
+            meta_files = sorted(glob.glob(os.path.join(backend_dir, "*" + hs.META_SUFFIX)))
 
-                # First pass: read all meta files, remove corrupted ones, collect valid keys
-                valid_entries = []  # (meta_path, basename, cachename)
-                for meta_path in meta_files:
-                    basename = os.path.basename(meta_path)
-                    cachename = basename.removesuffix(hs.META_SUFFIX)
-
-                    try:
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            json.load(f)
-                    except (json.JSONDecodeError, Exception):
-                        log.warning("Removed corrupted meta file: %s", basename)
-                        try:
-                            os.remove(meta_path)
-                            deleted += 1
-                            deleted_backends.add(backend_key)
-                        except OSError:
-                            pass
-                        continue
-
-                    valid_entries.append((meta_path, basename, cachename))
-
-                # Second pass: check cache existence via backend_manager
-                for meta_path, basename, cachename in valid_entries:
-                    cache_exists = await backend_manager.cache_exists(backend_key, cachename)
-
-                    if not cache_exists:
-                        log.info("Removed orphan meta file (no matching cache): %s", basename)
-                        try:
-                            os.remove(meta_path)
-                            deleted += 1
-                            deleted_backends.add(backend_key)
-                        except OSError:
-                            pass
-
-                if backend_key in deleted_backends:
-                    try:
-                        if not os.listdir(backend_dir):
-                            os.rmdir(backend_dir)
-                            log.info("Removed empty backend directory: %s", backend_key)
-                    except OSError:
-                        pass
-        else:
-            meta_files = sorted(glob.glob(os.path.join(META_DIR, "*" + hs.META_SUFFIX)))
+            # First pass: read all meta files, remove corrupted ones, collect valid keys
+            valid_entries = []  # (meta_path, basename, cachename)
             for meta_path in meta_files:
                 basename = os.path.basename(meta_path)
                 cachename = basename.removesuffix(hs.META_SUFFIX)
@@ -304,34 +255,41 @@ class KVMetaManager:
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
                         json.load(f)
-                except (json.JSONDecodeError, Exception) as e:
+                except (json.JSONDecodeError, Exception):
                     log.warning("Removed corrupted meta file: %s", basename)
                     try:
                         os.remove(meta_path)
                         deleted += 1
+                        deleted_backends.add(backend_key)
                     except OSError:
                         pass
                     continue
 
-                # Without backend_keys, we can't determine the backend for cache existence checks
-                # Skip cache existence check for standalone meta files
-                log.info("Removed orphan meta file (no backend context): %s", basename)
+                valid_entries.append((meta_path, basename, cachename))
+
+            # Second pass: check cache existence via backend_manager
+            for meta_path, basename, cachename in valid_entries:
+                cache_exists = await backend_manager.cache_exists(backend_key, cachename)
+
+                if not cache_exists:
+                    log.info("Removed orphan meta file (no matching cache): %s", basename)
+                    try:
+                        os.remove(meta_path)
+                        deleted += 1
+                        deleted_backends.add(backend_key)
+                    except OSError:
+                        pass
+
+            if backend_key in deleted_backends:
                 try:
-                    os.remove(meta_path)
-                    deleted += 1
+                    if not os.listdir(backend_dir):
+                        os.rmdir(backend_dir)
+                        log.info("Removed empty backend directory: %s", backend_key)
                 except OSError:
                     pass
 
         log.info("Finished reconciling meta files with llama cache directory")
         return deleted
-
-    async def total_meta_size(self, backend_id: str) -> int:
-        """Return total size of all cache files for a backend."""
-        total = 0
-        for key in self.list_keys(backend_id):
-            total += await self.get_cache_size(key, backend_id, cache_dir)
-        return total
-
 
 # Singleton instance
 kv_meta = KVMetaManager()

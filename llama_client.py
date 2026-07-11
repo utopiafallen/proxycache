@@ -298,13 +298,14 @@ class LlamaClient:
 
         # Filter to requested model if specified
         if model_name:
-            models = [m for m in models if m["name"] == model_name]
-            if not models:
+            matched = [m for m in models if m["name"] == model_name]
+            if not matched:
                 log.warning(
                     "Model '%s' not loaded, available models: %s",
                     model_name, [m["name"] for m in models],
                 )
                 return None
+            models = matched
 
         all_slots = []
         for m in models:

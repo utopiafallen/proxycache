@@ -297,7 +297,7 @@ def test_slot_manager_release():
     # Release
     sm.release("ModelA", "10.0.0.1:8000", 0)
     assert not sm._in_use[("ModelA", "10.0.0.1:8000", 0)]
-    assert sm._last_used[("ModelA", "10.0.0.1:8000", 0)] == 0.0
+    assert sm._last_used[("ModelA", "10.0.0.1:8000", 0)] == 100.0
     print("PASS: test_slot_manager_release")
 
 
@@ -1200,7 +1200,7 @@ def test_streaming_completion_releases_slot():
             "save_slot must be called on normal completion"
 
         # Pool state: slot 0 should be free
-        assert sm._last_used.get(("ModelA", "10.0.0.1:8000", 0), 0.0) == 0.0, \
+        assert not sm._in_use.get(("ModelA", "10.0.0.1:8000", 0), True), \
             "Slot must be free after completion"
 
     asyncio.run(_run())

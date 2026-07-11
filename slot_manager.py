@@ -667,7 +667,6 @@ class SlotManager:
     def release(self, model_name: str, backend_id: str, slot_id: int):
         g = (model_name, backend_id, slot_id)
         self._in_use[g] = False
-        self._last_used[g] = 0.0
 
         # Update EMA of slot occupancy duration
         if g in self._slot_acquired_at:
