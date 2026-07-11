@@ -40,7 +40,7 @@ class KVMetaManager:
         """Scan meta files for a backend and return list of meta dicts."""
         search_dir = self.meta_dir(backend_key)
         if not os.path.isdir(search_dir):
-            log.warn("Meta directory missing for backend '%s'", backend_key)
+            log.warning("Meta directory missing for backend '%s'", backend_key)
             return []
         files = sorted(
             glob.glob(os.path.join(search_dir, "*" + hs.META_SUFFIX)),
@@ -54,7 +54,7 @@ class KVMetaManager:
                     metas.append(json.load(fd))
             except Exception as e:
                 log.warning("Failed to read meta file %s: %s", f, e)
-        log.warn("Meta scan found %d entries", len(metas))
+        log.warning("Meta scan found %d entries", len(metas))
         return metas
 
     def read_meta(self, key: str, backend_id: str) -> Optional[Dict]:

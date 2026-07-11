@@ -15,7 +15,6 @@ SlotManager: per-model slot pools with lazy discovery.
 """
 
 import os
-import json
 import time
 import asyncio
 import logging
@@ -81,8 +80,8 @@ class SlotManager:
 
         log.info("Cache entry expiry set to %d hours", CACHE_MAX_AGE_HOURS)
 
-    async def _evict_cache_file(self, key: str, backend_id: str, log_msg: str, log_extra: str):
-        """Delete a cache file via agent or local fallback.
+    async def _evict_entry(self, key: str, backend_id: str, log_msg: str, log_extra: str):
+        """Delete a cache file and its meta file in one step.
 
         Args:
             key: Cache file basename
@@ -98,9 +97,6 @@ class SlotManager:
                 log.warning("%s_agent_fail: %s", log_msg, key[:16])
         else:
             log.warning("%s: no backend_id, skipping cache file deletion", log_msg)
-
-    def _evict_meta_file(self, key: str):
-        """Delete the meta file for a cache entry."""
         kv_meta.delete_meta_file(key)
 
     async def init_from_disk(self):
@@ -156,9 +152,8 @@ class SlotManager:
                         "Startup cleanup: evicting expired entry '%s' for backend '%s' (%d bytes)",
                         evict_key, backend_id, evict_size,
                     )
-                    await self._evict_cache_file(evict_key, backend_id, "startup_evict",
-                                                 "(%d bytes)" % evict_size)
-                    self._evict_meta_file(evict_key)
+                    await self._evict_entry(evict_key, backend_id, "startup_evict",
+                                            "(%d bytes)" % evict_size)
                 else:
                     break
 
@@ -179,9 +174,8 @@ class SlotManager:
                     "Startup cleanup: evicting LRU entry '%s' for backend '%s' (%d bytes, total now=%.1f GB)",
                     evict_key, backend_id, evict_size, self._total_bytes.get(backend_id, 0) / 1024**3,
                 )
-                await self._evict_cache_file(evict_key, backend_id, "startup_evict",
-                                             "(%d bytes)" % evict_size)
-                self._evict_meta_file(evict_key)
+                await self._evict_entry(evict_key, backend_id, "startup_evict",
+                                        "(%d bytes)" % evict_size)
 
         per_backend = [(bid, self._total_bytes.get(bid, 0), len(self._cache_ring.get(bid, [])))
                        for bid in self._cache_ring]
@@ -277,7 +271,7 @@ class SlotManager:
         lcp = hs.lcp_blocks(req_blocks, prev_blocks)
         denom = max(1, min(len(req_blocks), len(prev_blocks)))
         ratio = lcp / denom
-        log.warn(
+        log.warning(
             "Checking skip restore for model '%s' on backend '%s' slot %d: ratio=%.3f",
             g[0], g[1], g[2], ratio,
         )
@@ -385,7 +379,6 @@ class SlotManager:
         RETRY_COUNT=11
         for attempt in range(RETRY_COUNT):
             # Phase 1: check cache backend first (if provided)
-            cache_acquired = False
             if restore_info:
                 restore_key, cache_backend, canonical_name = restore_info
                 min_ctx = backend_manager.get_model_n_ctx(canonical_name)
@@ -590,7 +583,7 @@ class SlotManager:
         if blocks:
             g = (model_name, backend_id, slot_id)
             self._slot_kv_state[g] = blocks
-            log.warn(
+            log.warning(
                 "Updated KV cache state for model '%s' on backend '%s' slot %d: %d blocks",
                 model_name, backend_id, slot_id, len(blocks),
             )
@@ -626,9 +619,8 @@ class SlotManager:
                             ring.remove(entry)
                             self._total_bytes[backend_id] -= evict_size
                             age_hours = (now - entry[2]) / 3600
-                            await self._evict_cache_file(evict_key, backend_id, "ring_evict_expired",
-                                                         "(%d bytes, age=%.1fh)" % (evict_size, age_hours))
-                            self._evict_meta_file(evict_key)
+                            await self._evict_entry(evict_key, backend_id, "ring_evict_expired",
+                                                    "(%d bytes, age=%.1fh)" % (evict_size, age_hours))
                             evicted_expired = True
                             break
                     if evicted_expired:
@@ -648,9 +640,8 @@ class SlotManager:
                         "Ring buffer eviction: evicted LRU entry '%s' for backend '%s' (%d bytes, remaining=%d)",
                         evict_key, backend_id, evict_size, self._total_bytes.get(backend_id, 0),
                     )
-                    await self._evict_cache_file(evict_key, backend_id, "ring_evict_lru",
-                                                 "(%d bytes, last_used=%.0f)" % (evict_size, lru_ts))
-                    self._evict_meta_file(evict_key)
+                    await self._evict_entry(evict_key, backend_id, "ring_evict_lru",
+                                            "(%d bytes, last_used=%.0f)" % (evict_size, lru_ts))
 
         return ok, size
 

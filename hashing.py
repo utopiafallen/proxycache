@@ -40,7 +40,7 @@ def block_hashes_from_tokens(token_ids: List[int], wpb: int = WORDS_PER_BLOCK) -
         chunk = token_ids[i:i + wpb]
         h = hashlib.sha256(",".join(str(t) for t in chunk).encode("utf-8")).hexdigest()
         hashes.append(h)
-    log.warn("Block hashes: %d blocks, %d tokens per block", len(hashes), wpb)
+    log.warning("Block hashes: %d blocks, %d tokens per block", len(hashes), wpb)
     return hashes
 
 

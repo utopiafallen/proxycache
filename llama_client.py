@@ -316,7 +316,7 @@ class LlamaClient:
                     s["_router_model"] = m["name"]
                     s["_router_port"] = m["port"]
                 all_slots.extend(slots)
-                log.warn(
+                log.warning(
                     "Child process %s:%d returned %d slots",
                     m["name"], m["port"], len(slots),
                 )
