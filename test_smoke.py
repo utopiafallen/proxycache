@@ -837,7 +837,7 @@ def test_lock_released_on_restore_failure():
 
     async def _run():
         try:
-            await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")], restore_key="bad_key", blocks=["a", "b"])
+            await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")], restore_key="bad_key", backend_blocks={"10.0.0.1:8000": ["a", "b"]})
         except Exception:
             pass
 
@@ -2354,7 +2354,7 @@ def test_cache_hit_wait_phase0_success():
         with patch.object(backend_manager, "refresh_slot_counts", new=AsyncMock(return_value={})):
             with patch.object(backend_manager, "get_client", side_effect=mock_get_client):
                 g, restored = await sm.acquire_for_request(
-                    candidate_backends, restore_info, blocks=["block1"], prompt_tokens=10
+                    candidate_backends, restore_info, backend_blocks={"backend1": ["block1"]}, prompt_tokens=10
                 )
                 return g, restored
 
@@ -2415,7 +2415,7 @@ def test_cache_hit_wait_phase0_timeout():
         with patch.object(backend_manager, "refresh_slot_counts", new=AsyncMock(return_value={})):
             with patch.object(backend_manager, "get_client", side_effect=mock_get_client):
                 g, restored = await sm.acquire_for_request(
-                    candidate_backends, restore_info, blocks=["block1"], prompt_tokens=10
+                    candidate_backends, restore_info, backend_blocks={"backend1": ["block1"]}, prompt_tokens=10
                 )
                 return g, restored
 
@@ -2477,7 +2477,7 @@ def test_cache_hit_wait_pending_count_blocks():
         with patch.object(backend_manager, "refresh_slot_counts", new=AsyncMock(return_value={})):
             with patch.object(backend_manager, "get_client", side_effect=mock_get_client):
                 g, restored = await sm.acquire_for_request(
-                    candidate_backends, restore_info, blocks=["block1"], prompt_tokens=10
+                    candidate_backends, restore_info, backend_blocks={"backend1": ["block1"]}, prompt_tokens=10
                 )
                 return sm, g, restored
 

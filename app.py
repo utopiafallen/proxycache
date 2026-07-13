@@ -209,6 +209,7 @@ class StreamReader:
                         total_bytes += len(chunk)
                         self._raw_response_body.extend(chunk)
                         # Parse SSE events incrementally to extract usage.prompt_tokens
+                        sse_done = False
                         try:
                             text = chunk.decode("utf-8", errors="replace")
                             self._sse_line_buffer += text
@@ -218,6 +219,7 @@ class StreamReader:
                                 if line.startswith("data: "):
                                     data = line[6:].strip()
                                     if data == "[DONE]":
+                                        sse_done = True
                                         break
                                     try:
                                         event = json.loads(data)
@@ -238,6 +240,17 @@ class StreamReader:
                                         continue
                         except Exception:
                             pass
+
+                        if sse_done:
+                            log.info(
+                                "SSE [DONE] received for model '%s' on backend '%s' slot %d (key %s)",
+                                self.model_name, self.backend_id, self.slot_id, self.key_short,
+                            )
+                            self._stream_complete = True
+                            self._disconnect_event.set()
+                            for t in pending:
+                                t.cancel()
+                            break
                         try:
                             self.queue.put_nowait(chunk)
                             chunks_received += 1
@@ -568,14 +581,16 @@ async def chat(req: Request):
         restore_key = None
         restore_backend = None
         best_ratio = 0.0
-        key = None
-        blocks = None
         pending_slot_hit = False
 
         # Routing diagnostics: per-backend scan results for post-hoc analysis
         scan_diagnostics: List[Dict[str, Any]] = []
         # Track cache ratio per backend for save decision (use serving backend's ratio, not winning match)
         backend_cache_ratios: Dict[str, float] = {}
+        # Per-backend tokenization results — used after slot acquisition so blocks/key
+        # always come from the serving backend, avoiding cross-backend tokenization mismatch
+        backend_token_ids: Dict[str, List[int]] = {}
+        backend_blocks: Dict[str, List[str]] = {}
         for opt in options:
             for be_id in opt.backends:
                 opt_client = backend_manager.get_client(be_id)
@@ -591,6 +606,8 @@ async def chat(req: Request):
                     })
                     continue
                 opt_blocks = hs.block_hashes_from_tokens(opt_token_ids, WORDS_PER_BLOCK)
+                backend_token_ids[be_id] = opt_token_ids
+                backend_blocks[be_id] = opt_blocks
                 diag_entry: Dict[str, Any] = {
                     "model": opt.name, "backend": be_id,
                     "n_blocks": len(opt_blocks), "n_tokens": len(opt_token_ids),
@@ -604,8 +621,6 @@ async def chat(req: Request):
                         restore_key = cand[0]
                         restore_backend = be_id
                         canonical_name = opt.name
-                        key = hs.meta_key(opt.name, opt_token_ids)
-                        blocks = opt_blocks
                         pending_slot_hit = False
                         log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
                                  restore_key[:16], canonical_name, restore_backend, best_ratio)
@@ -674,7 +689,7 @@ async def chat(req: Request):
         if restore_backend:
             restore_info = (restore_key, restore_backend, canonical_name)
         g, restored = await asyncio.wait_for(
-            sm.acquire_for_request(candidate_backends, restore_info, blocks, prompt_tokens),
+            sm.acquire_for_request(candidate_backends, restore_info, backend_blocks, prompt_tokens),
             timeout=ACQUIRE_TIMEOUT,
         )
     except (asyncio.TimeoutError, RuntimeError) as e:
@@ -690,23 +705,23 @@ async def chat(req: Request):
     model_name, be_id, slot_id = g
     client = backend_manager.get_client(be_id)
 
+    # Derive key and blocks from the serving backend's tokenization
+    # so that _slot_kv_state and meta files always use consistent tokenization
+    serving_token_ids = backend_blocks.get(be_id, first_token_ids)
+    key = hs.meta_key(model_name, serving_token_ids)
+    blocks = hs.block_hashes_from_tokens(serving_token_ids, WORDS_PER_BLOCK)
+
     # Determine routing reason for metrics
     if pending_slot_hit:
         routing_reason = "pending_slot_hit"
     elif restore_key and restore_backend and be_id == restore_backend:
         routing_reason = "cache_hit"
-    elif key is None:
-        # No cache entry found at all (key generated from first_token_ids as fallback)
+    elif restore_key is None and restore_backend is None:
         routing_reason = "no_cache_entry"
     else:
-        # Cache hit found but different backend was used (backend unavailable/busy)
         routing_reason = "cache_backend_unavailable"
 
-    # Fallback: if no cache hit found, generate key/blocks from the serving backend's model name
-    if key is None:
-        key = hs.meta_key(model_name, first_token_ids)
-        blocks = hs.block_hashes_from_tokens(first_token_ids, WORDS_PER_BLOCK)
-        log.info("No cache hit: using key '%s' for model '%s' (client model '%s')", key[:16], model_name, client_model)
+    log.info("No cache hit: using key '%s' for model '%s' (client model '%s')", key[:16], model_name, client_model)
 
     log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s, save_key='%s', canonical_name='%s'",
              model_name, be_id, slot_id, restored, key[:16], canonical_name)

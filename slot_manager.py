@@ -306,7 +306,7 @@ class SlotManager:
         self,
         candidate_backends: list[tuple[str, str]],
         restore_info: Optional[tuple[str, str, str]] = None,
-        blocks: Optional[List[str]] = None,
+        backend_blocks: Optional[Dict[str, List[str]]] = None,
         prompt_tokens: int = 0,
     ) -> Tuple[GSlot, Optional[bool]]:
         """Acquire a slot, checking all candidate backends before sleeping.
@@ -320,6 +320,8 @@ class SlotManager:
             If provided, the cache backend is checked first. But if no slot is available
             there, fallback candidates are tried — restore_key is only used if the
             cache backend was acquired (cache files are not shared between backends).
+        backend_blocks: dict mapping backend_id to block hashes from that backend's
+            tokenization. Each backend gets its own blocks for skip-restore checks.
         """
         # Refresh slot counts for all discovered models
         try:
@@ -336,7 +338,8 @@ class SlotManager:
             restore_key, cache_backend, canonical_name = restore_info
             min_ctx = backend_manager.get_model_n_ctx(canonical_name)
             if prompt_tokens < min_ctx:
-                result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, blocks)
+                be_blocks = backend_blocks.get(cache_backend) if backend_blocks else None
+                result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, be_blocks)
                 if result:
                     return result
 
@@ -355,7 +358,8 @@ class SlotManager:
                         while elapsed < wait_timeout:
                             await asyncio.sleep(min(5.0, wait_timeout - elapsed))
                             elapsed += 5.0
-                            result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, blocks)
+                            be_blocks = backend_blocks.get(cache_backend) if backend_blocks else None
+                            result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, be_blocks)
                             if result:
                                 return result
                     finally:
@@ -369,7 +373,8 @@ class SlotManager:
                 restore_key, cache_backend, canonical_name = restore_info
                 min_ctx = backend_manager.get_model_n_ctx(canonical_name)
                 if prompt_tokens < min_ctx:
-                    result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, blocks)
+                    be_blocks = backend_blocks.get(cache_backend) if backend_blocks else None
+                    result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, be_blocks)
                     if result:
                         return result
 
@@ -380,7 +385,8 @@ class SlotManager:
                 min_ctx = backend_manager.get_model_n_ctx(canonical_name)
                 if prompt_tokens >= min_ctx:
                     continue
-                result = await self._try_acquire_and_restore(canonical_name, backend_id, None, blocks)
+                be_blocks = backend_blocks.get(backend_id) if backend_blocks else None
+                result = await self._try_acquire_and_restore(canonical_name, backend_id, None, be_blocks)
                 if result:
                     return result
 
