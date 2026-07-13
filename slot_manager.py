@@ -338,7 +338,7 @@ class SlotManager:
             restore_key, cache_backend, canonical_name = restore_info
             min_ctx = backend_manager.get_model_n_ctx(canonical_name)
             if prompt_tokens < min_ctx:
-                be_blocks = backend_blocks.get(cache_backend) if backend_blocks else None
+                be_blocks = backend_blocks.get(cache_backend) if backend_blocks and restore_key else None
                 result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, be_blocks)
                 if result:
                     return result
@@ -358,7 +358,7 @@ class SlotManager:
                         while elapsed < wait_timeout:
                             await asyncio.sleep(min(5.0, wait_timeout - elapsed))
                             elapsed += 5.0
-                            be_blocks = backend_blocks.get(cache_backend) if backend_blocks else None
+                            be_blocks = backend_blocks.get(cache_backend) if backend_blocks and restore_key else None
                             result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, be_blocks)
                             if result:
                                 return result
@@ -373,7 +373,7 @@ class SlotManager:
                 restore_key, cache_backend, canonical_name = restore_info
                 min_ctx = backend_manager.get_model_n_ctx(canonical_name)
                 if prompt_tokens < min_ctx:
-                    be_blocks = backend_blocks.get(cache_backend) if backend_blocks else None
+                    be_blocks = backend_blocks.get(cache_backend) if backend_blocks and restore_key else None
                     result = await self._try_acquire_and_restore(canonical_name, cache_backend, restore_key, be_blocks)
                     if result:
                         return result
@@ -385,7 +385,7 @@ class SlotManager:
                 min_ctx = backend_manager.get_model_n_ctx(canonical_name)
                 if prompt_tokens >= min_ctx:
                     continue
-                be_blocks = backend_blocks.get(backend_id) if backend_blocks else None
+                be_blocks = backend_blocks.get(backend_id) if backend_blocks and not restore_info else None
                 result = await self._try_acquire_and_restore(canonical_name, backend_id, None, be_blocks)
                 if result:
                     return result

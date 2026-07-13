@@ -707,7 +707,7 @@ async def chat(req: Request):
 
     # Derive key and blocks from the serving backend's tokenization
     # so that _slot_kv_state and meta files always use consistent tokenization
-    serving_token_ids = backend_blocks.get(be_id, first_token_ids)
+    serving_token_ids = backend_token_ids.get(be_id, first_token_ids)
     key = hs.meta_key(model_name, serving_token_ids)
     blocks = hs.block_hashes_from_tokens(serving_token_ids, WORDS_PER_BLOCK)
 
@@ -721,7 +721,8 @@ async def chat(req: Request):
     else:
         routing_reason = "cache_backend_unavailable"
 
-    log.info("No cache hit: using key '%s' for model '%s' (client model '%s')", key[:16], model_name, client_model)
+    if restore_key is None and restore_backend is None:
+        log.info("No cache hit: using key '%s' for model '%s' (client model '%s')", key[:16], model_name, client_model)
 
     log.info("Slot acquired: model '%s' on backend '%s' slot %d, restored=%s, save_key='%s', canonical_name='%s'",
              model_name, be_id, slot_id, restored, key[:16], canonical_name)
