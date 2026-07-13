@@ -49,16 +49,12 @@ class LlamaClient:
                 self.base_url, self._request_count, CLIENT_RECREATE_INTERVAL,
             )
             self._request_count = 0
-            asyncio.create_task(self._recreate_client())
+            self._recreate_client()
 
-    async def _recreate_client(self):
-        """Close old client and create a fresh one."""
-        old = self.client
+    def _recreate_client(self):
+        """Create a fresh client. The old one is dropped — GC closes it
+        once any in-flight requests release their connections."""
         self._create_client()
-        try:
-            await old.aclose()
-        except Exception as e:
-            log.warning("Error closing old HTTP client for %s: %s", self.base_url, e)
 
     async def apply_chat_template(self, messages: list) -> str:
         self._maybe_recreate()
