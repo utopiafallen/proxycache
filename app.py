@@ -620,7 +620,7 @@ async def chat(req: Request):
                     lcp = hs.lcp_blocks(opt_blocks, kv_blocks)
                     ratio = lcp / len(opt_blocks)
                     pending_ratios.append({"slot": g[2], "lcp_blocks": lcp, "slot_blocks": len(kv_blocks), "ratio": round(ratio, 4)})
-                    if ratio > best_ratio:
+                    if ratio >= LCP_TH and ratio > best_ratio:
                         best_ratio = ratio
                         restore_key = None  # clear — slot already has KV content, and old key may point to a different backend
                         restore_backend = be_id
