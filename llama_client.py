@@ -17,7 +17,7 @@ import logging
 from typing import Dict, Optional, Tuple
 from urllib.parse import quote
 
-from config import REQUEST_TIMEOUT, BACKEND_MODE, SLOT_TIMEOUT, DEFAULT_N_CTX
+from config import REQUEST_TIMEOUT, BACKEND_MODE, SLOT_TIMEOUT, DEFAULT_N_CTX, CLIENT_RECREATE_INTERVAL
 
 log = logging.getLogger(__name__)
 
@@ -25,18 +25,43 @@ log = logging.getLogger(__name__)
 class LlamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
+        self._request_count = 0
+        self._create_client()
+        log.info("Initialized HTTP client for %s (httpx %s)", base_url, httpx.__version__)
+
+    def _create_client(self):
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30)
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=REQUEST_TIMEOUT,
             limits=limits,
         )
-        log.info("Initialized HTTP client for %s (httpx %s)", base_url, httpx.__version__)
 
     async def close(self):
         await self.client.aclose()
 
+    def _maybe_recreate(self):
+        """Recreate the httpx.AsyncClient periodically to avoid stale connections."""
+        self._request_count += 1
+        if self._request_count >= CLIENT_RECREATE_INTERVAL:
+            log.info(
+                "Recreating HTTP client for %s after %d requests (interval=%d)",
+                self.base_url, self._request_count, CLIENT_RECREATE_INTERVAL,
+            )
+            self._request_count = 0
+            asyncio.create_task(self._recreate_client())
+
+    async def _recreate_client(self):
+        """Close old client and create a fresh one."""
+        old = self.client
+        self._create_client()
+        try:
+            await old.aclose()
+        except Exception as e:
+            log.warning("Error closing old HTTP client for %s: %s", self.base_url, e)
+
     async def apply_chat_template(self, messages: list) -> str:
+        self._maybe_recreate()
         resp = await self.client.post(
             "/apply-template",
             json={"messages": messages},
@@ -45,6 +70,7 @@ class LlamaClient:
         return resp.json().get("prompt", "")
 
     async def tokenize(self, text: str, add_special: bool = False) -> list[int]:
+        self._maybe_recreate()
         resp = await self.client.post(
             "/tokenize",
             json={"content": text, "add_special": add_special},
@@ -80,6 +106,7 @@ class LlamaClient:
         slot_id: Optional[int] = None,
         stream: bool = False,
     ):
+        self._maybe_recreate()
         body2, query = self._with_slot_id(body, slot_id)
 
         log.info("Chat completions: stream=%s, body_stream=%s, %d messages",
@@ -134,6 +161,7 @@ class LlamaClient:
             }
 
     async def save_slot(self, slot_id: int, basename: str, model_name: str = None) -> Tuple[bool, int]:
+        self._maybe_recreate()
         # JSON body: {"filename": "..."} — avoids 500 on some builds
         if BACKEND_MODE == "llama-swap" and model_name:
             path = f"/upstream/{quote(model_name, safe='')}/slots/{slot_id}"
@@ -170,6 +198,7 @@ class LlamaClient:
         return True, n_written
 
     async def restore_slot(self, slot_id: int, basename: str, model_name: str = None) -> bool:
+        self._maybe_recreate()
         if BACKEND_MODE == "llama-swap" and model_name:
             path = f"/upstream/{quote(model_name, safe='')}/slots/{slot_id}"
         else:
@@ -204,6 +233,7 @@ class LlamaClient:
 
     async def get_slot_status(self, slot_id: int) -> Optional[dict]:
         """GET /slots/{slot_id} — returns slot status dict or None."""
+        self._maybe_recreate()
         try:
             resp = await self.client.get(f"/slots/{slot_id}")
             resp.raise_for_status()
@@ -218,6 +248,7 @@ class LlamaClient:
         child-process model.  Only models with status == 'loaded' are returned.
         Each entry has {'name': str, 'port': int}.
         """
+        self._maybe_recreate()
         try:
             resp = await self.client.get("/models")
             resp.raise_for_status()
@@ -249,6 +280,7 @@ class LlamaClient:
 
     async def _get_child_slots(self, child_url: str) -> Optional[list]:
         """GET /slots on a child process, returns list or None."""
+        self._maybe_recreate()
         try:
             resp = await self.client.get(f"{child_url}/slots")
             resp.raise_for_status()
@@ -268,6 +300,7 @@ class LlamaClient:
         If model_name is provided, only queries that model's child process.
         If model_name is None, queries all loaded child processes.
         """
+        self._maybe_recreate()
         # Fast path: normal (non-router) mode
         try:
             resp = await self.client.get("/slots")
@@ -333,6 +366,7 @@ class LlamaClient:
 
     async def discover_models(self) -> list[tuple[str, int]]:
         """Discover models served by this backend. Returns [(name, n_ctx)]."""
+        self._maybe_recreate()
         # Router mode: GET /models
         try:
             resp = await self.client.get("/models")

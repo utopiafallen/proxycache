@@ -53,6 +53,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `CACHE_SAVE_RATIO_THRESHOLD` | `0.8` | Skip cache save if restore ratio >= this (avoids overwriting good cache) |
 | `SLOT_TIMEOUT` | `30` | Timeout for slot save/restore operations (seconds) |
 | `REQUEST_TIMEOUT` | `600` | HTTP timeout to backend (seconds) |
+| `CLIENT_RECREATE_INTERVAL` | `50` | Recreate the httpx client after this many requests per backend to avoid stale connections |
 | `MODEL_ID` | `llama.cpp` | Default model ID when client omits it |
 | `CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT` | `30` | Initial EMA timeout for cache-hit wait queue (seconds) |
 | `CACHE_HIT_WAIT_EMA_MIN_TIMEOUT` | `10` | Minimum wait queue timeout (seconds) |

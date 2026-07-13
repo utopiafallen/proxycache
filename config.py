@@ -74,6 +74,10 @@ def should_save_cache(best_ratio: float, recompute_happened: bool) -> bool:
 # because chat completions can take minutes, but slot operations should fail fast
 SLOT_TIMEOUT = float(os.getenv("SLOT_TIMEOUT", "30"))
 
+# Recreate the underlying httpx.AsyncClient after this many requests per backend
+# to avoid connection pool degradation (stale/half-closed connections)
+CLIENT_RECREATE_INTERVAL = int(os.getenv("CLIENT_RECREATE_INTERVAL", "50"))
+
 # Cache hit wait queue settings
 CACHE_HIT_WAIT_EMA_MIN_TIMEOUT = float(os.getenv("CACHE_HIT_WAIT_EMA_MIN_TIMEOUT", "10"))
 CACHE_HIT_WAIT_MAX_PENDING_REQS = int(os.getenv("CACHE_HIT_WAIT_MAX_PENDING_REQS", "3"))
