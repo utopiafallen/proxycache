@@ -11,7 +11,7 @@ KV Proxy for llama.cpp with disk save/restore:
 
 Additionally:
 
-- acquire_for_request is wrapped in a timeout to avoid hanging forever if a slot is never released.
+- Slot acquisition is wrapped in a timeout to avoid hanging forever if a slot is never released.
 - Streaming:
     * socket reads from llama.cpp run in a background task (reader),
       racing against a disconnect event;
@@ -20,7 +20,7 @@ Additionally:
       release, and puts a sentinel in the queue;
     * heartbeat task checks is_disconnected() every 0.5s.
 - Slot pools are per-model with lazy discovery.
-- Cache eviction via ring buffer in SlotManager (age-first, then LRU).
+- Cache eviction via ring buffer in BackendSlotManager (age-first, then LRU).
 """
 
 import asyncio
@@ -29,8 +29,8 @@ import os
 import time
 import uuid
 import logging
-from collections import deque
-from typing import List, Dict, AsyncGenerator, Optional
+from enum import Enum
+from typing import List, Dict, Optional, Any, Tuple
 
 import httpx
 from concurrent.futures import ThreadPoolExecutor
@@ -38,13 +38,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 from config import (BACKENDS, WORDS_PER_BLOCK,
-                    LCP_TH, META_DIR, MODEL_ID, PORT,
-                    CACHE_MAX_AGE_HOURS,
-                    SLOT_TIMEOUT, DEFAULT_N_CTX, CACHE_SAVE_RATIO_THRESHOLD,
-                    should_save_cache)
+                    LCP_TH, MODEL_ID, PORT, DEFAULT_N_CTX,
+                    should_save_cache,
+                    CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT,
+                    CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, CACHE_HIT_WAIT_MAX_PENDING_REQS)
 
 import hashing as hs
-from slot_manager import SlotManager
+from slot_manager import SlotManager, BackendSlotManager
 from metrics import metrics, extract_prompt_preview
 
 log = logging.getLogger(__name__)
@@ -56,6 +56,13 @@ ACQUIRE_TIMEOUT = 60.0
 STREAM_QUEUE_SIZE = 16
 STREAM_QUEUE_TIMEOUT = 5.0
 RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS = 0.92
+
+
+class CacheHitType(str, Enum):
+    """Explicit routing decision — tells downstream what to do with a slot."""
+    DISK_RESTORE = "disk_restore"   # disk cache file found, restore from specific key
+    SKIP = "skip"                    # pending slot hit, slot already has matching KV cache
+
 
 app = FastAPI(title="Simple KV Proxy")
 
@@ -105,6 +112,176 @@ async def models():
     return {"data": models_list}
 
 
+# ── Slot acquisition helpers (routing decision executed here) ──────────
+
+
+async def _acquire_slot_for_request(
+    sm: SlotManager,
+    candidate_backends: list[tuple[str, str]],
+    restore_backend: Optional[str],
+    canonical_name: str,
+    hit_type: Optional[CacheHitType],
+    restore_key: Optional[str],
+    backend_blocks: Dict[str, List[str]],
+    prompt_tokens: int,
+) -> Tuple[Tuple[str, str, int], Optional[bool]]:
+    """Acquire a slot, trying cache backend first then fallbacks.
+
+    Orchestrates: slot refresh → cache backend (with poll) → retry loop with fallbacks.
+    """
+    # Refresh slot counts
+    await sm.refresh_slot_counts()
+
+    min_ctx = backend_manager.get_model_n_ctx(canonical_name)
+
+    # Precompute: blocks to pass to cache backend based on hit type
+    # DISK_RESTORE: blocks needed for skip-restore check + disk restore
+    # SKIP: no blocks — slot already has matching KV cache
+    if hit_type == CacheHitType.DISK_RESTORE and restore_backend:
+        cache_blocks = backend_blocks.get(restore_backend)
+    else:
+        cache_blocks = None
+
+    async def _do_restore_call(be_sm: BackendSlotManager, slot_id: int,
+                                key: Optional[str], blocks: Optional[List[str]]) -> Optional[bool]:
+        """Execute restore logic for an acquired slot. Returns restored flag."""
+        restored: Optional[bool] = None
+
+        # Flush previously skipped save
+        skip_entry = be_sm.flush_save_skipped(slot_id)
+        if skip_entry:
+            if len(skip_entry) >= 6:
+                save_key, save_blocks, save_n_tokens, _, skip_ratio, skip_recompute = skip_entry
+                if should_save_cache(skip_ratio, skip_recompute):
+                    await be_sm.save_after(canonical_name, slot_id, save_key, save_blocks, save_n_tokens)
+                    log.info(
+                        "Saved skipped cache for model '%s' on backend '%s' slot %d before restore",
+                        canonical_name, be_sm.backend_id, slot_id,
+                    )
+            else:
+                save_key, save_blocks, save_n_tokens = skip_entry[:3]
+                await be_sm.save_after(canonical_name, slot_id, save_key, save_blocks, save_n_tokens)
+                log.info(
+                    "Saved skipped cache (legacy) for model '%s' on backend '%s' slot %d before restore",
+                    canonical_name, be_sm.backend_id, slot_id,
+                )
+
+        if blocks:
+            if be_sm.should_skip_restore(slot_id, blocks):
+                log.info(
+                    "Skipping restore for model '%s' on backend '%s' slot %d: slot cache already matches",
+                    canonical_name, be_sm.backend_id, slot_id,
+                )
+                restored = False
+            elif key:
+                await be_sm.restore(slot_id, key, canonical_name, touch_ring=True)
+                r_blocks = kv_meta.get_blocks(key, be_sm.backend_id)
+                if r_blocks is not None:
+                    be_sm.set_kv_state(slot_id, r_blocks)
+                restored = True
+            else:
+                # No restore key — cache miss on this backend, no dynamic search needed
+                # (routing scan already determined there's nothing useful here)
+                log.info(
+                    "No restore key for model '%s' on backend '%s' slot %d",
+                    canonical_name, be_sm.backend_id, slot_id,
+                )
+                restored = False
+        elif key:
+            # No blocks but have a key (pending slot hit with key — shouldn't happen, but safe)
+            await be_sm.restore(slot_id, key, canonical_name, touch_ring=True)
+            restored = True
+        else:
+            # Pending slot hit: no blocks, no key — slot already has matching KV
+            restored = None
+
+        return restored
+
+    async def _try_cache_backend() -> Optional[Tuple[Tuple[str, str, int], Optional[bool]]]:
+        """Try to acquire a slot on the cache backend and restore."""
+        if not restore_backend or prompt_tokens >= min_ctx:
+            return None
+        be_sm = sm.get(restore_backend)
+        slot_id = be_sm.try_acquire(canonical_name)
+        if slot_id is None:
+            return None
+        # Set KV state: use request blocks for disk restore, preserve existing for pending hit
+        if cache_blocks:
+            be_sm.set_kv_state(slot_id, cache_blocks)
+        # For pending slot hit (cache_blocks is None), keep existing KV state intact
+        restored = await _do_restore_call(be_sm, slot_id, restore_key, cache_blocks)
+        sm._backend_last_used[restore_backend] = time.time()
+        return (canonical_name, restore_backend, slot_id), restored
+
+    # Phase 0: try cache backend; if busy, poll up to EMA timeout
+    if restore_backend and hit_type and prompt_tokens < min_ctx:
+        result = await _try_cache_backend()
+        if result:
+            return result
+
+        # No free slot — poll every 5s up to EMA timeout
+        pending = sm._cache_wait_pending.get(restore_backend, 0)
+        if pending < CACHE_HIT_WAIT_MAX_PENDING_REQS:
+            ema = sm._slot_duration_ema.get(restore_backend, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
+            wait_timeout = max(min(ema, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
+            log.info(
+                "Cache backend '%s' busy for model '%s', polling up to %.1fs",
+                restore_backend, canonical_name, wait_timeout,
+            )
+            try:
+                sm._cache_wait_pending[restore_backend] = pending + 1
+                elapsed = 0.0
+                while elapsed < wait_timeout:
+                    await asyncio.sleep(min(5.0, wait_timeout - elapsed))
+                    elapsed += 5.0
+                    result = await _try_cache_backend()
+                    if result:
+                        return result
+            finally:
+                sm._cache_wait_pending[restore_backend] -= 1
+
+    # Retry loop: cache backend + fallbacks
+    RETRY_COUNT = 11
+    for attempt in range(RETRY_COUNT):
+        # Phase 1: cache backend
+        if restore_backend and hit_type and prompt_tokens < min_ctx:
+            result = await _try_cache_backend()
+            if result:
+                return result
+
+        # Phase 2: fallback backends
+        for be_id, model_name in candidate_backends:
+            if not model_name:
+                continue
+            be_min_ctx = backend_manager.get_model_n_ctx(model_name)
+            if prompt_tokens >= be_min_ctx:
+                continue
+            be_sm = sm.get(be_id)
+            slot_id = be_sm.try_acquire(model_name)
+            if slot_id is None:
+                continue
+            # Cache miss: track blocks for this backend
+            fb_blocks = backend_blocks.get(be_id)
+            if fb_blocks:
+                be_sm.set_kv_state(slot_id, fb_blocks)
+            else:
+                be_sm.set_kv_state(slot_id, [])
+            restored = await _do_restore_call(be_sm, slot_id, None, fb_blocks)
+            sm._backend_last_used[be_id] = time.time()
+            return (model_name, be_id, slot_id), restored
+
+        if attempt < RETRY_COUNT - 1:
+            backoff = (attempt + 1) * 5
+            log.info("No slots available across all backends, retrying in %ds (attempt %d/%d)",
+                     backoff, attempt + 1, RETRY_COUNT)
+            await asyncio.sleep(backoff)
+
+    raise RuntimeError(f"No slots available for candidate_backends={len(candidate_backends)}")
+
+
+# ── Streaming ──────────────────────────────────────────────────────────
+
+
 class StreamReader:
     def __init__(self, resp: httpx.Response, req: Request,
                  model_name: str, backend_id: str, slot_id: int,
@@ -143,7 +320,6 @@ class StreamReader:
         self.key_short = key[:16]
 
     def _log_response_info(self):
-        """Return (status, headers) tuple with safe fallbacks."""
         try:
             status = self.resp.status_code
         except Exception:
@@ -208,7 +384,6 @@ class StreamReader:
                     if chunk:
                         total_bytes += len(chunk)
                         self._raw_response_body.extend(chunk)
-                        # Parse SSE events incrementally to extract usage.prompt_tokens
                         sse_done = False
                         try:
                             text = chunk.decode("utf-8", errors="replace")
@@ -276,7 +451,6 @@ class StreamReader:
                 anext_task.cancel()
 
     async def _heartbeat(self):
-        """Periodically check if client disconnected; sets _disconnect_event when True."""
         while True:
             await asyncio.sleep(0.5)
             try:
@@ -291,41 +465,11 @@ class StreamReader:
                 break
 
     def _signal_done(self):
-        """Send None sentinel to unblock stream consumer."""
         self._cancelled = True
         self.queue.put_nowait(None)
 
-    def _extract_sse_prompt_tokens(self) -> int:
-        """Parse SSE events from raw response body and return usage.prompt_tokens.
-
-        Note: llama.cpp reports total_tokens (prompt + completion) in the
-        'prompt_tokens' field of its SSE usage event, unlike OpenAI which
-        reports only prompt tokens. We capture the first usage event's
-        prompt_tokens value.
-        """
-        try:
-            text = self._raw_response_body.decode("utf-8", errors="replace")
-        except Exception:
-            return 0
-        for line in text.split("\n"):
-            line = line.strip()
-            if line.startswith("data: "):
-                data = line[6:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data)
-                    usage = event.get("usage")
-                    if usage and isinstance(usage, dict):
-                        pt = usage.get("prompt_tokens")
-                        if pt:
-                            return pt
-                except (json.JSONDecodeError, ValueError):
-                    continue
-        return 0
-
     async def _save(self) -> tuple:
-        # Detect recompute from SSE cached_tokens before deciding whether to save
+        be_sm = self.sm.get(self.backend_id)
         recompute_happened = False
         if self.restored and self.restore_key and self.restore_backend:
             cached_tokens = self._sse_cached_tokens
@@ -346,7 +490,6 @@ class StreamReader:
                 )
                 kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
 
-        # Skip save only if restored, no recompute happened, and ratio is high enough
         if not should_save_cache(self.best_ratio, recompute_happened):
             log.info(
                 "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): "
@@ -354,13 +497,14 @@ class StreamReader:
                 self.model_name, self.backend_id, self.slot_id, self.key_short,
                 self.best_ratio,
             )
-            self.sm._slot_save_skipped[(self.model_name, self.backend_id, self.slot_id)] = (self.key, self.blocks, self.n_tokens, self.restored, self.best_ratio, recompute_happened)
+            be_sm.mark_save_skipped(self.slot_id,
+                                    (self.key, self.blocks, self.n_tokens, self.restored, self.best_ratio, recompute_happened))
             return False, 0
         ok = False
         cache_size = 0
         try:
-            ok, cache_size = await self.sm.save_after(
-                self.model_name, self.backend_id, self.slot_id,
+            ok, cache_size = await be_sm.save_after(
+                self.model_name, self.slot_id,
                 self.key, self.blocks, self.n_tokens,
             )
             log.info("SAVE: model_name='%s', key='%s', backend='%s', model_id_in_meta='%s'",
@@ -374,6 +518,7 @@ class StreamReader:
         return ok, cache_size
 
     async def _cleanup(self):
+        be_sm = self.sm.get(self.backend_id)
         log.info("Starting cleanup for model '%s' on backend '%s' slot %d (key %s): cancelled=%s, stream_complete=%s",
                   self.model_name, self.backend_id, self.slot_id, self.key_short, self._cancelled, self._stream_complete)
         try:
@@ -397,14 +542,23 @@ class StreamReader:
             if self._cancelled:
                 log.info("Request cancelled — invalidating KV cache for model '%s' on backend '%s' slot %d (key %s)",
                          self.model_name, self.backend_id, self.slot_id, self.key_short)
-                self.sm.invalidate_slot(self.model_name, self.backend_id, self.slot_id)
+                be_sm.invalidate(self.slot_id)
             else:
                 log.info("Backend disconnected — invalidating KV cache for model '%s' on backend '%s' slot %d (key %s)",
                          self.model_name, self.backend_id, self.slot_id, self.key_short)
-                self.sm.invalidate_slot(self.model_name, self.backend_id, self.slot_id)
-        self.sm.release(self.model_name, self.backend_id, self.slot_id)
+                be_sm.invalidate(self.slot_id)
+
+        duration = be_sm.release(self.slot_id)
         log.info("Released slot %d for model '%s' on backend '%s' (key %s)", self.slot_id,
                   self.model_name, self.backend_id, self.key_short)
+
+        # Update EMA of slot occupancy duration
+        if duration is not None:
+            old = self.sm._slot_duration_ema.get(self.backend_id, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
+            from config import CACHE_HIT_WAIT_EMA_ALPHA
+            self.sm._slot_duration_ema[self.backend_id] = (
+                CACHE_HIT_WAIT_EMA_ALPHA * duration + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * old
+            )
 
         # Record metrics for streaming requests
         if self._t0 > 0:
@@ -501,6 +655,9 @@ class StreamReader:
             await asyncio.shield(self._cleanup())
 
 
+# ── Chat Completions ───────────────────────────────────────────────────
+
+
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     sm: SlotManager = app.state.sm
@@ -508,7 +665,6 @@ async def chat(req: Request):
     t0 = time.time()
     client_ip = req.client.host if req.client else "-"
 
-    # Capture request body once for metrics (before req.json() consumes it)
     raw_body = await req.body()
     request_json = json.loads(raw_body)
     data = request_json
@@ -517,7 +673,6 @@ async def chat(req: Request):
     stream = bool(data.get("stream", False))
     client_model = data.get("model") or MODEL_ID
 
-    # Generate request ID and record arrival immediately (two-phase metrics)
     request_id = str(uuid.uuid4())
     prompt_preview = extract_prompt_preview(request_json)
     try:
@@ -547,7 +702,7 @@ async def chat(req: Request):
                 })
                 return JSONResponse({"error": f"model '{client_model}' not found"}, status_code=400)
 
-        # 2. Apply chat template + tokenize, then scan for cache hits
+        # 2. Tokenize + scan for cache hits
         first_opt = options[0]
         first_client = backend_manager.get_client(first_opt.backends[0])
         try:
@@ -581,16 +736,13 @@ async def chat(req: Request):
         restore_key = None
         restore_backend = None
         best_ratio = 0.0
-        pending_slot_hit = False
+        hit_type: Optional[CacheHitType] = None
 
-        # Routing diagnostics: per-backend scan results for post-hoc analysis
         scan_diagnostics: List[Dict[str, Any]] = []
-        # Track cache ratio per backend for save decision (use serving backend's ratio, not winning match)
         backend_cache_ratios: Dict[str, float] = {}
-        # Per-backend tokenization results — used after slot acquisition so blocks/key
-        # always come from the serving backend, avoiding cross-backend tokenization mismatch
         backend_token_ids: Dict[str, List[int]] = {}
         backend_blocks: Dict[str, List[str]] = {}
+
         for opt in options:
             for be_id in opt.backends:
                 opt_client = backend_manager.get_client(be_id)
@@ -621,37 +773,38 @@ async def chat(req: Request):
                         restore_key = cand[0]
                         restore_backend = be_id
                         canonical_name = opt.name
-                        pending_slot_hit = False
+                        hit_type = CacheHitType.DISK_RESTORE
                         log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
                                  restore_key[:16], canonical_name, restore_backend, best_ratio)
                 else:
                     diag_entry["cache_file_ratio"] = None
 
-                # Check pending (in-flight) slots for cache hits during the save window
+                # Check pending slots for cache hits
+                be_sm = sm.get(be_id)
                 pending_ratios: List[Dict[str, Any]] = []
-                for g, kv_blocks in sm._slot_kv_state.items():
-                    if g[0] != opt.name or g[1] != be_id:
-                        continue
+                for slot_id, kv_blocks in be_sm.get_kv_states().items():
                     lcp = hs.lcp_blocks(opt_blocks, kv_blocks)
                     ratio = lcp / len(opt_blocks)
-                    pending_ratios.append({"slot": g[2], "lcp_blocks": lcp, "slot_blocks": len(kv_blocks), "ratio": round(ratio, 4)})
+                    pending_ratios.append({"slot": slot_id, "lcp_blocks": lcp,
+                                          "slot_blocks": len(kv_blocks), "ratio": round(ratio, 4)})
                     if ratio >= LCP_TH and ratio > best_ratio:
                         best_ratio = ratio
-                        restore_key = None  # clear — slot already has KV content, and old key may point to a different backend
+                        restore_key = None
                         restore_backend = be_id
                         canonical_name = opt.name
-                        pending_slot_hit = True
+                        hit_type = CacheHitType.SKIP
                         log.info("Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
-                                 canonical_name, restore_backend, g[2], ratio)
+                                 canonical_name, restore_backend, slot_id, ratio)
                 diag_entry["pending_slots"] = pending_ratios
                 scan_diagnostics.append(diag_entry)
-                # Track best ratio for this backend (cache file or pending slot) for save decision
                 be_best = diag_entry.get("cache_file_ratio") or 0.0
                 for ps in pending_ratios:
                     if ps["ratio"] > be_best:
                         be_best = ps["ratio"]
                 if be_best > 0:
                     backend_cache_ratios[be_id] = be_best
+
+        pending_slot_hit = hit_type == CacheHitType.SKIP
 
         log.info(
             "Chat request from %s: model '%s', %d tokens, restore key=%s on backend %s",
@@ -660,36 +813,29 @@ async def chat(req: Request):
             restore_backend,
         )
 
-        
-
-        # 5. Build candidate backends list (fallback ONLY, cache backend excluded)
-        # Only include backends for the canonical model (the one used for slot pools).
-        # Each DiscoveredModel already has its own backend list, so we only pair
-        # backends that actually support that specific model variant.
+        # 5. Build fallback candidate backends
         candidate_backends: list[tuple[str, str]] = []
         for opt in options:
             for be_id in opt.backends:
-                if not restore_key or be_id != restore_backend:
-                    candidate_backends.append((be_id, opt.name))
+                if restore_backend and be_id == restore_backend:
+                    continue
+                candidate_backends.append((be_id, opt.name))
 
-        # Sort fallback backends by a composite score to minimize cache churn
-        # and latency. Safe always: the restore backend is excluded from
-        # candidates and tried first via restore_info in Phase 0/1.
         candidate_backends.sort(
             key=lambda cb: (
                 backend_cache_ratios.get(cb[0], 0.0),
-                len(sm._cache_ring.get(cb[0], [])),
+                sm.get(cb[0]).get_ring_size(),
                 sm.get_backend_latency_ema(cb[0]),
                 sm.get_backend_last_used(cb[0]),
             ),
         )
 
-        # 6. Acquire slot (cache backend tried first via restore_info, then fallback)
-        restore_info: Optional[tuple[str, str, str]] = None
-        if restore_backend:
-            restore_info = (restore_key, restore_backend, canonical_name)
+        # 6. Acquire slot (cache backend first, then fallbacks)
         g, restored = await asyncio.wait_for(
-            sm.acquire_for_request(candidate_backends, restore_info, backend_blocks, prompt_tokens),
+            _acquire_slot_for_request(
+                sm, candidate_backends, restore_backend, canonical_name,
+                hit_type, restore_key, backend_blocks, prompt_tokens,
+            ),
             timeout=ACQUIRE_TIMEOUT,
         )
     except (asyncio.TimeoutError, RuntimeError) as e:
@@ -704,9 +850,9 @@ async def chat(req: Request):
 
     model_name, be_id, slot_id = g
     client = backend_manager.get_client(be_id)
+    be_sm = sm.get(be_id)
 
-    # Derive key and blocks from the serving backend's tokenization
-    # so that _slot_kv_state and meta files always use consistent tokenization
+    # Derive key and blocks from serving backend's tokenization
     serving_token_ids = backend_token_ids.get(be_id, first_token_ids)
     key = hs.meta_key(model_name, serving_token_ids)
     blocks = hs.block_hashes_from_tokens(serving_token_ids, WORDS_PER_BLOCK)
@@ -742,7 +888,7 @@ async def chat(req: Request):
                 "best_ratio": round(best_ratio, 4),
                 "restore_key": restore_key[:16] if restore_key else None,
                 "restore_backend": restore_backend,
-                "restore_info_backend": restore_info[1] if restore_info else None,
+                "restore_info_backend": restore_backend,
                 "candidate_backends": [cb[0] for cb in candidate_backends],
                 "scan": scan_diagnostics,
             },
@@ -764,21 +910,16 @@ async def chat(req: Request):
 
     log.info(
         "Dispatching request from client %s: model '%s' on backend '%s' slot %d, restore=%s, restored=%s",
-        client_ip,
-        model_name,
-        be_id,
-        slot_id,
-        restore_key[:16] if restore_key else None,
-        restored,
+        client_ip, model_name, be_id, slot_id,
+        restore_key[:16] if restore_key else None, restored,
     )
 
     _reader_created = False
+    _slot_released = False
     try:
         if stream:
             resp = await client.chat_completions(
-                body,
-                slot_id=slot_id,
-                stream=True,
+                body, slot_id=slot_id, stream=True,
             )
             if resp.status_code != 200:
                 err_txt = await resp.aread()
@@ -809,16 +950,12 @@ async def chat(req: Request):
                 "Connection": "keep-alive",
             }
             return StreamingResponse(
-                gen,
-                media_type="text/event-stream",
-                headers=headers,
+                gen, media_type="text/event-stream", headers=headers,
             )
 
         else:
             out = await client.chat_completions(
-                body,
-                slot_id=slot_id,
-                stream=False,
+                body, slot_id=slot_id, stream=False,
             )
             if not isinstance(out, dict):
                 metrics.record({
@@ -836,9 +973,6 @@ async def chat(req: Request):
                 )
 
             ok = False
-
-            # Track recompute penalty: if restore was attempted and cached_tokens < request length,
-            # the KV cache restore was partial/useless (llama.cpp had to recompute)
             recompute_happened = False
             llm_prompt_tokens = 0
             cached_tokens = 0
@@ -866,12 +1000,11 @@ async def chat(req: Request):
 
             save_ok = False
             cache_size = 0
-            # Use serving backend's cache ratio, not the winning scan ratio (which may be from a different backend)
             serving_be_ratio = backend_cache_ratios.get(be_id, best_ratio)
             if should_save_cache(serving_be_ratio, recompute_happened):
                 try:
-                    ok, cache_size = await sm.save_after(
-                        model_name, be_id, slot_id, key, blocks, prompt_tokens,
+                    ok, cache_size = await be_sm.save_after(
+                        model_name, slot_id, key, blocks, prompt_tokens,
                     )
                     save_ok = ok
                 except asyncio.CancelledError:
@@ -881,9 +1014,9 @@ async def chat(req: Request):
                     log.warning("Cache save failed for model '%s' on backend '%s' slot %d: %s",
                                 model_name, be_id, slot_id, e)
             else:
-                sm._slot_save_skipped[(model_name, be_id, slot_id)] = (key, blocks, prompt_tokens, restored, serving_be_ratio, recompute_happened)
+                be_sm.mark_save_skipped(slot_id,
+                                        (key, blocks, prompt_tokens, restored, serving_be_ratio, recompute_happened))
 
-            # Record metrics for non-streaming requests
             prompt_preview = extract_prompt_preview(request_json)
             latency_ms = (time.time() - t0) * 1000
             metrics.record({
@@ -908,18 +1041,6 @@ async def chat(req: Request):
             })
             sm.update_backend_latency(be_id, latency_ms)
 
-            # log.info(
-            #     "json_response\n%s",
-            #     json.dumps(out, indent=2, ensure_ascii=False),
-            # )
-            # log.info(
-            #     "json_done client_ip=%s model=%s be=%s slot=%d key=%s saved=%s is_big=%s dur_ms=%d",
-            #     client_ip, model_name, be_id, slot_id,
-            #     key[:16],
-            #     ok,
-            #     is_big,
-            #     int((time.time() - t0) * 1000),
-            # )
             return JSONResponse(content=out, status_code=200)
 
     except httpx.TimeoutException as e:
@@ -938,7 +1059,9 @@ async def chat(req: Request):
     except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
         log.exception("Backend connection error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                       client_ip, model_name, be_id, slot_id, key[:16], e)
-        sm.invalidate_slot(model_name, be_id, slot_id)
+        be_sm.invalidate(slot_id)
+        be_sm.release(slot_id)
+        _slot_released = True
         metrics.record({
             "request_id": request_id,
             "model": model_name,
@@ -963,20 +1086,18 @@ async def chat(req: Request):
         })
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
-        if not _reader_created:
-            sm.release(model_name, be_id, slot_id)
+        if not _reader_created and not _slot_released:
+            be_sm.release(slot_id)
 
 
 # ── Metrics & Dashboard Endpoints ────────────────────────────────────
 
 @app.get("/metrics/summary")
 async def metrics_summary():
-    """Full summary for the dashboard."""
     summary = metrics.get_summary()
     summary["backends"] = _get_backend_health()
     summary["slots"] = _get_slot_status()
     summary["cache"] = _get_cache_stats()
-    # Per-backend performance
     backend_perf = {}
     for be_id in summary["backends"]:
         bp = metrics.get_performance(backend=be_id)
@@ -988,31 +1109,21 @@ async def metrics_summary():
 
 @app.get("/metrics/health")
 async def metrics_health():
-    """Backend health and model discovery info."""
     return _get_backend_health()
 
 
 @app.get("/metrics/slots")
 async def metrics_slots():
-    """Per-slot state for all backends."""
     return _get_slot_status()
 
 
 @app.get("/metrics/cache")
 async def metrics_cache():
-    """Per-backend cache utilization stats."""
     return _get_cache_stats()
 
 
 @app.get("/metrics/diagnostics")
 async def metrics_diagnostics(request_id: str = None, liveness: bool = False, timeline: bool = False):
-    """Routing diagnostics, liveness events, and unified timeline.
-
-    Args:
-        request_id: Return routing diagnostics for a specific request.
-        liveness: Return recent liveness change events.
-        timeline: Return unified timeline (requests + events) for post-mortem analysis.
-    """
     if timeline:
         return {"timeline": metrics.get_timeline(limit=200)}
     if liveness:
@@ -1022,7 +1133,6 @@ async def metrics_diagnostics(request_id: str = None, liveness: bool = False, ti
         if req is None:
             return JSONResponse({"error": "Request not found"}, status_code=404)
         return {"request_id": request_id, "routing_diagnostics": req.get("routing_diagnostics")}
-    # Return diagnostics for all recent requests
     requests = metrics.get_requests(limit=100)
     return {"diagnostics": [
         {"request_id": r.get("request_id"), "routing_diagnostics": r.get("routing_diagnostics")}
@@ -1032,14 +1142,12 @@ async def metrics_diagnostics(request_id: str = None, liveness: bool = False, ti
 
 @app.get("/metrics/requests")
 async def metrics_requests(limit: int = 100, offset: int = 0):
-    """Recent requests with full JSON payload."""
     requests = metrics.get_requests(limit=limit, offset=offset)
     return {"requests": requests, "total": metrics.get_total_count()}
 
 
 @app.get("/metrics/request/{request_id}")
 async def metrics_request_by_id(request_id: str):
-    """Fetch a single request by its UUID."""
     req = metrics.get_request_by_id(request_id)
     if req is None:
         return JSONResponse({"error": "Request not found"}, status_code=404)
@@ -1048,14 +1156,12 @@ async def metrics_request_by_id(request_id: str):
 
 @app.get("/metrics/performance")
 async def metrics_performance(model: str = None, backend: str = None):
-    """Cache performance metrics."""
     perf = metrics.get_performance(model=model, backend=backend)
     return perf
 
 
 @app.get("/dashboard")
 async def dashboard():
-    """Serve the monitoring dashboard HTML."""
     from config import DASHBOARD_ENABLED
     if not DASHBOARD_ENABLED:
         return JSONResponse({"error": "Dashboard disabled"}, status_code=404)
@@ -1070,7 +1176,6 @@ async def dashboard():
 
 
 def _get_backend_health() -> dict:
-    """Build backend health info from BackendManager and SlotManager."""
     sm = app.state.sm if hasattr(app.state, "sm") else None
     result = {}
     for key in backend_manager.keys():
@@ -1087,16 +1192,15 @@ def _get_backend_health() -> dict:
         for model_name, model_info in backend_manager._discovered_models.items():
             if key not in model_info.backends:
                 continue
-            # Count in-use slots for this model/backend
             in_use = 0
             total_slots = 0
-            if sm:
-                pool_key = (model_name, key)
-                pool = sm._slot_pools.get(pool_key)
+            if sm and key in sm._backends:
+                be_sm = sm.get(key)
+                pool = be_sm.get_pool(model_name)
                 if pool:
                     total_slots = len(pool)
                     for slot_id in pool:
-                        if sm._in_use.get((model_name, key, slot_id), False):
+                        if be_sm._in_use.get(slot_id, False):
                             in_use += 1
             refresh_key = (model_name, key)
             last_ts, _, _ = backend_manager._refresh_state.get(refresh_key, (0.0, True, 0))
@@ -1112,55 +1216,54 @@ def _get_backend_health() -> dict:
 
 
 def _get_slot_status() -> dict:
-    """Build per-slot state for all backends."""
     sm = app.state.sm if hasattr(app.state, "sm") else None
     if not sm:
         return {}
     result = {}
-    for (model_name, backend_id), pool in sm._slot_pools.items():
+    for backend_id, be_sm in sm._backends.items():
         if backend_id not in result:
             result[backend_id] = {"models": {}}
-        if model_name not in result[backend_id]["models"]:
-            result[backend_id]["models"][model_name] = {"slots": {}}
-        slots = result[backend_id]["models"][model_name]["slots"]
-        for slot_id in pool:
-            g = (model_name, backend_id, slot_id)
-            in_use = sm._in_use.get(g, False)
-            last_used = sm._last_used.get(g, 0)
-            kv_blocks = len(sm._slot_kv_state.get(g, []))
-            # Check if slot was recently restored (within 5s)
-            last_restore_key = None
-            if g in sm._slot_save_skipped:
-                skip_entry = sm._slot_save_skipped[g]
-                if len(skip_entry) >= 3:
-                    last_restore_key = skip_entry[0][:16] if skip_entry[0] else None
-            slots[str(slot_id)] = {
-                "in_use": in_use,
-                "last_used": last_used,
-                "kv_blocks": kv_blocks,
-                "last_restore": last_restore_key,
-            }
+        for model_name, pool in be_sm._slot_pools.items():
+            if model_name not in result[backend_id]["models"]:
+                result[backend_id]["models"][model_name] = {"slots": {}}
+            slots = result[backend_id]["models"][model_name]["slots"]
+            for slot_id in pool:
+                in_use = be_sm._in_use.get(slot_id, False)
+                last_used = be_sm._last_used.get(slot_id, 0)
+                kv_blocks = len(be_sm._slot_kv_state.get(slot_id, []))
+                last_restore_key = None
+                if slot_id in be_sm._slot_save_skipped:
+                    skip_entry = be_sm._slot_save_skipped[slot_id]
+                    if len(skip_entry) >= 3:
+                        last_restore_key = skip_entry[0][:16] if skip_entry[0] else None
+                slots[str(slot_id)] = {
+                    "in_use": in_use,
+                    "last_used": last_used,
+                    "kv_blocks": kv_blocks,
+                    "last_restore": last_restore_key,
+                }
     return result
 
 
 def _get_cache_stats() -> dict:
-    """Build per-backend cache utilization stats."""
     sm = app.state.sm if hasattr(app.state, "sm") else None
     if not sm:
         return {}
     result = {}
     for backend_id in backend_manager.keys():
-        ring = sm._cache_ring.get(backend_id, deque())
-        total_bytes = sm._total_bytes.get(backend_id, 0)
+        be_sm = sm.get(backend_id) if backend_id in sm._backends else None
+        if not be_sm:
+            continue
+        total_bytes = be_sm.get_total_bytes()
         max_gb = backend_manager.get_cache_max_size_gb(backend_id)
         max_bytes = max_gb * 1024**3
         utilization = (total_bytes / max_bytes * 100) if max_bytes > 0 else 0
-        file_count = len(ring)
+        file_count = be_sm.get_ring_size()
         oldest = None
         newest = None
-        if ring:
-            oldest = ring[0][2]
-            newest = ring[-1][2]
+        if be_sm._cache_ring:
+            oldest = be_sm._cache_ring[0][2]
+            newest = be_sm._cache_ring[-1][2]
         cache_dir = backend_manager.get_cache_dir(backend_id)
         result[backend_id] = {
             "ring_size": file_count,
