@@ -486,6 +486,10 @@ function getBarPct(value) {
   return Math.min(100, Math.max(0, value * 100));
 }
 
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 async function fetchMetrics() {
   try {
     const resp = await fetch(API_BASE + '/metrics/summary');
@@ -784,7 +788,7 @@ function _doRenderFilteredRequests() {
     const expanded = expandedRequests.has(req.timestamp) ? 'open' : '';
     const bodyOpen = expanded ? 'open' : '';
     const arrowOpen = expanded ? 'open' : '';
-    const preview = req.prompt_preview ? `<div class="request-preview">"${req.prompt_preview}${req.prompt_preview.length >= 200 ? '...' : ''}"</div>` : '';
+    const preview = req.prompt_preview ? `<div class="request-preview">"${escapeHtml(req.prompt_preview)}${req.prompt_preview.length >= 200 ? '...' : ''}"</div>` : '';
     const metricsParts = [];
     if (req.cache_hit && req.n_tokens) metricsParts.push(`${req.cached_tokens || 0}/${req.n_tokens} cached`);
     if (req.n_tokens && !req.cache_hit) metricsParts.push(`${req.n_tokens} prompt tokens`);
@@ -811,7 +815,7 @@ function _doRenderFilteredRequests() {
         const obj = JSON.parse(JSON.stringify(req.full_request_json));
         if (obj.tools) delete obj.tools;
         const jsonStr = JSON.stringify(obj, null, 2);
-        return `<div class="request-preview" style="display:flex;align-items:center;gap:8px;"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">"${req.prompt_preview || ''}${(req.prompt_preview || '').length >= 200 ? '...' : ''}"</span><button class="copy-json-btn" data-json="${encodeURIComponent(jsonStr)}" style="font-size:11px;padding:2px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--text);cursor:pointer;flex-shrink:0;">Copy</button></div>`;
+        return `<div class="request-preview" style="display:flex;align-items:center;gap:8px;"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">"${escapeHtml(req.prompt_preview || '')}${(req.prompt_preview || '').length >= 200 ? '...' : ''}"</span><button class="copy-json-btn" data-json="${encodeURIComponent(jsonStr)}" style="font-size:11px;padding:2px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--text);cursor:pointer;flex-shrink:0;">Copy</button></div>`;
       })() : preview}
       ${metricsHtml ? `<div class="request-footer" style="font-size:12px;color:var(--text-secondary);padding:4px 10px;border-top:1px solid var(--border);">${metricsHtml}</div>` : ''}
       <div class="request-footer" style="font-size:11px;color:var(--text-secondary);padding:3px 10px;border-top:1px solid var(--border);display:flex;align-items:center;gap:6px;">
