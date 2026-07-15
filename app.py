@@ -286,10 +286,12 @@ class StreamReader:
     def __init__(self, resp: httpx.Response, req: Request,
                  model_name: str, backend_id: str, slot_id: int,
                  key: str, n_tokens: int, blocks: List[str],
-                 sm: SlotManager, best_ratio: float = 0.0, restored: bool = False,
+                 sm: SlotManager, best_ratio: float = 0.0,
+                 hit_type: Optional[CacheHitType] = None,
                  restore_key: Optional[str] = None, restore_backend: Optional[str] = None,
                  t0: float = 0, request_json: Optional[Dict] = None,
-                 request_id: Optional[str] = None, routing_reason: str = "cache_miss"):
+                 request_id: Optional[str] = None, routing_reason: str = "cache_miss",
+                 backend_cache_ratios: Optional[Dict[str, float]] = None):
         self.resp = resp
         self.req = req
         self.model_name = model_name
@@ -300,9 +302,10 @@ class StreamReader:
         self.blocks = blocks
         self.sm = sm
         self.best_ratio = best_ratio
-        self.restored = restored
+        self._hit_type = hit_type
         self.restore_key = restore_key
         self.restore_backend = restore_backend
+        self._backend_cache_ratios = backend_cache_ratios or {}
         self._t0 = t0
         self._request_json = request_json
         self._request_id = request_id
@@ -471,7 +474,7 @@ class StreamReader:
     async def _save(self) -> tuple:
         be_sm = self.sm.get(self.backend_id)
         recompute_happened = False
-        if self.restored and self.restore_key and self.restore_backend:
+        if self._hit_type and self.restore_backend:
             cached_tokens = self._sse_cached_tokens
             llm_prompt_tokens = self._sse_prompt_tokens or self.n_tokens
             log.info(
@@ -488,17 +491,19 @@ class StreamReader:
                     self.model_name, self.backend_id, self.slot_id, self.key_short,
                     cached_tokens, llm_prompt_tokens,
                 )
-                kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
+                if self.restore_key:
+                    kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
 
-        if not should_save_cache(self.best_ratio, recompute_happened):
+        serving_be_ratio = self._backend_cache_ratios.get(self.backend_id, 0.0)
+        if not should_save_cache(serving_be_ratio, recompute_happened):
             log.info(
                 "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): "
                 "restore ratio %.3f >= threshold (no recompute, cache was useful)",
                 self.model_name, self.backend_id, self.slot_id, self.key_short,
-                self.best_ratio,
+                serving_be_ratio,
             )
             be_sm.mark_save_skipped(self.slot_id,
-                                    (self.key, self.blocks, self.n_tokens, self.restored, self.best_ratio, recompute_happened))
+                                    (self.key, self.blocks, self.n_tokens, self._hit_type, serving_be_ratio, recompute_happened))
             return False, 0
         ok = False
         cache_size = 0
@@ -563,7 +568,7 @@ class StreamReader:
         # Record metrics for streaming requests
         if self._t0 > 0:
             recompute_happened = False
-            if self.restored and (self.restore_key or self._routing_reason == "pending_slot_hit"):
+            if self._hit_type:
                 cached_tokens = self._sse_cached_tokens
                 llm_prompt_tokens = self._sse_prompt_tokens or self.n_tokens
                 if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
@@ -584,8 +589,9 @@ class StreamReader:
                 "model": self.model_name,
                 "backend": self.backend_id,
                 "slot_id": self.slot_id,
-                 "cache_hit": bool(self.restore_key) or self._routing_reason == "pending_slot_hit",
-                "restored": self.restored,
+                 "cache_hit": self._hit_type is not None,
+                 "restored": (True if self._hit_type == CacheHitType.DISK_RESTORE and self.restore_key
+                              else (None if self._hit_type == CacheHitType.SKIP else False)),
                 "recompute": recompute_happened,
                 "saved": ok,
                 "latency_ms": latency_ms,
@@ -804,8 +810,6 @@ async def chat(req: Request):
                 if be_best > 0:
                     backend_cache_ratios[be_id] = be_best
 
-        pending_slot_hit = hit_type == CacheHitType.SKIP
-
         log.info(
             "Chat request from %s: model '%s', %d tokens, restore key=%s on backend %s",
             client_ip, client_model, prompt_tokens,
@@ -823,7 +827,7 @@ async def chat(req: Request):
 
         candidate_backends.sort(
             key=lambda cb: (
-                backend_cache_ratios.get(cb[0], 0.0),
+                -backend_cache_ratios.get(cb[0], 0.0),
                 sm.get(cb[0]).get_ring_size(),
                 sm.get_backend_latency_ema(cb[0]),
                 sm.get_backend_last_used(cb[0]),
@@ -858,11 +862,11 @@ async def chat(req: Request):
     blocks = hs.block_hashes_from_tokens(serving_token_ids, WORDS_PER_BLOCK)
 
     # Determine routing reason for metrics
-    if pending_slot_hit:
+    if hit_type == CacheHitType.SKIP and be_id == restore_backend:
         routing_reason = "pending_slot_hit"
-    elif restore_key and restore_backend and be_id == restore_backend:
+    elif hit_type == CacheHitType.DISK_RESTORE and be_id == restore_backend:
         routing_reason = "cache_hit"
-    elif restore_key is None and restore_backend is None:
+    elif hit_type is None:
         routing_reason = "no_cache_entry"
     else:
         routing_reason = "cache_backend_unavailable"
@@ -881,7 +885,7 @@ async def chat(req: Request):
             "backend": be_id,
             "slot_id": slot_id,
             "routing_reason": routing_reason,
-            "cache_hit": bool(restore_key) or pending_slot_hit,
+            "cache_hit": hit_type is not None,
             "restored": restored,
             "status": "incomplete",
             "routing_diagnostics": {
@@ -939,9 +943,12 @@ async def chat(req: Request):
                 )
 
             reader = StreamReader(resp, req, model_name, be_id, slot_id,
-                                  key, prompt_tokens, blocks, sm, best_ratio, restored,
-                                  restore_key, restore_backend, t0=t0, request_json=request_json,
-                                  request_id=request_id, routing_reason=routing_reason)
+                                   key, prompt_tokens, blocks, sm, best_ratio,
+                                   hit_type=hit_type,
+                                   restore_key=restore_key, restore_backend=restore_backend,
+                                   t0=t0, request_json=request_json,
+                                   request_id=request_id, routing_reason=routing_reason,
+                                   backend_cache_ratios=backend_cache_ratios)
             gen = reader.stream()
             _reader_created = True
 
@@ -976,7 +983,7 @@ async def chat(req: Request):
             recompute_happened = False
             llm_prompt_tokens = 0
             cached_tokens = 0
-            if restored and (restore_key or pending_slot_hit):
+            if hit_type:
                 usage = out.get("usage") or {}
                 pt_details = usage.get("prompt_tokens_details") or {}
                 cached_tokens = pt_details.get("cached_tokens", 0)
@@ -1000,7 +1007,7 @@ async def chat(req: Request):
 
             save_ok = False
             cache_size = 0
-            serving_be_ratio = backend_cache_ratios.get(be_id, best_ratio)
+            serving_be_ratio = backend_cache_ratios.get(be_id, 0.0)
             if should_save_cache(serving_be_ratio, recompute_happened):
                 try:
                     ok, cache_size = await be_sm.save_after(
@@ -1015,7 +1022,7 @@ async def chat(req: Request):
                                 model_name, be_id, slot_id, e)
             else:
                 be_sm.mark_save_skipped(slot_id,
-                                        (key, blocks, prompt_tokens, restored, serving_be_ratio, recompute_happened))
+                                         (key, blocks, prompt_tokens, hit_type, serving_be_ratio, recompute_happened))
 
             prompt_preview = extract_prompt_preview(request_json)
             latency_ms = (time.time() - t0) * 1000
@@ -1026,7 +1033,7 @@ async def chat(req: Request):
                 "model": model_name,
                 "backend": be_id,
                 "slot_id": slot_id,
-                "cache_hit": bool(restore_key) or pending_slot_hit,
+                "cache_hit": hit_type is not None,
                 "restored": restored,
                 "recompute": recompute_happened,
                 "saved": save_ok,
