@@ -210,7 +210,7 @@ async def _acquire_slot_for_request(
             be_sm.set_kv_state(slot_id, cache_blocks)
         # For pending slot hit (cache_blocks is None), keep existing KV state intact
         restored = await _do_restore_call(be_sm, slot_id, restore_key, cache_blocks)
-        sm._backend_last_used[restore_backend] = time.time()
+        backend_manager.touch_backend(restore_backend)
         return (canonical_name, restore_backend, slot_id), restored
 
     # Phase 0: try cache backend; if busy, poll up to EMA timeout
@@ -222,7 +222,7 @@ async def _acquire_slot_for_request(
         # No free slot — poll every 5s up to EMA timeout
         pending = sm._cache_wait_pending.get(restore_backend, 0)
         if pending < CACHE_HIT_WAIT_MAX_PENDING_REQS:
-            ema = sm._slot_duration_ema.get(restore_backend, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
+            ema = sm.get(restore_backend).get_slot_duration_ema()
             wait_timeout = max(min(ema, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
             log.info(
                 "Cache backend '%s' busy for model '%s', polling up to %.1fs",
@@ -267,7 +267,7 @@ async def _acquire_slot_for_request(
             else:
                 be_sm.set_kv_state(slot_id, [])
             restored = await _do_restore_call(be_sm, slot_id, None, fb_blocks)
-            sm._backend_last_used[be_id] = time.time()
+            backend_manager.touch_backend(be_id)
             return (model_name, be_id, slot_id), restored
 
         if attempt < RETRY_COUNT - 1:
@@ -553,17 +553,9 @@ class StreamReader:
                          self.model_name, self.backend_id, self.slot_id, self.key_short)
                 be_sm.invalidate(self.slot_id)
 
-        duration = be_sm.release(self.slot_id)
+        be_sm.release(self.slot_id)
         log.info("Released slot %d for model '%s' on backend '%s' (key %s)", self.slot_id,
                   self.model_name, self.backend_id, self.key_short)
-
-        # Update EMA of slot occupancy duration
-        if duration is not None:
-            old = self.sm._slot_duration_ema.get(self.backend_id, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
-            from config import CACHE_HIT_WAIT_EMA_ALPHA
-            self.sm._slot_duration_ema[self.backend_id] = (
-                CACHE_HIT_WAIT_EMA_ALPHA * duration + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * old
-            )
 
         # Record metrics for streaming requests
         if self._t0 > 0:
@@ -603,7 +595,7 @@ class StreamReader:
                 "routing_reason": self._routing_reason,
                 "status": stream_status,
             })
-            self.sm.update_backend_latency(self.backend_id, latency_ms)
+            backend_manager.update_backend_latency(self.backend_id, latency_ms)
 
         log.info("Stream reader finished for model '%s' on backend '%s' slot %d (key %s): saved=%s",
                   self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
@@ -829,8 +821,8 @@ async def chat(req: Request):
             key=lambda cb: (
                 -backend_cache_ratios.get(cb[0], 0.0),
                 sm.get(cb[0]).get_ring_size(),
-                sm.get_backend_latency_ema(cb[0]),
-                sm.get_backend_last_used(cb[0]),
+                backend_manager.get_backend_latency_ema(cb[0]),
+                backend_manager.get_backend_last_used(cb[0]),
             ),
         )
 
@@ -1046,7 +1038,7 @@ async def chat(req: Request):
                 "routing_reason": routing_reason,
                 "status": "complete",
             })
-            sm.update_backend_latency(be_id, latency_ms)
+            backend_manager.update_backend_latency(be_id, latency_ms)
 
             return JSONResponse(content=out, status_code=200)
 

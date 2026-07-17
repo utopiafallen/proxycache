@@ -1775,6 +1775,7 @@ def test_no_cache_fallback_lru():
 def test_no_cache_lru_backend_routing():
     """Cache-miss routing uses composite sort: cache ratio (lowest), ring size (fewest), latency (fastest), LRU (least recent)."""
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
     import time
 
     sm = SlotManager()
@@ -1784,14 +1785,14 @@ def test_no_cache_lru_backend_routing():
     #   be2: ratio=0.0, ring=5, latency=50ms,  last_used=old
     #   be3: ratio=0.8, ring=1, latency=100ms, last_used=never
     now = time.time()
-    sm._backend_last_used["10.0.0.1:8000"] = now
-    sm._backend_last_used["10.0.0.2:8000"] = now - 1000
+    backend_manager._backend_last_used["10.0.0.1:8000"] = now
+    backend_manager._backend_last_used["10.0.0.2:8000"] = now - 1000
     sm.get("10.0.0.1:8000")._cache_ring = deque([(f"key_{i}", 1024, now - i) for i in range(5)])
     sm.get("10.0.0.2:8000")._cache_ring = deque([(f"key_{i}", 1024, now - i) for i in range(5)])
     sm.get("10.0.0.3:8000")._cache_ring = deque([("key_0", 1024, now)])
-    sm._backend_latency_ema["10.0.0.1:8000"] = 200.0
-    sm._backend_latency_ema["10.0.0.2:8000"] = 50.0
-    sm._backend_latency_ema["10.0.0.3:8000"] = 100.0
+    backend_manager._backend_latency_ema["10.0.0.1:8000"] = 200.0
+    backend_manager._backend_latency_ema["10.0.0.2:8000"] = 50.0
+    backend_manager._backend_latency_ema["10.0.0.3:8000"] = 100.0
 
     backend_cache_ratios = {
         "10.0.0.1:8000": 0.0,
@@ -1809,8 +1810,8 @@ def test_no_cache_lru_backend_routing():
         key=lambda cb: (
             backend_cache_ratios.get(cb[0], 0.0),
             len(sm.get(cb[0])._cache_ring),
-            sm.get_backend_latency_ema(cb[0]),
-            sm.get_backend_last_used(cb[0]),
+            backend_manager.get_backend_latency_ema(cb[0]),
+            backend_manager.get_backend_last_used(cb[0]),
         ),
     )
 
@@ -1823,8 +1824,8 @@ def test_no_cache_lru_backend_routing():
     assert candidate_backends[2][0] == "10.0.0.3:8000", f"Expected be3 last (high ratio), got {candidate_backends[2][0]}"
 
     # Verify latency EMA tracking
-    sm.update_backend_latency("10.0.0.1:8000", 150.0)
-    assert sm.get_backend_latency_ema("10.0.0.1:8000") > 0, "EMA should be > 0 after update"
+    backend_manager.update_backend_latency("10.0.0.1:8000", 150.0)
+    assert backend_manager.get_backend_latency_ema("10.0.0.1:8000") > 0, "EMA should be > 0 after update"
 
     # Verify try_acquire works correctly
     sm.get("10.0.0.1:8000").ensure_pool("ModelA", 1)
@@ -2391,7 +2392,7 @@ def test_cache_hit_wait_phase0_timeout():
         sm.get("backend2")._in_use[0] = False
 
         # Use a very short timeout by directly manipulating the EMA
-        sm._slot_duration_ema["backend1"] = CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
+        sm.get("backend1")._slot_duration_ema = CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
 
         # In the new API, the fallback backend has a free slot, so try_acquire should succeed
         be_sm = sm.get("backend2")
@@ -2464,7 +2465,8 @@ def test_slot_duration_ema_updates_after_release():
     """EMA should update with slot occupancy duration after release."""
     from slot_manager import SlotManager
     from backend_manager import backend_manager
-    from config import CACHE_HIT_WAIT_EMA_ALPHA, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT
+    from config import CACHE_HIT_WAIT_EMA_ALPHA, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, \
+        CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT
 
     backend_manager._first_key = "10.0.0.1:8000"
     backend_manager._refresh_state.clear()
@@ -2494,6 +2496,10 @@ def test_slot_duration_ema_updates_after_release():
     # Release should return the occupancy duration
     assert duration == 50.0, f"Expected duration 50.0, got {duration}"
     assert 0 not in be_sm._slot_acquired_at
+    # EMA should be updated on the BackendSlotManager (blends duration with initial timeout, clamped)
+    expected_ema = CACHE_HIT_WAIT_EMA_ALPHA * 50.0 + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT
+    expected_ema = max(min(expected_ema, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
+    assert be_sm._slot_duration_ema == expected_ema, f"Expected EMA {expected_ema}, got {be_sm._slot_duration_ema}"
     print("PASS: test_slot_duration_ema_updates_after_release")
 
 
@@ -2533,13 +2539,11 @@ def test_slot_duration_ema_uses_initial_for_new_backend():
     backend_manager._discovered_models.clear()
 
     sm = SlotManager()
-    sm.get("backend1").ensure_pool("ModelA", 1)
+    be_sm = sm.get("backend1")
+    be_sm.ensure_pool("ModelA", 1)
 
-    # No prior EMA data
-    assert "backend1" not in sm._slot_duration_ema
-
-    # Effective timeout should use INITIAL_TIMEOUT
-    ema = sm._slot_duration_ema.get("backend1", CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT)
+    # No prior EMA data — getter returns INITIAL_TIMEOUT
+    ema = be_sm.get_slot_duration_ema()
     wait_timeout = max(min(ema, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT), CACHE_HIT_WAIT_EMA_MIN_TIMEOUT)
     assert wait_timeout == CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, \
         f"Expected INITIAL_TIMEOUT {CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT}, got {wait_timeout}"

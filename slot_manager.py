@@ -25,7 +25,9 @@ from typing import List, Tuple, Dict, Optional
 import httpx
 
 from config import META_DIR, CACHE_MAX_AGE_HOURS, \
-    KV_CACHE_SKIP_THRESHOLD, WORDS_PER_BLOCK, CACHE_HIT_WAIT_EMA_ALPHA
+    KV_CACHE_SKIP_THRESHOLD, WORDS_PER_BLOCK, CACHE_HIT_WAIT_EMA_ALPHA, \
+    CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT, \
+    CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
 import hashing as hs
 from backend_manager import backend_manager
 from kv_meta_manager import kv_meta
@@ -51,6 +53,7 @@ class BackendSlotManager:
         self._slot_kv_state: Dict[int, List[str]] = {}  # slot_id -> blocks
         self._slot_save_skipped: Dict[int, tuple] = {}
         self._slot_acquired_at: Dict[int, float] = {}
+        self._slot_duration_ema: float = 0.0
 
         # Cache ring buffer
         self._cache_ring: deque = deque()
@@ -124,6 +127,12 @@ class BackendSlotManager:
         if slot_id in self._slot_acquired_at:
             duration = time.time() - self._slot_acquired_at[slot_id]
             del self._slot_acquired_at[slot_id]
+            old = self._slot_duration_ema if self._slot_duration_ema > 0 else CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT
+            self._slot_duration_ema = CACHE_HIT_WAIT_EMA_ALPHA * duration + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * old
+            self._slot_duration_ema = max(
+                min(self._slot_duration_ema, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT),
+                CACHE_HIT_WAIT_EMA_MIN_TIMEOUT,
+            )
             return duration
         return None
 
@@ -147,6 +156,10 @@ class BackendSlotManager:
 
     def set_kv_state(self, slot_id: int, blocks: List[str]):
         self._slot_kv_state[slot_id] = blocks
+
+    def get_slot_duration_ema(self) -> float:
+        """Return the EMA slot occupancy duration for this backend."""
+        return self._slot_duration_ema if self._slot_duration_ema > 0 else CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT
 
     def should_skip_restore(self, slot_id: int, req_blocks: List[str]) -> bool:
         """Check if the slot's current KV cache already matches the request.
@@ -351,15 +364,13 @@ class BackendSlotManager:
 class SlotManager:
     """Thin global coordinator — holds per-backend BackendSlotManager instances.
 
-    Delegates slot operations to per-backend managers. Owns cross-backend
-    metrics (EMA latency, slot duration) and startup initialization.
+    Delegates slot operations to per-backend managers. Owns cache wait queue
+    tracking and startup initialization. Per-backend metrics (EMA latency,
+    slot duration, last used) live on BackendManager/BackendSlotManager.
     """
 
     def __init__(self):
         self._backends: Dict[str, BackendSlotManager] = {}
-        self._slot_duration_ema: Dict[str, float] = {}
-        self._backend_last_used: Dict[str, float] = {}
-        self._backend_latency_ema: Dict[str, float] = {}
         self._cache_wait_pending: Dict[str, int] = {}
         log.info("Cache entry expiry set to %d hours", CACHE_MAX_AGE_HOURS)
 
@@ -411,16 +422,3 @@ class SlotManager:
             be_sm = self.get(backend_key)
             for canonical_name, n_slots in model_slots.items():
                 be_sm.ensure_pool(canonical_name, n_slots)
-
-    # ── Cross-backend metrics ─────────────────────────────────────────
-
-    def update_backend_latency(self, backend_id: str, latency_ms: float):
-        alpha = CACHE_HIT_WAIT_EMA_ALPHA
-        old = self._backend_latency_ema.get(backend_id, latency_ms)
-        self._backend_latency_ema[backend_id] = alpha * latency_ms + (1 - alpha) * old
-
-    def get_backend_latency_ema(self, backend_id: str) -> float:
-        return self._backend_latency_ema.get(backend_id, 0.0)
-
-    def get_backend_last_used(self, backend_id: str) -> float:
-        return self._backend_last_used.get(backend_id, 0.0)

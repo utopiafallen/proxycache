@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import BACKENDS, DEFAULT_N_CTX
+from config import BACKENDS, DEFAULT_N_CTX, CACHE_HIT_WAIT_EMA_ALPHA
 from llama_client import LlamaClient
 from cache_agent_client import CacheAgentClient
 from hashing import sanitize_backend_dir
@@ -60,6 +60,8 @@ class BackendManager:
         self._refresh_state: dict[tuple[str, str], tuple[float, bool, int]] = {}
         self._discovered_models: dict[str, DiscoveredModel] = {}
         self._backend_state: dict[str, bool] = {}
+        self._backend_last_used: dict[str, float] = {}
+        self._backend_latency_ema: dict[str, float] = {}
         self._discovery_task: asyncio.Task | None = None
 
         for be in backends_config:
@@ -121,6 +123,23 @@ class BackendManager:
         if be is None:
             raise KeyError(f"Unknown backend key: {key}")
         return getattr(be, 'cache_max_size_gb', 25.0)
+
+    def touch_backend(self, backend_id: str):
+        """Mark a backend as recently used."""
+        self._backend_last_used[backend_id] = time.time()
+
+    def get_backend_last_used(self, backend_id: str) -> float:
+        """Return the last-used timestamp for a backend."""
+        return self._backend_last_used.get(backend_id, 0.0)
+
+    def update_backend_latency(self, backend_id: str, latency_ms: float):
+        """Update the EMA latency for a backend."""
+        old = self._backend_latency_ema.get(backend_id, latency_ms)
+        self._backend_latency_ema[backend_id] = CACHE_HIT_WAIT_EMA_ALPHA * latency_ms + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * old
+
+    def get_backend_latency_ema(self, backend_id: str) -> float:
+        """Return the EMA latency for a backend."""
+        return self._backend_latency_ema.get(backend_id, 0.0)
 
     async def cache_delete(self, backend_id: str, key: str) -> bool:
         """Delete a cache file via agent or local filesystem."""
