@@ -143,8 +143,14 @@ async def _acquire_slot_for_request(
         cache_blocks = None
 
     async def _do_restore_call(be_sm: BackendSlotManager, slot_id: int,
-                                key: Optional[str], blocks: Optional[List[str]]) -> Optional[bool]:
-        """Execute restore logic for an acquired slot. Returns restored flag."""
+                                key: Optional[str], blocks: Optional[List[str]],
+                                prev_blocks: Optional[List[str]] = None) -> Optional[bool]:
+        """Execute restore logic for an acquired slot. Returns restored flag.
+
+        prev_blocks: the slot's KV state *before* this request. If provided,
+        should_skip_restore checks against this instead of whatever is currently
+        in _slot_kv_state (which may have been pre-set to the request's own blocks).
+        """
         restored: Optional[bool] = None
 
         # Flush previously skipped save
@@ -167,7 +173,7 @@ async def _acquire_slot_for_request(
                 )
 
         if blocks:
-            if be_sm.should_skip_restore(slot_id, blocks):
+            if be_sm.should_skip_restore(slot_id, blocks, prev_blocks):
                 log.info(
                     "Skipping restore for model '%s' on backend '%s' slot %d: slot cache already matches",
                     canonical_name, be_sm.backend_id, slot_id,
@@ -205,11 +211,13 @@ async def _acquire_slot_for_request(
         slot_id = be_sm.try_acquire(canonical_name)
         if slot_id is None:
             return None
+        # Save old KV state before updating — skip-restore must check against previous state
+        old_kv = be_sm.get_kv_state(slot_id)
         # Set KV state: use request blocks for disk restore, preserve existing for pending hit
         if cache_blocks:
             be_sm.set_kv_state(slot_id, cache_blocks)
         # For pending slot hit (cache_blocks is None), keep existing KV state intact
-        restored = await _do_restore_call(be_sm, slot_id, restore_key, cache_blocks)
+        restored = await _do_restore_call(be_sm, slot_id, restore_key, cache_blocks, old_kv)
         backend_manager.touch_backend(restore_backend)
         return (canonical_name, restore_backend, slot_id), restored
 
@@ -262,11 +270,12 @@ async def _acquire_slot_for_request(
                 continue
             # Cache miss: track blocks for this backend
             fb_blocks = backend_blocks.get(be_id)
+            old_fb_kv = be_sm.get_kv_state(slot_id)
             if fb_blocks:
                 be_sm.set_kv_state(slot_id, fb_blocks)
             else:
                 be_sm.set_kv_state(slot_id, [])
-            restored = await _do_restore_call(be_sm, slot_id, None, fb_blocks)
+            restored = await _do_restore_call(be_sm, slot_id, None, fb_blocks, old_fb_kv)
             backend_manager.touch_backend(be_id)
             return (model_name, be_id, slot_id), restored
 
@@ -347,10 +356,18 @@ class StreamReader:
             while True:
                 anext_task = asyncio.create_task(iterator.__anext__())
                 disconnect_wait = asyncio.ensure_future(self._disconnect_event.wait())
-                done, pending = await asyncio.wait(
-                    [anext_task, disconnect_wait],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                try:
+                    done, pending = await asyncio.wait(
+                        [anext_task, disconnect_wait],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    log.warning("Reader loop cancelled for model '%s' on backend '%s' slot %d (key %s)",
+                                self.model_name, self.backend_id, self.slot_id, self.key_short)
+                    for t in [anext_task, disconnect_wait]:
+                        if not t.done():
+                            t.cancel()
+                    raise
                 if self._disconnect_event.is_set():
                     log.warning("Client disconnected while reading from model '%s' on backend '%s' slot %d (key %s)",
                                 self.model_name, self.backend_id, self.slot_id, self.key_short)
@@ -374,11 +391,13 @@ class StreamReader:
                         for t in pending:
                             t.cancel()
                         break
-                    except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError):
+                    except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError,
+                            httpx.StreamError, asyncio.IncompleteReadError,
+                            ConnectionResetError, BrokenPipeError, OSError) as stream_err:
                         log.warning(
-                            "Backend disconnected for model '%s' on backend '%s' slot %d (key %s): incomplete body (%d chunks, %d bytes)",
+                            "Backend disconnected for model '%s' on backend '%s' slot %d (key %s): incomplete body (%d chunks, %d bytes), error=%s: %s",
                             self.model_name, self.backend_id, self.slot_id, self.key_short,
-                            chunks_received, total_bytes,
+                            chunks_received, total_bytes, type(stream_err).__name__, stream_err,
                         )
                         self._disconnect_event.set()
                         for t in pending:
@@ -527,9 +546,12 @@ class StreamReader:
         log.info("Starting cleanup for model '%s' on backend '%s' slot %d (key %s): cancelled=%s, stream_complete=%s",
                   self.model_name, self.backend_id, self.slot_id, self.key_short, self._cancelled, self._stream_complete)
         try:
-            await self.resp.aclose()
+            await asyncio.wait_for(self.resp.aclose(), timeout=5.0)
             log.info("Response closed for model '%s' on backend '%s' slot %d (key %s)",
                       self.model_name, self.backend_id, self.slot_id, self.key_short)
+        except asyncio.TimeoutError:
+            log.warning("Response aclose() timed out for model '%s' on backend '%s' slot %d (key %s) — half-open connection",
+                        self.model_name, self.backend_id, self.slot_id, self.key_short)
         except Exception as e:
             log.info("Error closing response for model '%s' on backend '%s' slot %d (key %s): %s",
                       self.model_name, self.backend_id, self.slot_id, self.key_short, e)
@@ -648,6 +670,13 @@ class StreamReader:
                 else:
                     self._cancelled = True
                     self._task.cancel()
+                    try:
+                        await asyncio.wait_for(self._task, timeout=5.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        log.warning(
+                            "Reader task did not finish after cancel for model '%s' on backend '%s' slot %d (key %s)",
+                            self.model_name, self.backend_id, self.slot_id, self.key_short,
+                        )
             if not heartbeat.done():
                 heartbeat.cancel()
             await asyncio.shield(self._cleanup())

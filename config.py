@@ -53,6 +53,11 @@ DEFAULT_N_CTX = int(os.getenv("DEFAULT_N_CTX", "16384"))
 # KV cache skip threshold (0..1) — skip restore if slot KV cache matches >= this
 KV_CACHE_SKIP_THRESHOLD = float(os.getenv("KV_CACHE_SKIP_THRESHOLD", "0.9"))
 
+# Max block count difference ratio (0..1) for skip-restore — if the slot's tracked
+# block count differs from the request by more than this fraction, don't skip.
+# e.g. 0.1 means a 46-block request vs 841-block slot (94% diff) won't skip.
+KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT = float(os.getenv("KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT", "0.1"))
+
 # Cache save ratio threshold (0..1) — only save cache if restore candidate ratio < this
 # When a cached prompt already matches well (>= threshold), no need to save a duplicate
 CACHE_SAVE_RATIO_THRESHOLD = float(os.getenv("CACHE_SAVE_RATIO_THRESHOLD", "0.8"))

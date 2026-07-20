@@ -26,6 +26,7 @@ class LlamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
         self._request_count = 0
+        self._connection_errors = 0
         self._create_client()
         log.info("Initialized HTTP client for %s (httpx %s)", base_url, httpx.__version__)
 
@@ -45,15 +46,18 @@ class LlamaClient:
         self._request_count += 1
         if self._request_count >= CLIENT_RECREATE_INTERVAL:
             log.info(
-                "Recreating HTTP client for %s after %d requests (interval=%d)",
-                self.base_url, self._request_count, CLIENT_RECREATE_INTERVAL,
+                "Recreating HTTP client for %s after %d requests, %d connection errors (interval=%d)",
+                self.base_url, self._request_count, self._connection_errors, CLIENT_RECREATE_INTERVAL,
             )
             self._request_count = 0
+            self._connection_errors = 0
             self._recreate_client()
 
     def _recreate_client(self):
-        """Create a fresh client. The old one is dropped — GC closes it
-        once any in-flight requests release their connections."""
+        """Create a fresh client, dropping the old one. The old client's
+        connections are released by GC — we deliberately don't await aclose()
+        here because it can hang on half-open connections and block the
+        event loop (making the app unresponsive to Ctrl+C)."""
         self._create_client()
 
     async def apply_chat_template(self, messages: list) -> str:

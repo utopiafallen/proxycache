@@ -25,9 +25,9 @@ from typing import List, Tuple, Dict, Optional
 import httpx
 
 from config import META_DIR, CACHE_MAX_AGE_HOURS, \
-    KV_CACHE_SKIP_THRESHOLD, WORDS_PER_BLOCK, CACHE_HIT_WAIT_EMA_ALPHA, \
-    CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT, \
-    CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
+    KV_CACHE_SKIP_THRESHOLD, KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT, WORDS_PER_BLOCK, \
+    CACHE_HIT_WAIT_EMA_ALPHA, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, \
+    CACHE_HIT_WAIT_EMA_MAX_TIMEOUT, CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
 import hashing as hs
 from backend_manager import backend_manager
 from kv_meta_manager import kv_meta
@@ -161,12 +161,21 @@ class BackendSlotManager:
         """Return the EMA slot occupancy duration for this backend."""
         return self._slot_duration_ema if self._slot_duration_ema > 0 else CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT
 
-    def should_skip_restore(self, slot_id: int, req_blocks: List[str]) -> bool:
+    def should_skip_restore(self, slot_id: int, req_blocks: List[str],
+                             prev_blocks: Optional[List[str]] = None) -> bool:
         """Check if the slot's current KV cache already matches the request.
 
-        Only applies for single-slot backends.
+        Only applies for single-slot backends. Three conditions must all pass:
+        1. Slot must not have more blocks than the request (stale leftover state)
+        2. Block count difference must be within KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT
+        3. LCP ratio must be >= KV_CACHE_SKIP_THRESHOLD
+
+        prev_blocks: if provided, use this as the slot's previous KV state instead of
+        reading from _slot_kv_state. This is needed when _slot_kv_state was already
+        updated to the request's own blocks before the skip-restore check runs.
         """
-        prev_blocks = self._slot_kv_state.get(slot_id)
+        if prev_blocks is None:
+            prev_blocks = self._slot_kv_state.get(slot_id)
         if not prev_blocks:
             return False
 
@@ -175,12 +184,35 @@ class BackendSlotManager:
             if len(pool) > 1:
                 return False
 
+        n_prev = len(prev_blocks)
+        n_req = len(req_blocks)
+
+        # Slot has more blocks than request — stale leftover state, can't skip
+        if n_prev > n_req:
+            log.warning(
+                "Cannot skip restore for backend '%s' slot %d: slot has %d blocks, request needs %d (stale state)",
+                self.backend_id, slot_id, n_prev, n_req,
+            )
+            return False
+
+        # Block count difference exceeds threshold
+        diff = n_req - n_prev
+        max_len = max(n_prev, n_req)
+        diff_pct = diff / max_len if max_len > 0 else 0
+        if diff_pct > KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT:
+            log.warning(
+                "Cannot skip restore for backend '%s' slot %d: block diff %d/%d (%.1f%%) > %.0f%% threshold",
+                self.backend_id, slot_id, diff, max_len, diff_pct * 100,
+                KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT * 100,
+            )
+            return False
+
         lcp = hs.lcp_blocks(req_blocks, prev_blocks)
-        denom = max(1, min(len(req_blocks), len(prev_blocks)))
+        denom = max(1, min(n_req, n_prev))
         ratio = lcp / denom
         log.warning(
-            "Checking skip restore for backend '%s' slot %d: ratio=%.3f",
-            self.backend_id, slot_id, ratio,
+            "Checking skip restore for backend '%s' slot %d: ratio=%.3f, blocks %d->%d",
+            self.backend_id, slot_id, ratio, n_prev, n_req,
         )
         return ratio >= KV_CACHE_SKIP_THRESHOLD
 
