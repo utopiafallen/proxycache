@@ -46,7 +46,6 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `BACKENDS` | `[]` | JSON array of backend configs (see below). Empty defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`. Each backend must specify exactly one of `cache_dir` or `agent_port`. |
 | `BACKEND_MODE` | `llama-cpp` | `llama-cpp` or `llama-swap` (changes `/slots` URL paths) |
 | `META_DIR` | `./kv_meta` | Local metadata directory (organized by backend subdirectories) |
-| `CACHE_MAX_AGE_HOURS` | `168` | Delete cache files older than this (0=disabled) |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
 | `LCP_TH` | `0.2` | LCP similarity threshold for cache match (0–1) |
 | `KV_CACHE_SKIP_THRESHOLD` | `0.9` | Skip restore if slot KV cache matches >= this ratio |

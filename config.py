@@ -43,9 +43,6 @@ BACKEND_MODE = os.getenv("BACKEND_MODE", "llama-cpp")
 # Service port
 PORT = int(os.getenv("PORT", "8081"))
 
-# Cache cleanup settings
-CACHE_MAX_AGE_HOURS = int(os.getenv("CACHE_MAX_AGE_HOURS", "168"))  # 7 days default
-
 
 # Default context length used when backend doesn't report n_ctx
 DEFAULT_N_CTX = int(os.getenv("DEFAULT_N_CTX", "16384"))

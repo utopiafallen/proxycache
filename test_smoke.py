@@ -383,161 +383,123 @@ def test_slot_manager_gslot_type():
     print("PASS: test_slot_manager_gslot_type")
 
 
-def test_ring_buffer_age_eviction():
-    from collections import deque
-    """Ring buffer should evict expired entries before LRU entries when over limit."""
+def test_ring_buffer_scored_eviction():
+    """Scored eviction should evict stale+redundant entries before fresh+unique ones."""
     from slot_manager import SlotManager
-    import hashing as hs
-    import tempfile
+    from backend_manager import backend_manager
+    from kv_meta_manager import kv_meta
 
     sm = SlotManager()
-    sm.get("test_be")._max_age_seconds = 3600  # 1 hour
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache_dir = os.path.join(tmpdir, "cache")
-        meta_dir = os.path.join(tmpdir, "meta")
-        os.makedirs(cache_dir)
-        os.makedirs(meta_dir)
-
-        # Simulate ring buffer with entries of different ages
-        old_key = "old_cache_file"
-        new_key = "new_cache_file"
-        size = 1024 * 1024 * 1020  # ~1 GB each
-        max_bytes = 1500 * 1024 * 1024  # 1.5 GB limit
-
-        sm.get("test_be")._cache_ring.append((old_key, size, time.time() - 7200))  # 2 hours old
-        sm.get("test_be")._cache_ring.append((new_key, size, time.time() - 300))   # 5 minutes old
-        sm.get("test_be")._total_bytes = size * 2
-
-        # Trigger eviction (simulating save_after behavior)
-        now = time.time()
-        evicted = []
-        be_sm = sm.get("test_be")
-        while be_sm._total_bytes > max_bytes and be_sm._cache_ring:
-            # First pass: evict expired entries
-            evicted_expired = False
-            for entry in be_sm._cache_ring:
-                if now - entry[2] > be_sm._max_age_seconds:
-                    evict_key, evict_size, _ = entry
-                    be_sm._cache_ring.remove(entry)
-                    be_sm._total_bytes -= evict_size
-                    evicted.append(evict_key)
-                    evicted_expired = True
-                    break
-            if evicted_expired:
-                continue
-
-            # Second pass: evict LRU entry
-            lru_idx = 0
-            lru_ts = be_sm._cache_ring[0][2]
-            for i in range(1, len(be_sm._cache_ring)):
-                if be_sm._cache_ring[i][2] < lru_ts:
-                    lru_ts = be_sm._cache_ring[i][2]
-                    lru_idx = i
-            evict_key, evict_size, _ = be_sm._cache_ring[lru_idx]
-            be_sm._cache_ring.remove(be_sm._cache_ring[lru_idx])
-            be_sm._total_bytes -= evict_size
-            evicted.append(evict_key)
-
-        assert evicted == [old_key], f"Expected [old_key], got {evicted}"
-        assert be_sm._total_bytes == size  # Only old entry removed
-        assert len(be_sm._cache_ring) == 1
-        assert be_sm._cache_ring[0][0] == new_key
-        print("PASS: test_ring_buffer_age_eviction")
-
-
-def test_ring_buffer_lru_eviction():
-    """Ring buffer should evict LRU entry when no entries are expired."""
-    from collections import deque
-    from slot_manager import SlotManager
-
-    sm = SlotManager()
-    sm.get("test_be")._max_age_seconds = 3600  # 1 hour
-
-    size = 1024 * 1024 * 1020  # ~1 GB each
-    max_bytes = 1500 * 1024 * 1024  # 1.5 GB limit
-
-    # Simulate ring buffer with all entries under max age
-    sm.get("test_be")._cache_ring.append(("cache_a", size, time.time() - 1800))  # 30 min old
-    sm.get("test_be")._cache_ring.append(("cache_b", size, time.time() - 600))   # 10 min old
-    sm.get("test_be")._total_bytes = size * 2
-
-    # Trigger eviction
-    now = time.time()
-    evicted = []
     be_sm = sm.get("test_be")
-    while be_sm._total_bytes > max_bytes and be_sm._cache_ring:
-        evicted_expired = False
-        for entry in be_sm._cache_ring:
-            if now - entry[2] > be_sm._max_age_seconds:
-                evict_key, evict_size, _ = entry
-                be_sm._cache_ring.remove(entry)
-                be_sm._total_bytes -= evict_size
-                evicted.append(evict_key)
-                evicted_expired = True
-                break
-        if evicted_expired:
-            continue
+    size = 1024 * 1024 * 1020  # ~1 GB each
 
-        lru_idx = 0
-        lru_ts = be_sm._cache_ring[0][2]
-        for i in range(1, len(be_sm._cache_ring)):
-            if be_sm._cache_ring[i][2] < lru_ts:
-                lru_ts = be_sm._cache_ring[i][2]
-                lru_idx = i
-        evict_key, evict_size, _ = be_sm._cache_ring[lru_idx]
-        be_sm._cache_ring.remove(be_sm._cache_ring[lru_idx])
-        be_sm._total_bytes -= evict_size
-        evicted.append(evict_key)
+    # 4 entries: stale+redundant, stale+unique, fresh+redundant, fresh+unique
+    now = time.time()
+    be_sm._cache_ring.append(("stale_redundant", size, now - 7200))   # 2h old, shares blocks
+    be_sm._cache_ring.append(("stale_unique", size, now - 7200))      # 2h old, unique blocks
+    be_sm._cache_ring.append(("fresh_redundant", size, now - 300))    # 5m old, shares blocks
+    be_sm._cache_ring.append(("fresh_unique", size, now - 300))       # 5m old, unique blocks
+    be_sm._total_bytes = size * 4
 
-    assert evicted == ["cache_a"], f"Expected [cache_a] (LRU), got {evicted}"
+    shared_blocks = ["a", "b", "c", "d"]
+    unique_stale = ["s1", "s2", "s3", "s4"]
+    unique_fresh = ["f1", "f2", "f3", "f4"]
+
+    blocks_map = {
+        "stale_redundant": shared_blocks,
+        "stale_unique": unique_stale,
+        "fresh_redundant": shared_blocks,
+        "fresh_unique": unique_fresh,
+    }
+
+    evicted = []
+
+    async def _run():
+        with patch.object(backend_manager, "get_cache_max_size_gb", return_value=3.5):
+            with patch.object(kv_meta, "get_blocks") as mock_blocks:
+                mock_blocks.side_effect = lambda key, be: blocks_map.get(key, [])
+                with patch.object(backend_manager, "cache_delete", return_value=True):
+                    with patch.object(kv_meta, "delete_meta_file") as mock_delete:
+                        mock_delete.side_effect = lambda key: evicted.append(key)
+                        await be_sm._evict_if_needed()
+
+    asyncio.run(_run())
+
+    # Scores: stale_redundant=14400, stale_unique=7200, fresh_redundant=600, fresh_unique=300
+    # total=4GB, max=3.5GB -> need to evict 1 entry (~1GB) to get to ~3GB
+    # stale_redundant has highest score, evicted first
+    assert evicted == ["stale_redundant"], f"Expected [stale_redundant], got {evicted}"
+    assert be_sm._total_bytes == size * 3
+    assert len(be_sm._cache_ring) == 3
+    print("PASS: test_ring_buffer_scored_eviction")
+
+
+def test_ring_buffer_stale_unique_evicted():
+    """Unique entries must still be evicted when stale enough and no redundant entries remain."""
+    from slot_manager import SlotManager
+    from backend_manager import backend_manager
+    from kv_meta_manager import kv_meta
+
+    sm = SlotManager()
+    be_sm = sm.get("test_be")
+    size = 1024 * 1024 * 1020  # ~1 GB each
+
+    now = time.time()
+    be_sm._cache_ring.append(("stale_unique", size, now - 7200))   # 2h old, unique
+    be_sm._cache_ring.append(("fresh_unique", size, now - 300))    # 5m old, unique
+    be_sm._total_bytes = size * 2
+
+    blocks_map = {
+        "stale_unique": ["a", "b", "c"],
+        "fresh_unique": ["x", "y", "z"],
+    }
+
+    evicted = []
+
+    async def _run():
+        with patch.object(backend_manager, "get_cache_max_size_gb", return_value=1.5):
+            with patch.object(kv_meta, "get_blocks") as mock_blocks:
+                mock_blocks.side_effect = lambda key, be: blocks_map.get(key, [])
+                with patch.object(backend_manager, "cache_delete", return_value=True):
+                    with patch.object(kv_meta, "delete_meta_file") as mock_delete:
+                        mock_delete.side_effect = lambda key: evicted.append(key)
+                        await be_sm._evict_if_needed()
+
+    asyncio.run(_run())
+
+    # stale_unique: score = 7200 * 1.0 = 7200
+    # fresh_unique: score = 300 * 1.0 = 300
+    # total=2GB, max=1.5GB -> evict stale_unique (1GB) to get to ~1GB
+    assert evicted == ["stale_unique"], f"Expected [stale_unique], got {evicted}"
     assert be_sm._total_bytes == size
     assert len(be_sm._cache_ring) == 1
-    assert be_sm._cache_ring[0][0] == "cache_b"
-    print("PASS: test_ring_buffer_lru_eviction")
+    print("PASS: test_ring_buffer_stale_unique_evicted")
 
 
 def test_ring_buffer_no_eviction_under_limit():
     """Ring buffer should not evict when under size limit."""
-    from collections import deque
     from slot_manager import SlotManager
+    from backend_manager import backend_manager
+    from kv_meta_manager import kv_meta
 
     sm = SlotManager()
-    sm.get("test_be")._max_age_seconds = 3600
-
+    be_sm = sm.get("test_be")
     size = 1024 * 1024 * 1020  # ~1 GB
-    max_bytes = 2 * 1024 * 1024 * 1024  # 2 GB limit
-
-    sm.get("test_be")._cache_ring.append(("cache_a", size, time.time() - 1800))
-    sm.get("test_be")._cache_ring.append(("cache_b", size, time.time() - 600))
-    sm.get("test_be")._total_bytes = size * 2
 
     now = time.time()
-    evicted = []
-    be_sm = sm.get("test_be")
-    while be_sm._total_bytes > max_bytes and be_sm._cache_ring:
-        evicted_expired = False
-        for entry in be_sm._cache_ring:
-            if now - entry[2] > be_sm._max_age_seconds:
-                evict_key, evict_size, _ = entry
-                be_sm._cache_ring.remove(entry)
-                be_sm._total_bytes -= evict_size
-                evicted.append(evict_key)
-                evicted_expired = True
-                break
-        if evicted_expired:
-            continue
+    be_sm._cache_ring.append(("cache_a", size, now - 1800))
+    be_sm._cache_ring.append(("cache_b", size, now - 600))
+    be_sm._total_bytes = size * 2
 
-        lru_idx = 0
-        lru_ts = be_sm._cache_ring[0][2]
-        for i in range(1, len(be_sm._cache_ring)):
-            if be_sm._cache_ring[i][2] < lru_ts:
-                lru_ts = be_sm._cache_ring[i][2]
-                lru_idx = i
-        evict_key, evict_size, _ = be_sm._cache_ring[lru_idx]
-        be_sm._cache_ring.remove(be_sm._cache_ring[lru_idx])
-        be_sm._total_bytes -= evict_size
-        evicted.append(evict_key)
+    evicted = []
+
+    async def _run():
+        with patch.object(backend_manager, "get_cache_max_size_gb", return_value=3.0):
+            with patch.object(kv_meta, "delete_meta_file") as mock_delete:
+                mock_delete.side_effect = lambda key: evicted.append(key)
+                await be_sm._evict_if_needed()
+
+    asyncio.run(_run())
 
     assert evicted == [], f"Expected no evictions, got {evicted}"
     assert be_sm._total_bytes == size * 2
@@ -2825,8 +2787,8 @@ if __name__ == "__main__":
     test_slot_manager_pool_resize_down()
     test_slot_manager_multiple_backends()
     test_slot_manager_gslot_type()
-    test_ring_buffer_age_eviction()
-    test_ring_buffer_lru_eviction()
+    test_ring_buffer_scored_eviction()
+    test_ring_buffer_stale_unique_evicted()
     test_ring_buffer_no_eviction_under_limit()
 
     # KV cache skip tests

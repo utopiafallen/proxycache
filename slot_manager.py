@@ -20,12 +20,12 @@ import time
 import asyncio
 import logging
 from collections import deque
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Set
 
 import httpx
 
-from config import META_DIR, CACHE_MAX_AGE_HOURS, \
-    KV_CACHE_SKIP_THRESHOLD, KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT, WORDS_PER_BLOCK, \
+from config import META_DIR, KV_CACHE_SKIP_THRESHOLD, \
+    KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT, WORDS_PER_BLOCK, \
     CACHE_HIT_WAIT_EMA_ALPHA, CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, \
     CACHE_HIT_WAIT_EMA_MAX_TIMEOUT, CACHE_HIT_WAIT_EMA_MIN_TIMEOUT
 import hashing as hs
@@ -61,7 +61,6 @@ class BackendSlotManager:
         # Cache ring buffer
         self._cache_ring: deque = deque()
         self._total_bytes: int = 0
-        self._max_age_seconds: float = CACHE_MAX_AGE_HOURS * 3600
         self._save_lock: asyncio.Lock = asyncio.Lock()
 
     # ── Slot pool management ──────────────────────────────────────────
@@ -307,42 +306,101 @@ class BackendSlotManager:
         return ok, size
 
     async def _evict_if_needed(self):
-        """Evict expired then LRU entries if over budget."""
+        """Score all entries by staleness + redundancy, evict highest-scored until under budget."""
         max_bytes = backend_manager.get_cache_max_size_gb(self.backend_id) * 1024**3
-        now = time.time()
-        log.info(
-            "Cache ring check for backend '%s': total=%d bytes, max=%d bytes, ring_size=%d",
-            self.backend_id, self._total_bytes, max_bytes, len(self._cache_ring),
-        )
-        while self._total_bytes > max_bytes and self._cache_ring:
-            # First pass: evict expired entries
-            evicted = False
-            for i, entry in enumerate(self._cache_ring):
-                if now - entry[2] > self._max_age_seconds:
-                    evict_key, evict_size, _ = entry
-                    del self._cache_ring[i]
-                    self._total_bytes -= evict_size
-                    age_hours = (now - entry[2]) / 3600
-                    await self._delete_entry(evict_key, "ring_evict_expired",
-                                       "(%d bytes, age=%.1fh)" % (evict_size, age_hours))
-                    evicted = True
-                    break
-            if evicted:
-                continue
+        if self._total_bytes <= max_bytes:
+            return
 
-            # Second pass: evict LRU
-            lru_idx = min(range(len(self._cache_ring)),
-                          key=lambda i: self._cache_ring[i][2])
-            evict_key, evict_size, _ = self._cache_ring[lru_idx]
-            del self._cache_ring[lru_idx]
-            self._total_bytes -= evict_size
+        now = time.time()
+
+        # Load blocks for all entries (cache in dict for O(1) LCP lookups)
+        blocks_map: Dict[str, List[str]] = {}
+        valid_ring: deque = deque()
+        for entry in self._cache_ring:
+            key, size, ts = entry
+            blocks = kv_meta.get_blocks(key, self.backend_id)
+            if blocks:
+                blocks_map[key] = blocks
+                valid_ring.append(entry)
+            else:
+                # No meta — orphaned ring entry, evict immediately
+                self._total_bytes -= size
+                log.info(
+                    "Evicting orphaned ring entry '%s' for backend '%s' (%d bytes)",
+                    key[:16], self.backend_id, size,
+                )
+                await self._delete_entry(key, "ring_evict_orphan", "(%d bytes)" % size)
+        self._cache_ring = valid_ring
+
+        if not self._cache_ring or self._total_bytes <= max_bytes:
+            return
+
+        # Score: staleness is primary, redundancy is secondary modifier.
+        # score = stale_seconds * (2 - uniqueness)
+        #   uniqueness = 1.0 -> multiplier 1.0 (evict by age alone)
+        #   uniqueness = 0.0 -> multiplier 2.0 (redundant entries count as "twice as stale")
+        # This ensures unique entries still expire, just at half the priority of redundant ones.
+        scored: List[Tuple[int, float]] = []
+        ring_list = list(self._cache_ring)
+        for i, (key, size, ts) in enumerate(ring_list):
+            stale = now - ts
+            blocks = blocks_map.get(key, [])
+            if not blocks:
+                scored.append((i, stale * 2.0))
+                continue
+            max_lcp_ratio = 0.0
+            for j, (other_key, _, _) in enumerate(ring_list):
+                if i == j:
+                    continue
+                other_blocks = blocks_map.get(other_key, [])
+                if not other_blocks:
+                    continue
+                lcp = hs.lcp_blocks(blocks, other_blocks)
+                ratio = lcp / max(1, len(blocks))
+                if ratio > max_lcp_ratio:
+                    max_lcp_ratio = ratio
+            uniqueness = 1.0 - max_lcp_ratio
+            score = stale * (2.0 - uniqueness)
+            scored.append((i, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Collect keys to evict (indices become stale after deque deletion)
+        keys_to_evict: Set[str] = set()
+        projected = self._total_bytes
+        for idx, score in scored:
+            if projected <= max_bytes:
+                break
+            entry = ring_list[idx]
+            keys_to_evict.add(entry[0])
+            projected -= entry[1]
+
+        # Evict collected entries
+        evicted_any = False
+        remaining = deque()
+        for entry in self._cache_ring:
+            if entry[0] in keys_to_evict:
+                evict_key, evict_size, evict_ts = entry
+                self._total_bytes -= evict_size
+                stale_hours = (now - evict_ts) / 3600
+                score_val = next(s for i, s in scored if ring_list[i][0] == evict_key)
+                log.info(
+                    "Ring buffer eviction: evicted '%s' for backend '%s' "
+                    "(%d bytes, score=%.0f, age=%.1fh, remaining=%d)",
+                    evict_key[:16], self.backend_id, evict_size, score_val, stale_hours, self._total_bytes,
+                )
+                await self._delete_entry(evict_key, "ring_evict_scored",
+                                        "(score=%.0f, age=%.1fh)" % (score_val, stale_hours))
+                evicted_any = True
+            else:
+                remaining.append(entry)
+        self._cache_ring = remaining
+
+        if evicted_any:
             log.info(
-                "Ring buffer eviction: evicted LRU entry '%s' for backend '%s' "
-                "(%d bytes, remaining=%d)",
-                evict_key, self.backend_id, evict_size, self._total_bytes,
+                "Cache ring check for backend '%s': total=%d bytes, max=%d bytes, ring_size=%d",
+                self.backend_id, self._total_bytes, max_bytes, len(self._cache_ring),
             )
-            await self._delete_entry(evict_key, "ring_evict_lru",
-                                "(%d bytes)" % evict_size)
 
     async def _delete_entry(self, key: str, log_msg: str, log_extra: str):
         """Delete cache file and meta."""
@@ -354,7 +412,7 @@ class BackendSlotManager:
         kv_meta.delete_meta_file(key)
 
     async def init_from_disk(self):
-        """Populate ring buffer from existing cache files. Evict expired/over-size."""
+        """Populate ring buffer from existing cache files. Evict over-size."""
         backend_dir = hs.sanitize_backend_dir(self.backend_id)
         if not os.path.isdir(META_DIR):
             return
@@ -373,23 +431,6 @@ class BackendSlotManager:
                 self._total_bytes += cache_size
             except OSError:
                 continue
-
-        # Evict expired entries from front of ring
-        now = time.time()
-        while self._cache_ring:
-            entry = self._cache_ring[0]
-            if now - entry[2] > self._max_age_seconds:
-                evict_key, evict_size, _ = entry
-                self._cache_ring.popleft()
-                self._total_bytes -= evict_size
-                log.info(
-                    "Startup cleanup: evicting expired entry '%s' for backend '%s' (%d bytes)",
-                    evict_key, self.backend_id, evict_size,
-                )
-                await self._delete_entry(evict_key, "startup_evict",
-                                         "(%d bytes)" % evict_size)
-            else:
-                break
 
         await self._evict_if_needed()
 
@@ -421,7 +462,6 @@ class SlotManager:
     def __init__(self):
         self._backends: Dict[str, BackendSlotManager] = {}
         self._cache_wait_pending: Dict[str, int] = {}
-        log.info("Cache entry expiry set to %d hours", CACHE_MAX_AGE_HOURS)
 
     def get(self, backend_id: str) -> BackendSlotManager:
         """Get or create the BackendSlotManager for a backend."""
