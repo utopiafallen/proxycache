@@ -1,6 +1,6 @@
 ---
 name: metrics-query
-description: Querying and parsing proxycache request history from the metrics dashboard. Use when querying metrics endpoints, analyzing request routing, or debugging cache hit/miss behavior.
+description: Querying and parsing proxycache request history from the metrics dashboard. Use when querying metrics, analyzing requests, debugging cache hits or misses, checking routing decisions, examining latency, or investigating recompute behavior.
 ---
 
 # Metrics Query
@@ -80,6 +80,19 @@ The `routing_diagnostics` dict is set during the routing phase and contains the 
 | `cache_file_key` | str or None | Best cache file key (first 16 chars), or None if no match |
 | `cache_file_ratio` | float or None | LCP ratio for best cache file match, or None |
 | `pending_slots` | list[dict] | Pending slot matches: `[{slot, lcp_blocks, slot_blocks, ratio}]` |
+
+**Skip-restore diagnostics** (`routing_diagnostics.skip_restore`):
+
+Populated only when `should_skip_restore` returns `True` (restore was skipped):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `skipped` | bool | Always `True` |
+| `backend` | str | Backend key where skip occurred |
+| `slot_id` | int | Slot that was reused |
+| `old_kv_blocks` | int | Block count in slot's previous KV state |
+| `req_blocks` | int | Block count in the request |
+| `restore_key` | str or None | Disk cache key that was available but not used |
 
 **Liveness events** (`event="liveness_change"`):
 

@@ -124,13 +124,20 @@ async def _acquire_slot_for_request(
     restore_key: Optional[str],
     backend_blocks: Dict[str, List[str]],
     prompt_tokens: int,
-) -> Tuple[Tuple[str, str, int], Optional[bool]]:
+) -> Tuple[Tuple[str, str, int], Optional[bool], Dict, Optional[List[str]]]:
     """Acquire a slot, trying cache backend first then fallbacks.
 
     Orchestrates: slot refresh → cache backend (with poll) → retry loop with fallbacks.
+    Returns (global_slot, restored, skip_restore_diag, old_kv).
     """
     # Refresh slot counts
     await sm.refresh_slot_counts()
+
+    # Diagnostics dict populated by nested functions, included in metrics
+    skip_restore_diag: Dict[str, Any] = {}
+
+    # Previous KV state — restored on backend error so _slot_kv_state stays accurate
+    old_kv: List[str] | None = None
 
     min_ctx = backend_manager.get_model_n_ctx(canonical_name)
 
@@ -173,11 +180,24 @@ async def _acquire_slot_for_request(
                 )
 
         if blocks:
+            log.warning(
+                "[diag] _do_restore_call: slot %d, blocks=%d, prev_blocks=%d, key=%s",
+                slot_id, len(blocks), len(prev_blocks) if prev_blocks else 0,
+                key[:16] if key else None,
+            )
             if be_sm.should_skip_restore(slot_id, blocks, prev_blocks):
                 log.info(
                     "Skipping restore for model '%s' on backend '%s' slot %d: slot cache already matches",
                     canonical_name, be_sm.backend_id, slot_id,
                 )
+                skip_restore_diag = {
+                    "skipped": True,
+                    "backend": be_sm.backend_id,
+                    "slot_id": slot_id,
+                    "old_kv_blocks": len(prev_blocks) if prev_blocks else 0,
+                    "req_blocks": len(blocks) if blocks else 0,
+                    "restore_key": key[:16] if key else None,
+                }
                 restored = False
             elif key:
                 await be_sm.restore(slot_id, key, canonical_name, touch_ring=True)
@@ -203,7 +223,7 @@ async def _acquire_slot_for_request(
 
         return restored
 
-    async def _try_cache_backend() -> Optional[Tuple[Tuple[str, str, int], Optional[bool]]]:
+    async def _try_cache_backend() -> Optional[Tuple[Tuple[str, str, int], Optional[bool], Optional[List[str]]]]:
         """Try to acquire a slot on the cache backend and restore."""
         if not restore_backend or prompt_tokens >= min_ctx:
             return None
@@ -212,20 +232,25 @@ async def _acquire_slot_for_request(
         if slot_id is None:
             return None
         # Save old KV state before updating — skip-restore must check against previous state
+        nonlocal old_kv
         old_kv = be_sm.get_kv_state(slot_id)
+        log.warning(
+            "[diag] _try_cache_backend: slot %d, old_kv blocks=%d, cache_blocks=%d",
+            slot_id, len(old_kv) if old_kv else 0, len(cache_blocks) if cache_blocks else 0,
+        )
         # Set KV state: use request blocks for disk restore, preserve existing for pending hit
         if cache_blocks:
             be_sm.set_kv_state(slot_id, cache_blocks)
         # For pending slot hit (cache_blocks is None), keep existing KV state intact
         restored = await _do_restore_call(be_sm, slot_id, restore_key, cache_blocks, old_kv)
         backend_manager.touch_backend(restore_backend)
-        return (canonical_name, restore_backend, slot_id), restored
+        return (canonical_name, restore_backend, slot_id), restored, skip_restore_diag, old_kv
 
     # Phase 0: try cache backend; if busy, poll up to EMA timeout
     if restore_backend and hit_type and prompt_tokens < min_ctx:
         result = await _try_cache_backend()
         if result:
-            return result
+            return result[0], result[1], skip_restore_diag, result[3]
 
         # No free slot — poll every 5s up to EMA timeout
         pending = sm._cache_wait_pending.get(restore_backend, 0)
@@ -244,7 +269,7 @@ async def _acquire_slot_for_request(
                     elapsed += 5.0
                     result = await _try_cache_backend()
                     if result:
-                        return result
+                        return result[0], result[1], skip_restore_diag, result[3]
             finally:
                 sm._cache_wait_pending[restore_backend] -= 1
 
@@ -255,7 +280,7 @@ async def _acquire_slot_for_request(
         if restore_backend and hit_type and prompt_tokens < min_ctx:
             result = await _try_cache_backend()
             if result:
-                return result
+                return result[0], result[1], skip_restore_diag, result[3]
 
         # Phase 2: fallback backends
         for be_id, model_name in candidate_backends:
@@ -270,14 +295,18 @@ async def _acquire_slot_for_request(
                 continue
             # Cache miss: track blocks for this backend
             fb_blocks = backend_blocks.get(be_id)
-            old_fb_kv = be_sm.get_kv_state(slot_id)
+            old_kv = be_sm.get_kv_state(slot_id)
             if fb_blocks:
                 be_sm.set_kv_state(slot_id, fb_blocks)
             else:
                 be_sm.set_kv_state(slot_id, [])
-            restored = await _do_restore_call(be_sm, slot_id, None, fb_blocks, old_fb_kv)
+            log.warning(
+                "[diag] fallback: slot %d, old_kv=%d, fb_blocks=%d",
+                slot_id, len(old_kv) if old_kv else 0, len(fb_blocks) if fb_blocks else 0,
+            )
+            restored = await _do_restore_call(be_sm, slot_id, None, fb_blocks, old_kv)
             backend_manager.touch_backend(be_id)
-            return (model_name, be_id, slot_id), restored
+            return (model_name, be_id, slot_id), restored, skip_restore_diag, old_kv
 
         if attempt < RETRY_COUNT - 1:
             backoff = (attempt + 1) * 5
@@ -856,7 +885,7 @@ async def chat(req: Request):
         )
 
         # 6. Acquire slot (cache backend first, then fallbacks)
-        g, restored = await asyncio.wait_for(
+        g, restored, skip_restore_diag, prev_kv = await asyncio.wait_for(
             _acquire_slot_for_request(
                 sm, candidate_backends, restore_backend, canonical_name,
                 hit_type, restore_key, backend_blocks, prompt_tokens,
@@ -916,6 +945,7 @@ async def chat(req: Request):
                 "restore_info_backend": restore_backend,
                 "candidate_backends": [cb[0] for cb in candidate_backends],
                 "scan": scan_diagnostics,
+                "skip_restore": skip_restore_diag,
             },
         })
     except Exception as e:
@@ -949,6 +979,13 @@ async def chat(req: Request):
             if resp.status_code != 200:
                 err_txt = await resp.aread()
                 await resp.aclose()
+                # Backend errored before processing — restore slot KV state to previous state
+                if prev_kv is not None:
+                    be_sm.set_kv_state(slot_id, prev_kv)
+                    log.info(
+                        "Backend %d error — restored slot %d KV state for model '%s' on backend '%s'",
+                        resp.status_code, slot_id, model_name, be_id,
+                    )
                 metrics.record({
                     "request_id": request_id,
                     "model": model_name,
@@ -986,6 +1023,13 @@ async def chat(req: Request):
                 body, slot_id=slot_id, stream=False,
             )
             if not isinstance(out, dict):
+                # Backend errored before processing — restore slot KV state to previous state
+                if prev_kv is not None:
+                    be_sm.set_kv_state(slot_id, prev_kv)
+                    log.info(
+                        "Backend non-JSON response — restored slot %d KV state for model '%s' on backend '%s'",
+                        slot_id, model_name, be_id,
+                    )
                 metrics.record({
                     "request_id": request_id,
                     "model": model_name,
@@ -1074,6 +1118,7 @@ async def chat(req: Request):
     except httpx.TimeoutException as e:
         log.exception("Chat timeout for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)
+        # Timeout — request may have been partially processed, don't restore KV state
         metrics.record({
             "request_id": request_id,
             "model": model_name,
@@ -1087,7 +1132,13 @@ async def chat(req: Request):
     except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
         log.exception("Backend connection error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                       client_ip, model_name, be_id, slot_id, key[:16], e)
-        be_sm.invalidate(slot_id)
+        # Connection error — request never reached backend, restore previous KV state
+        if prev_kv is not None:
+            be_sm.set_kv_state(slot_id, prev_kv)
+            log.info(
+                "Backend connection error — restored slot %d KV state for model '%s' on backend '%s'",
+                slot_id, model_name, be_id,
+            )
         be_sm.release(slot_id)
         _slot_released = True
         metrics.record({
@@ -1103,6 +1154,13 @@ async def chat(req: Request):
     except Exception as e:
         log.exception("Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %s",
                        client_ip, model_name, be_id, slot_id, key[:16], e)
+        # Generic error — request may or may not have reached backend, restore to be safe
+        if prev_kv is not None:
+            be_sm.set_kv_state(slot_id, prev_kv)
+            log.info(
+                "Generic error — restored slot %d KV state for model '%s' on backend '%s'",
+                slot_id, model_name, be_id,
+            )
         metrics.record({
             "request_id": request_id,
             "model": model_name,

@@ -1,6 +1,6 @@
 ---
 name: metrics-architecture
-description: Metrics collector with multi-phase request recording, routing reasons, and dashboard integration. Use when modifying metrics.py, app.py metrics recording, or dashboard.html metrics display.
+description: Metrics collector with multi-phase request recording, routing diagnostics, skip-restore tracking, ring buffer, liveness events, and dashboard. Use when working with request metrics, routing diagnostics, performance data, cache hit analysis, dashboard, or any proxycache observability.
 ---
 
 # Metrics Architecture
@@ -50,6 +50,14 @@ Captured during the routing phase (phase 2) and stored as `routing_diagnostics` 
     "restore_backend": "backend.lan-1234" or None,
     "restore_info_backend": "backend.lan-1234" or None,
     "candidate_backends": ["other.lan-1234"],
+    "skip_restore": {
+        "skipped": True,
+        "backend": "backend.lan-1234",
+        "slot_id": 0,
+        "old_kv_blocks": 512,
+        "req_blocks": 515,
+        "restore_key": "abc123..."
+    } or {},
     "scan": [
         {
             "model": "unsloth/...",
@@ -70,6 +78,7 @@ Captured during the routing phase (phase 2) and stored as `routing_diagnostics` 
 - `restore_key` is None when a pending slot hit won (no disk restore needed)
 - `restore_info_backend` is None when `restore_key` is None (no priority routing)
 - `candidate_backends` excludes the restore backend ONLY when `restore_key` is set (pending slot hits don't exclude)
+- `skip_restore` is populated (non-empty dict) when skip-restore fires, with `skipped=True`, block counts, and restore key. Empty dict `{}` means skip-restore did not fire.
 - `scan` entries with `status="unreachable"` mean the backend was down during the cache scan
 - `pending_slots` lists all matching slots per backend with their LCP details
 

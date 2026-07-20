@@ -624,17 +624,17 @@ def test_should_skip_restore_shorter_kv_cache():
 
     sm = SlotManager()
     sm.get("10.0.0.1:8000").ensure_pool("ModelA", 1)
-    kv_blocks = ["a", "b", "c"]
+    kv_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
     sm.get("10.0.0.1:8000")._slot_kv_state[0] = kv_blocks
 
-    # KV cache has 3 blocks, request has 10. LCP = 3. ratio = 3/3 = 1.0
+    # KV cache has 9 blocks, request has 10. LCP = 9. ratio = 9/9 = 1.0. Diff = 1/10 = 0.1 (within threshold).
     req_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
     assert sm.get("10.0.0.1:8000").should_skip_restore(0, req_blocks) is True
     print("PASS: test_should_skip_restore_shorter_kv_cache")
 
 
 def test_should_skip_restore_longer_kv_cache():
-    """_should_skip_restore should handle longer KV cache than request with single slot."""
+    """_should_skip_restore should reject longer KV cache than request (stale state)."""
     from slot_manager import SlotManager
 
     sm = SlotManager()
@@ -642,9 +642,9 @@ def test_should_skip_restore_longer_kv_cache():
     kv_blocks = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
     sm.get("10.0.0.1:8000")._slot_kv_state[0] = kv_blocks
 
-    # Request has 3 blocks, KV cache has 10. LCP = 3. ratio = 3/3 = 1.0
+    # Request has 3 blocks, KV cache has 10 — slot has stale leftover state, cannot skip.
     req_blocks = ["a", "b", "c"]
-    assert sm.get("10.0.0.1:8000").should_skip_restore(0, req_blocks) is True
+    assert sm.get("10.0.0.1:8000").should_skip_restore(0, req_blocks) is False
     print("PASS: test_should_skip_restore_longer_kv_cache")
 
 
@@ -2080,6 +2080,7 @@ def test_chat_any_model_routing():
 
 def test_chat_any_with_cache_hit():
     """Client requests 'any', multiple canonical models have cache hits. Selects best cache hit."""
+    import hashing as hs
     from kv_meta_manager import KVMetaManager
     mgr = KVMetaManager()
     from hashing import meta_key
@@ -2093,7 +2094,13 @@ def test_chat_any_with_cache_hit():
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
         old_meta_dir = config.META_DIR
+        old_app_wpb = app_mod.WORDS_PER_BLOCK
+        old_hs_wpb = hs.WORDS_PER_BLOCK
         config.META_DIR = tmpdir
+        # Use small WPB so we get multiple blocks for ratio comparison
+        test_wpb = 3
+        app_mod.WORDS_PER_BLOCK = test_wpb
+        hs.WORDS_PER_BLOCK = test_wpb
 
         try:
             backend_manager._backends.clear()
@@ -2109,16 +2116,19 @@ def test_chat_any_with_cache_hit():
                 total_slots=1, last_discovered=0.0,
             )
 
-            # Create meta files: model-a has ratio 0.95, model-b has ratio 0.70
+            # Use real block hashes so LCP matching works
             token_ids = [123, 456, 789, 101, 102, 103, 104, 105, 106, 107]
-            blocks_a = ["blk1", "blk2", "blk3", "blk4", "blk5"]
-            blocks_b = ["blk1", "blk2", "x", "x", "x"]
+            req_blocks = hs.block_hashes_from_tokens(token_ids, test_wpb)
+            # model-a: all blocks match (ratio 1.0)
+            blocks_a = list(req_blocks)
+            # model-b: only first 2 blocks match (ratio 2/4 = 0.5)
+            blocks_b = list(req_blocks[:2]) + ["unique_b_1", "unique_b_2"]
 
             key_a = meta_key("model-a", token_ids)
             key_b = meta_key("model-b", token_ids)
 
-            mgr.write_meta(key_a, 10, blocks_a, 100, "model-a", "10.0.0.1:8000")
-            mgr.write_meta(key_b, 10, blocks_b, 100, "model-b", "10.0.0.1:9000")
+            mgr.write_meta(key_a, len(token_ids), blocks_a, test_wpb, "model-a", "10.0.0.1:8000")
+            mgr.write_meta(key_b, len(token_ids), blocks_b, test_wpb, "model-b", "10.0.0.1:9000")
 
             mock_client_a = AsyncMock(spec=LlamaClient)
             mock_client_a.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
@@ -2128,8 +2138,8 @@ def test_chat_any_with_cache_hit():
             mock_client_a.save_slot = AsyncMock(return_value=(True, 1024))
             mock_client_b = AsyncMock(spec=LlamaClient)
             mock_client_b.tokenize = AsyncMock(return_value=token_ids)
-            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client_a, 'agent_client': None, 'cache_dir': None, 'cache_dir': None})()
-            backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': mock_client_b, 'agent_client': None, 'cache_dir': None, 'cache_dir': None})()
+            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client_a, 'agent_client': None, 'cache_dir': None})()
+            backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': mock_client_b, 'agent_client': None, 'cache_dir': None})()
 
             # Set up app state (normally done in startup event)
             from slot_manager import SlotManager
@@ -2152,6 +2162,8 @@ def test_chat_any_with_cache_hit():
             assert body["model"] == "model-a", f"Expected model-a (best cache), got {body['model']}"
         finally:
             config.META_DIR = old_meta_dir
+            app_mod.WORDS_PER_BLOCK = old_app_wpb
+            hs.WORDS_PER_BLOCK = old_hs_wpb
 
     print("PASS: test_chat_any_with_cache_hit")
 

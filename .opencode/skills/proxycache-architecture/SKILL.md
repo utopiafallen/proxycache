@@ -1,6 +1,6 @@
 ---
 name: proxycache-architecture
-description: Proxycache KV cache slot management, cache hit scanning, and pending cache optimization. Use when modifying slot_manager.py, app.py cache hit logic, or kv_meta_manager.py.
+description: Proxycache KV cache slot management, cache hit scanning, slot acquisition, restore/save logic, skip-restore, pending slot hits, and backend error handling. Use when working with slots, cache hits, KV cache state, restore, save, routing, or any proxycache request flow.
 ---
 
 # Proxycache Architecture
@@ -21,11 +21,12 @@ This means the cache key is **known at slot acquisition time**, before the respo
 
 ## Slot KV State Tracking (`_slot_kv_state`)
 
-`SlotManager._slot_kv_state: Dict[GSlot, List[str]]` tracks KV cache block hashes per slot.
+`BackendSlotManager._slot_kv_state: Dict[int, List[str]]` tracks KV cache block hashes per slot (keyed by `slot_id`, per-backend).
 
 - Set at slot acquisition time, making the slot's KV state visible to subsequent requests' cache hit scans while the slot is in-flight
 - Updated after a successful restore or save to reflect the slot's current state
-- Cleared by `invalidate_slot()` on cancellation/failure in `StreamReader._cleanup()` before `release()`
+- On backend error (400+), restored to `prev_kv` (the state captured before acquisition's `set_kv_state()`) since the request was never processed
+- Cleared by `invalidate()` on cancellation/failure in `StreamReader._cleanup()` before `release()`
 
 ## Cache Hit Scan Flow (in `app.py` chat handler)
 
@@ -55,10 +56,11 @@ The cache hit scan lives in the chat handler in `app.py`, between model resoluti
 - Sleeps 5s between attempts (up to 11 attempts)
 - Picks first available slot
 
-**After `_try_acquire()` succeeds (all phases):**
-- `_slot_kv_state[g]` is set to the request's blocks (before any restore decision)
-- The slot's previous KV state is captured and passed to `_restore_and_return()`
-- `_should_skip_restore()` uses the captured previous state to decide whether to skip the restore
+**After slot acquisition succeeds (all phases):**
+- `_slot_kv_state[slot_id]` is set to the request's blocks (before any restore decision)
+- The slot's previous KV state (`old_kv`) is captured before `set_kv_state()` and returned as 4th element
+- `_do_restore_call()` checks skip-restore using the captured previous state
+- On backend error, `old_kv` is used to restore `_slot_kv_state` so tracking stays accurate
 
 ## `_should_skip_restore` Constraints
 
@@ -88,11 +90,15 @@ When a request completes and starts saving, subsequent requests that arrive duri
 
 - **Tokenization is backend-specific**: Each backend applies its own chat template and tokenizer. Different backends may produce different token IDs for the same messages.
 - **Cache key = prompt tokens only**: The key is computed from `opt_token_ids` (prompt), not the full request+response. This is known at acquisition time.
-- **`_slot_kv_state` is keyed by `(model, backend, slot_id)`**: Use the full GSlot tuple, not just the backend.
+- **`_slot_kv_state` is keyed by `slot_id`** (per `BackendSlotManager` instance, not globally). Access via `sm.get(backend_id)._slot_kv_state[slot_id]`.
 - **`invalidate_slot()` clears `_slot_kv_state`**: Called on cancellation/failure in `app.py:_cleanup()` before `release()`.
 - **Ring buffer eviction is per-backend**: Uses `CACHE_MAX_SIZE_GB` per backend (default 25 GB). Evicts age-first, then LRU.
 - **Pending slot scan uses per-backend blocks**: The scan runs inside the per-backend loop in `app.py`, so `blocks` always matches the current backend's tokenizer output.
 - **Pending slot hit clears `restore_key`**: The cache hit scan iterates backends in a loop — a disk hit on backend A sets `restore_key`, then a pending slot hit on backend B must clear it. Leaving the stale key causes a failed restore attempt against a cache file that doesn't exist on backend B.
+- **Backend error KV state restore**: When the backend errors (400+ status, connection error, non-JSON body) before processing the request, the slot's actual KV cache is untouched. `_acquire_slot_for_request` captures `old_kv = be_sm.get_kv_state(slot_id)` before `set_kv_state()`, returns it as 4th element. Error handlers in `chat()` restore `prev_kv` via `be_sm.set_kv_state(slot_id, prev_kv)`. Timeout errors (504) do NOT restore — the request may have been partially processed.
+- **`_NO_PREV` sentinel in `should_skip_restore`**: `prev_blocks` parameter defaults to sentinel `_NO_PREV` (not `None`) to distinguish "not passed" (fallback to `_slot_kv_state` for backward compat with tests) from "explicitly `None`" (fresh slot, always return False — can't skip restore on a slot with no tracked state).
+- **Backend key sanitization**: Filesystem paths use `sanitize_backend_dir()` (colons → dashes, e.g. `10.0.0.1:8000` → `10.0.0.1-8000`). But in-memory `_backends` dict keys, `DiscoveredModel.backends`, and all app-level code use raw colon keys. Tests that manually construct `BackendManager` must use raw colon keys for `_backends` dict.
+- **Module-level config imports**: `app.py`, `hashing.py`, `slot_manager.py` all import config values (like `WORDS_PER_BLOCK`, `LCP_TH`) at module load time. Changing `config.WORDS_PER_BLOCK` in tests doesn't affect already-imported copies — must patch the importing module directly (e.g. `app_mod.WORDS_PER_BLOCK = 3`).
 
 ## Key Functions
 
@@ -103,10 +109,11 @@ When a request completes and starts saving, subsequent requests that arrive duri
 | `lcp_blocks()` | `hashing.py` | Compute longest common prefix between two block lists |
 | `find_best_restore_candidate()` | `kv_meta_manager.py` | Scan disk meta files for best cache hit |
 | `scan_all_meta()` | `kv_meta_manager.py` | Load all meta files from disk for a backend |
-| `acquire_for_request()` | `slot_manager.py` | Slot acquisition with Phase 0/1/2 logic, sets `_slot_kv_state` at acquisition |
-| `_should_skip_restore()` | `slot_manager.py` | Skip restore if LCP ratio >= threshold and single-slot backend |
-| `_restore_and_return()` | `slot_manager.py` | Restore KV cache, update `_slot_kv_state` on success |
-| `invalidate_slot()` | `slot_manager.py` | Clear `_slot_kv_state` for a slot |
+| `_acquire_slot_for_request()` | `app.py` | Slot acquisition with Phase 0/1/2 logic, captures `old_kv`, sets `_slot_kv_state`, returns `(gslot, restored, skip_restore_diag, prev_kv)` |
+| `_do_restore_call()` | `app.py` (nested) | Execute restore: flush skipped save, skip-restore check, disk restore, update `_slot_kv_state` |
+| `should_skip_restore()` | `slot_manager.py` | Skip restore if LCP ratio >= threshold, single-slot backend, and valid prev state |
+| `invalidate()` | `slot_manager.py` | Clear `_slot_kv_state` for a slot |
+| `get_kv_state()` / `set_kv_state()` | `slot_manager.py` | Get/set slot KV block tracking |
 | `save_after()` | `slot_manager.py` | Save KV cache to disk, write meta file, update ring buffer, update `_slot_kv_state` |
 | `StreamReader._save()` | `app.py` | Detect recompute, call `save_after()`, return ok/cache_size |
-| `StreamReader._cleanup()` | `app.py` | Stream lifecycle: save, invalidate_slot, release slot, record metrics |
+| `StreamReader._cleanup()` | `app.py` | Stream lifecycle: save, invalidate, release slot, record metrics |

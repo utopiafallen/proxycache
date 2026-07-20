@@ -37,6 +37,9 @@ log = logging.getLogger(__name__)
 # (canonical_model_name, backend_id, slot_id)
 GSlot = Tuple[str, str, int]
 
+# Sentinel for should_skip_restore: distinguishes "not passed" from "passed as None"
+_NO_PREV = object()
+
 
 class BackendSlotManager:
     """Manages slot state for a single backend.
@@ -162,7 +165,7 @@ class BackendSlotManager:
         return self._slot_duration_ema if self._slot_duration_ema > 0 else CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT
 
     def should_skip_restore(self, slot_id: int, req_blocks: List[str],
-                             prev_blocks: Optional[List[str]] = None) -> bool:
+                              prev_blocks: Optional[List[str]] = _NO_PREV) -> bool:
         """Check if the slot's current KV cache already matches the request.
 
         Only applies for single-slot backends. Three conditions must all pass:
@@ -173,9 +176,23 @@ class BackendSlotManager:
         prev_blocks: if provided, use this as the slot's previous KV state instead of
         reading from _slot_kv_state. This is needed when _slot_kv_state was already
         updated to the request's own blocks before the skip-restore check runs.
+        Pass None explicitly for a fresh slot with no prior state (always returns False).
         """
-        if prev_blocks is None:
+        if prev_blocks is _NO_PREV:
+            # Not explicitly passed — fallback to _slot_kv_state (tests, legacy callers)
             prev_blocks = self._slot_kv_state.get(slot_id)
+            log.warning(
+                "[diag] should_skip_restore: slot %d, prev_blocks not passed, fell back to _slot_kv_state: %d blocks",
+                slot_id, len(prev_blocks) if prev_blocks else 0,
+            )
+        elif prev_blocks is None:
+            # Explicitly passed None — fresh slot, no prior state to skip against
+            log.warning(
+                "[diag] should_skip_restore: slot %d, prev_blocks explicitly None (fresh slot), not skipping",
+                slot_id,
+            )
+            return False
+
         if not prev_blocks:
             return False
 
