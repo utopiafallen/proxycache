@@ -212,9 +212,6 @@ async def _acquire_slot_for_request(
                 restored = False
             elif key:
                 await be_sm.restore(slot_id, key, canonical_name, touch_ring=True)
-                r_blocks = kv_meta.get_blocks(key, be_sm.backend_id)
-                if r_blocks is not None:
-                    be_sm.set_kv_state(slot_id, r_blocks)
                 restored = True
             else:
                 # No restore key — cache miss on this backend, no dynamic search needed
