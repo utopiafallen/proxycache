@@ -405,6 +405,10 @@ class BackendManager:
                         "old_state": old_state,
                         "new_state": is_up,
                     })
+                    # Recreate client on state change — down transition likely
+                    # poisoned the connection pool (httpcore ReadError bug),
+                    # up transition needs fresh pool for discovery
+                    client._recreate_client()
             # Also trigger if an up backend has no models in the registry
             # (discovery previously failed or never ran for that backend)
             up_keys = {k for k, v in self._backend_state.items() if v}
@@ -421,12 +425,6 @@ class BackendManager:
                         "new_state": "up",
                     })
             if changed:
-                # Recreate httpx clients for backends that just came back up
-                # so discover_models() uses a fresh connection pool
-                for sc in state_changes:
-                    if sc["new_state"] is True:
-                        self.get_client(sc["backend"])._recreate_client()
-
                 try:
                     await self.discover_models()
                 except Exception as e:
