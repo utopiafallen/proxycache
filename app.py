@@ -56,7 +56,6 @@ ACQUIRE_TIMEOUT = 60.0
 STREAM_QUEUE_SIZE = 16
 STREAM_QUEUE_TIMEOUT = 5.0
 RECOMPUTE_THRESHOLD_RATIO = 0.7
-CONTEXT_RESERVE_RATIO = 0.05
 
 def _is_recompute(cached_tokens: int, llm_prompt_tokens: int, cache_n_tokens: int) -> bool:
     """Determine if the KV cache restore was partial/useless.
@@ -237,7 +236,7 @@ async def _acquire_slot_for_request(
 
     async def _try_cache_backend() -> Optional[Tuple[Tuple[str, str, int], Optional[bool], Optional[List[str]]]]:
         """Try to acquire a slot on the cache backend and restore."""
-        if not restore_backend or prompt_tokens >= backend_manager.get_backend_n_ctx(canonical_name, restore_backend) * (1 - CONTEXT_RESERVE_RATIO):
+        if not restore_backend or prompt_tokens >= backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
             return None
         be_sm = sm.get(restore_backend)
         slot_id = be_sm.try_acquire(canonical_name)
@@ -259,7 +258,7 @@ async def _acquire_slot_for_request(
         return (canonical_name, restore_backend, slot_id), restored, skip_restore_diag, old_kv
 
     # Phase 0: try cache backend; if busy, poll up to EMA timeout
-    if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend) * (1 - CONTEXT_RESERVE_RATIO):
+    if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
         result = await _try_cache_backend()
         if result:
             return result[0], result[1], skip_restore_diag, result[3]
@@ -289,7 +288,7 @@ async def _acquire_slot_for_request(
     RETRY_COUNT = 11
     for attempt in range(RETRY_COUNT):
         # Phase 1: cache backend
-        if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend) * (1 - CONTEXT_RESERVE_RATIO):
+        if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
             result = await _try_cache_backend()
             if result:
                 return result[0], result[1], skip_restore_diag, result[3]
@@ -299,7 +298,7 @@ async def _acquire_slot_for_request(
             if not model_name:
                 continue
             be_min_ctx = backend_manager.get_backend_n_ctx(model_name, be_id)
-            if prompt_tokens >= be_min_ctx * (1 - CONTEXT_RESERVE_RATIO):
+            if prompt_tokens >= be_min_ctx:
                 continue
             be_sm = sm.get(be_id)
             slot_id = be_sm.try_acquire(model_name)
@@ -670,7 +669,12 @@ class StreamReader:
     async def _reader(self):
         try:
             await self._read_loop()
-            self.queue.put_nowait(None)
+            try:
+                self.queue.put_nowait(None)
+            except asyncio.QueueFull:
+                log.info("Stream queue still full, closing backend for model '%s' on backend '%s' slot %d (key %s)",
+                         self.model_name, self.backend_id, self.slot_id, self.key_short)
+                await self.resp.aclose()
         except asyncio.CancelledError:
             log.warning("Stream reader cancelled for model '%s' on backend '%s' slot %d (key %s)",
                         self.model_name, self.backend_id, self.slot_id, self.key_short)
@@ -692,9 +696,10 @@ class StreamReader:
                         disconnected = await self.req.is_disconnected()
                     except Exception:
                         disconnected = False
-                    if disconnected:
-                        log.warning("Client disconnected during stream for model '%s' on backend '%s' slot %d (key %s)",
-                                    self.model_name, self.backend_id, self.slot_id, self.key_short)
+                    if disconnected or self._task.done():
+                        log.warning("Stream terminated for model '%s' on backend '%s' slot %d (key %s): disconnected=%s, reader_done=%s",
+                                    self.model_name, self.backend_id, self.slot_id, self.key_short,
+                                    disconnected, self._task.done())
                         self._signal_done()
                         self._task.cancel()
                         break
@@ -792,7 +797,7 @@ async def chat(req: Request):
             return JSONResponse({"error": "backend unreachable"}, status_code=503)
         prompt_tokens = len(first_token_ids)
         min_ctx = min(opt.n_ctx for opt in options)
-        if prompt_tokens >= min_ctx * (1 - CONTEXT_RESERVE_RATIO):
+        if prompt_tokens >= min_ctx:
             metrics.record({
                 "request_id": request_id,
                 "model": client_model,
