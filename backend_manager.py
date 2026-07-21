@@ -390,13 +390,22 @@ class BackendManager:
             state_changes: List[Dict[str, Any]] = []
             for backend_key in self.keys():
                 client = self.get_client(backend_key)
+                old_state = self._backend_state.get(backend_key, False)
                 is_up = False
                 try:
                     await client.client.get("/health", timeout=2.0)
                     is_up = True
                 except Exception:
-                    pass
-                old_state = self._backend_state.get(backend_key, False)
+                    # Backend marked down — pool may be poisoned from a prior
+                    # ReadError. Recreate client and retry once to detect recovery
+                    # without waiting for an external state transition.
+                    if not old_state:
+                        client._recreate_client()
+                        try:
+                            await client.client.get("/health", timeout=2.0)
+                            is_up = True
+                        except Exception:
+                            pass
                 if is_up != old_state:
                     self._backend_state[backend_key] = is_up
                     changed = True
@@ -405,6 +414,10 @@ class BackendManager:
                         "old_state": old_state,
                         "new_state": is_up,
                     })
+                    # Recreate client on state change — down transition likely
+                    # poisoned the connection pool (httpcore ReadError bug),
+                    # up transition needs fresh pool for discovery
+                    client._recreate_client()
             # Also trigger if an up backend has no models in the registry
             # (discovery previously failed or never ran for that backend)
             up_keys = {k for k, v in self._backend_state.items() if v}
@@ -421,12 +434,6 @@ class BackendManager:
                         "new_state": "up",
                     })
             if changed:
-                # Recreate httpx clients for backends that just came back up
-                # so discover_models() uses a fresh connection pool
-                for sc in state_changes:
-                    if sc["new_state"] is True:
-                        self.get_client(sc["backend"])._recreate_client()
-
                 try:
                     await self.discover_models()
                 except Exception as e:
