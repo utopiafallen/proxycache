@@ -56,6 +56,7 @@ ACQUIRE_TIMEOUT = 60.0
 STREAM_QUEUE_SIZE = 16
 STREAM_QUEUE_TIMEOUT = 5.0
 RECOMPUTE_THRESHOLD_RATIO = 0.7
+CONTEXT_RESERVE_RATIO = 0.05
 
 def _is_recompute(cached_tokens: int, llm_prompt_tokens: int, cache_n_tokens: int) -> bool:
     """Determine if the KV cache restore was partial/useless.
@@ -236,7 +237,7 @@ async def _acquire_slot_for_request(
 
     async def _try_cache_backend() -> Optional[Tuple[Tuple[str, str, int], Optional[bool], Optional[List[str]]]]:
         """Try to acquire a slot on the cache backend and restore."""
-        if not restore_backend or prompt_tokens >= backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
+        if not restore_backend or prompt_tokens >= backend_manager.get_backend_n_ctx(canonical_name, restore_backend) * (1 - CONTEXT_RESERVE_RATIO):
             return None
         be_sm = sm.get(restore_backend)
         slot_id = be_sm.try_acquire(canonical_name)
@@ -258,7 +259,7 @@ async def _acquire_slot_for_request(
         return (canonical_name, restore_backend, slot_id), restored, skip_restore_diag, old_kv
 
     # Phase 0: try cache backend; if busy, poll up to EMA timeout
-    if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
+    if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend) * (1 - CONTEXT_RESERVE_RATIO):
         result = await _try_cache_backend()
         if result:
             return result[0], result[1], skip_restore_diag, result[3]
@@ -288,7 +289,7 @@ async def _acquire_slot_for_request(
     RETRY_COUNT = 11
     for attempt in range(RETRY_COUNT):
         # Phase 1: cache backend
-        if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
+        if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend) * (1 - CONTEXT_RESERVE_RATIO):
             result = await _try_cache_backend()
             if result:
                 return result[0], result[1], skip_restore_diag, result[3]
@@ -298,7 +299,7 @@ async def _acquire_slot_for_request(
             if not model_name:
                 continue
             be_min_ctx = backend_manager.get_backend_n_ctx(model_name, be_id)
-            if prompt_tokens >= be_min_ctx:
+            if prompt_tokens >= be_min_ctx * (1 - CONTEXT_RESERVE_RATIO):
                 continue
             be_sm = sm.get(be_id)
             slot_id = be_sm.try_acquire(model_name)
@@ -791,7 +792,7 @@ async def chat(req: Request):
             return JSONResponse({"error": "backend unreachable"}, status_code=503)
         prompt_tokens = len(first_token_ids)
         min_ctx = min(opt.n_ctx for opt in options)
-        if prompt_tokens >= min_ctx:
+        if prompt_tokens >= min_ctx * (1 - CONTEXT_RESERVE_RATIO):
             metrics.record({
                 "request_id": request_id,
                 "model": client_model,
