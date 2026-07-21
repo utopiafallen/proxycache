@@ -861,7 +861,7 @@ async def chat(req: Request):
                     ratio = lcp / len(opt_blocks)
                     pending_ratios.append({"slot": slot_id, "lcp_blocks": lcp,
                                           "slot_blocks": len(kv_blocks), "ratio": round(ratio, 4)})
-                    if ratio >= LCP_TH and ratio > best_ratio:
+                    if ratio >= LCP_TH and ratio >= best_ratio:
                         best_ratio = ratio
                         restore_key = None
                         restore_backend = be_id
