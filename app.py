@@ -55,7 +55,20 @@ from kv_meta_manager import kv_meta
 ACQUIRE_TIMEOUT = 60.0
 STREAM_QUEUE_SIZE = 16
 STREAM_QUEUE_TIMEOUT = 5.0
-RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS = 0.92
+RECOMPUTE_THRESHOLD_RATIO = 0.7
+
+def _is_recompute(cached_tokens: int, llm_prompt_tokens: int, cache_n_tokens: int) -> bool:
+    """Determine if the KV cache restore was partial/useless.
+
+    Compares cached_tokens against min(cache_n_tokens, llm_prompt_tokens) so that
+    a perfect prefix match on a shorter cache entry is not penalized.
+    """
+    if llm_prompt_tokens == 0:
+        return False
+    expected = min(cache_n_tokens, llm_prompt_tokens)
+    if expected == 0:
+        return False
+    return cached_tokens < expected * RECOMPUTE_THRESHOLD_RATIO
 
 
 class CacheHitType(str, Enum):
@@ -138,8 +151,6 @@ async def _acquire_slot_for_request(
 
     # Previous KV state — restored on backend error so _slot_kv_state stays accurate
     old_kv: List[str] | None = None
-
-    min_ctx = backend_manager.get_model_n_ctx(canonical_name)
 
     # Precompute: blocks to pass to cache backend based on hit type
     # DISK_RESTORE: blocks needed for skip-restore check + disk restore
@@ -225,7 +236,7 @@ async def _acquire_slot_for_request(
 
     async def _try_cache_backend() -> Optional[Tuple[Tuple[str, str, int], Optional[bool], Optional[List[str]]]]:
         """Try to acquire a slot on the cache backend and restore."""
-        if not restore_backend or prompt_tokens >= min_ctx:
+        if not restore_backend or prompt_tokens >= backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
             return None
         be_sm = sm.get(restore_backend)
         slot_id = be_sm.try_acquire(canonical_name)
@@ -247,7 +258,7 @@ async def _acquire_slot_for_request(
         return (canonical_name, restore_backend, slot_id), restored, skip_restore_diag, old_kv
 
     # Phase 0: try cache backend; if busy, poll up to EMA timeout
-    if restore_backend and hit_type and prompt_tokens < min_ctx:
+    if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
         result = await _try_cache_backend()
         if result:
             return result[0], result[1], skip_restore_diag, result[3]
@@ -277,7 +288,7 @@ async def _acquire_slot_for_request(
     RETRY_COUNT = 11
     for attempt in range(RETRY_COUNT):
         # Phase 1: cache backend
-        if restore_backend and hit_type and prompt_tokens < min_ctx:
+        if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
             result = await _try_cache_backend()
             if result:
                 return result[0], result[1], skip_restore_diag, result[3]
@@ -286,7 +297,7 @@ async def _acquire_slot_for_request(
         for be_id, model_name in candidate_backends:
             if not model_name:
                 continue
-            be_min_ctx = backend_manager.get_model_n_ctx(model_name)
+            be_min_ctx = backend_manager.get_backend_n_ctx(model_name, be_id)
             if prompt_tokens >= be_min_ctx:
                 continue
             be_sm = sm.get(be_id)
@@ -530,14 +541,16 @@ class StreamReader:
                 self.model_name, self.slot_id, cached_tokens, self.n_tokens, llm_prompt_tokens,
                 self.best_ratio,
             )
-            if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
+            cache_meta = kv_meta.read_meta(self.restore_key, self.restore_backend) if self.restore_key else None
+            cache_n_tokens = cache_meta.get("n_tokens", llm_prompt_tokens) if cache_meta else llm_prompt_tokens
+            if _is_recompute(cached_tokens, llm_prompt_tokens, cache_n_tokens):
                 recompute_happened = True
                 log.warning(
                     "Recompute detected for model '%s' on backend '%s' slot %d (key %s): "
-                    "cached_tokens=%d llm_prompt_tokens=%d, "
+                    "cached_tokens=%d llm_prompt_tokens=%d cache_n_tokens=%d, "
                     "KV cache restore was partial/useless",
                     self.model_name, self.backend_id, self.slot_id, self.key_short,
-                    cached_tokens, llm_prompt_tokens,
+                    cached_tokens, llm_prompt_tokens, cache_n_tokens,
                 )
                 if self.restore_key:
                     kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
@@ -614,7 +627,9 @@ class StreamReader:
             if self._hit_type:
                 cached_tokens = self._sse_cached_tokens
                 llm_prompt_tokens = self._sse_prompt_tokens or self.n_tokens
-                if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
+                cache_meta = kv_meta.read_meta(self.restore_key, self.restore_backend) if self.restore_key else None
+                cache_n_tokens = cache_meta.get("n_tokens", llm_prompt_tokens) if cache_meta else llm_prompt_tokens
+                if _is_recompute(cached_tokens, llm_prompt_tokens, cache_n_tokens):
                     recompute_happened = True
 
             prompt_preview = extract_prompt_preview(self._request_json)
@@ -1058,14 +1073,16 @@ async def chat(req: Request):
                     model_name, slot_id, cached_tokens, prompt_tokens, llm_prompt_tokens,
                     best_ratio,
                 )
-                if cached_tokens < llm_prompt_tokens * RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS:
+                cache_meta = kv_meta.read_meta(restore_key, restore_backend) if restore_key else None
+                cache_n_tokens = cache_meta.get("n_tokens", llm_prompt_tokens) if cache_meta else llm_prompt_tokens
+                if _is_recompute(cached_tokens, llm_prompt_tokens, cache_n_tokens):
                     recompute_happened = True
                     log.warning(
                         "Recompute detected for model '%s' on backend '%s' slot %d (key %s): "
-                        "cached_tokens=%d llm_prompt_tokens=%d, "
+                        "cached_tokens=%d llm_prompt_tokens=%d cache_n_tokens=%d, "
                         "KV cache restore was partial/useless",
                         model_name, be_id, slot_id, key[:16],
-                        cached_tokens, llm_prompt_tokens,
+                        cached_tokens, llm_prompt_tokens, cache_n_tokens,
                     )
                     if restore_key and restore_backend:
                         kv_meta.increment_recompute_penalty(restore_key, restore_backend)

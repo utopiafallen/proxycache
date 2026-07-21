@@ -32,6 +32,7 @@ class DiscoveredModel:
     name: str
     n_ctx: int
     backends: list[str]
+    backend_n_ctx: dict[str, int]
     total_slots: int
     last_discovered: float
 
@@ -239,9 +240,11 @@ class BackendManager:
         merged = {}
         for name, entries in all_discovered.items():
             backends = [be for be, _ in entries]
+            backend_n_ctx = {be: ctx for be, ctx in entries}
             min_ctx = min(ctx for _, ctx in entries)
             merged[name] = DiscoveredModel(
                 name=name, n_ctx=min_ctx, backends=backends,
+                backend_n_ctx=backend_n_ctx,
                 total_slots=0,
                 last_discovered=time.time(),
             )
@@ -254,6 +257,11 @@ class BackendManager:
     def get_model_n_ctx(self, canonical_name: str) -> int:
         if canonical_name in self._discovered_models:
             return self._discovered_models[canonical_name].n_ctx
+        return DEFAULT_N_CTX
+
+    def get_backend_n_ctx(self, canonical_name: str, backend_key: str) -> int:
+        if canonical_name in self._discovered_models:
+            return self._discovered_models[canonical_name].backend_n_ctx.get(backend_key, DEFAULT_N_CTX)
         return DEFAULT_N_CTX
 
     def get_discovered_models(self, model_name: str) -> list[DiscoveredModel]:

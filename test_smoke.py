@@ -782,6 +782,7 @@ def test_lock_released_on_restore_failure():
     sm.get("10.0.0.1:8000").ensure_pool("ModelA", 1)
     backend_manager._discovered_models["ModelA"] = DiscoveredModel(
         name="ModelA", n_ctx=4096, backends=["10.0.0.1:8000"],
+        backend_n_ctx={},
         total_slots=1, last_discovered=0.0,
     )
 
@@ -839,6 +840,7 @@ def test_non_streaming_cancelled_error_releases_slot():
     from backend_manager import DiscoveredModel
     backend_manager._discovered_models["ModelA"] = DiscoveredModel(
         name="ModelA", n_ctx=4096, backends=["10.0.0.1:8000"],
+        backend_n_ctx={},
         total_slots=1, last_discovered=0.0,
     )
 
@@ -1021,6 +1023,7 @@ def test_streaming_release_not_in_outer_finally():
     from backend_manager import DiscoveredModel
     backend_manager._discovered_models["ModelA"] = DiscoveredModel(
         name="ModelA", n_ctx=4096, backends=["10.0.0.1:8000"],
+        backend_n_ctx={},
         total_slots=1, last_discovered=0.0,
     )
 
@@ -1479,6 +1482,7 @@ def test_resolve_exact_match():
 
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
         name="qwen3.6-32b", n_ctx=32768, backends=["10.0.0.1:8000", "10.0.0.1:9000"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
 
@@ -1496,6 +1500,7 @@ def test_resolve_substring_match():
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["qwen3.6-32b-instruct"] = DiscoveredModel(
         name="qwen3.6-32b-instruct", n_ctx=32768, backends=["10.0.0.1:8000"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
 
@@ -1513,10 +1518,12 @@ def test_resolve_ambiguous_substring():
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
         name="qwen3.6-32b", n_ctx=32768, backends=["10.0.0.1:8000"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
     backend_manager._discovered_models["qwen3.6-8b"] = DiscoveredModel(
         name="qwen3.6-8b", n_ctx=8192, backends=["10.0.0.1:9000"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
 
@@ -1535,10 +1542,12 @@ def test_resolve_any():
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
         name="qwen3.6-32b", n_ctx=32768, backends=["10.0.0.1:8000"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
     backend_manager._discovered_models["gemma-3-12b"] = DiscoveredModel(
         name="gemma-3-12b", n_ctx=16384, backends=["10.0.0.1:9000"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
 
@@ -1593,10 +1602,12 @@ def test_cache_hit_selects_best_ratio():
             backend_manager._discovered_models.clear()
             backend_manager._discovered_models["model-a"] = DiscoveredModel(
                 name="model-a", n_ctx=32768, backends=["be1"],
+        backend_n_ctx={},
                 total_slots=0, last_discovered=0.0,
             )
             backend_manager._discovered_models["model-b"] = DiscoveredModel(
                 name="model-b", n_ctx=32768, backends=["be2"],
+        backend_n_ctx={},
                 total_slots=0, last_discovered=0.0,
             )
 
@@ -1655,10 +1666,12 @@ def test_cache_hit_across_canonical_models():
             backend_manager._discovered_models.clear()
             backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
                 name="qwen3.6-32b", n_ctx=32768, backends=["be1"],
+        backend_n_ctx={},
                 total_slots=0, last_discovered=0.0,
             )
             backend_manager._discovered_models["qwen3.6-8b"] = DiscoveredModel(
                 name="qwen3.6-8b", n_ctx=8192, backends=["be2"],
+        backend_n_ctx={},
                 total_slots=0, last_discovered=0.0,
             )
 
@@ -1820,6 +1833,7 @@ def test_get_model_n_ctx_exact():
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
         name="qwen3.6-32b", n_ctx=32768, backends=["be1"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
 
@@ -1835,12 +1849,31 @@ def test_get_model_n_ctx_min_across_backends():
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["model-a"] = DiscoveredModel(
         name="model-a", n_ctx=8192, backends=["be1", "be2"],
+        backend_n_ctx={"be1": 32768, "be2": 8192},
         total_slots=0, last_discovered=0.0,
     )
 
     result = backend_manager.get_model_n_ctx("model-a")
     assert result == 8192, f"Expected 8192, got {result}"
     print("PASS: test_get_model_n_ctx_min_across_backends")
+
+
+def test_get_backend_n_ctx():
+    """Per-backend n_ctx: be1=32768, be2=8192. Returns correct value per backend."""
+    from backend_manager import backend_manager, DiscoveredModel
+
+    backend_manager._discovered_models.clear()
+    backend_manager._discovered_models["model-a"] = DiscoveredModel(
+        name="model-a", n_ctx=8192, backends=["be1", "be2"],
+        backend_n_ctx={"be1": 32768, "be2": 8192},
+        total_slots=0, last_discovered=0.0,
+    )
+
+    assert backend_manager.get_backend_n_ctx("model-a", "be1") == 32768
+    assert backend_manager.get_backend_n_ctx("model-a", "be2") == 8192
+    assert backend_manager.get_backend_n_ctx("model-a", "be3") == 16384  # DEFAULT_N_CTX
+    assert backend_manager.get_backend_n_ctx("unknown-model", "be1") == 16384  # DEFAULT_N_CTX
+    print("PASS: test_get_backend_n_ctx")
 
 
 def test_prompt_too_long_rejected():
@@ -1854,6 +1887,7 @@ def test_prompt_too_long_rejected():
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["model-a"] = DiscoveredModel(
         name="model-a", n_ctx=4096, backends=["10.0.0.1:8000"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
 
@@ -1892,10 +1926,12 @@ def test_models_endpoint_includes_any():
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["model-a"] = DiscoveredModel(
         name="model-a", n_ctx=32768, backends=["be1"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
     backend_manager._discovered_models["model-b"] = DiscoveredModel(
         name="model-b", n_ctx=16384, backends=["be2"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
 
@@ -1919,6 +1955,7 @@ def test_models_endpoint_openai_format():
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["model-a"] = DiscoveredModel(
         name="model-a", n_ctx=32768, backends=["be1"],
+        backend_n_ctx={},
         total_slots=0, last_discovered=0.0,
     )
 
@@ -2071,10 +2108,12 @@ def test_chat_any_with_cache_hit():
 
             backend_manager._discovered_models["model-a"] = DiscoveredModel(
                 name="model-a", n_ctx=32768, backends=["10.0.0.1:8000"],
+        backend_n_ctx={},
                 total_slots=1, last_discovered=0.0,
             )
             backend_manager._discovered_models["model-b"] = DiscoveredModel(
                 name="model-b", n_ctx=16384, backends=["10.0.0.1:9000"],
+        backend_n_ctx={},
                 total_slots=1, last_discovered=0.0,
             )
 
@@ -2149,6 +2188,7 @@ def test_acquire_for_request_retries_on_lock_timeout():
             "ModelA": DiscoveredModel(
                 name="ModelA", n_ctx=4096,
                 backends=["10.0.0.1:8000", "10.0.0.2:8000"],
+        backend_n_ctx={},
                 total_slots=4, last_discovered=time.time(),
             ),
         }
@@ -2202,6 +2242,7 @@ def test_chat_save_skipped_when_ratio_above_threshold():
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
         name="test-model", backends=["10.0.0.1:8000"], n_ctx=32768,
+        backend_n_ctx={},
         total_slots=1, last_discovered=0.0
     )
 
@@ -2255,6 +2296,7 @@ def test_chat_save_performed_when_ratio_below_threshold():
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
         name="test-model", backends=["10.0.0.1:8000"], n_ctx=32768,
+        backend_n_ctx={},
         total_slots=1, last_discovered=0.0
     )
 
@@ -2306,6 +2348,7 @@ def test_cache_hit_wait_phase0_success():
             "ModelA": DiscoveredModel(
                 name="ModelA", n_ctx=4096,
                 backends=["backend1"],
+        backend_n_ctx={},
                 total_slots=1, last_discovered=time.time(),
             ),
         }
@@ -2352,11 +2395,13 @@ def test_cache_hit_wait_phase0_timeout():
             "ModelA": DiscoveredModel(
                 name="ModelA", n_ctx=4096,
                 backends=["backend1"],
+        backend_n_ctx={},
                 total_slots=1, last_discovered=time.time(),
             ),
             "ModelB": DiscoveredModel(
                 name="ModelB", n_ctx=4096,
                 backends=["backend2"],
+        backend_n_ctx={},
                 total_slots=1, last_discovered=time.time(),
             ),
         }
@@ -2404,11 +2449,13 @@ def test_cache_hit_wait_pending_count_blocks():
             "ModelA": DiscoveredModel(
                 name="ModelA", n_ctx=4096,
                 backends=["backend1"],
+        backend_n_ctx={},
                 total_slots=1, last_discovered=time.time(),
             ),
             "ModelB": DiscoveredModel(
                 name="ModelB", n_ctx=4096,
                 backends=["backend2"],
+        backend_n_ctx={},
                 total_slots=1, last_discovered=time.time(),
             ),
         }
@@ -2849,6 +2896,7 @@ if __name__ == "__main__":
 
     test_get_model_n_ctx_exact()
     test_get_model_n_ctx_min_across_backends()
+    test_get_backend_n_ctx()
     test_prompt_too_long_rejected()
 
     # ── /v1/models endpoint tests ──────────────────────────────────────
