@@ -435,11 +435,19 @@ class BackendManager:
                     })
             if changed:
                 try:
-                    await self.discover_models()
+                    await asyncio.wait_for(self.discover_models(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    log.warning("discover_models timed out during liveness check — recreating clients")
+                    for backend_key in self.keys():
+                        self.get_client(backend_key)._recreate_client()
                 except Exception as e:
                     log.error("discover_models failed during liveness check: %s", e)
                 try:
-                    await self.refresh_slot_counts()
+                    await asyncio.wait_for(self.refresh_slot_counts(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    log.warning("refresh_slot_counts timed out during liveness check — recreating clients")
+                    for backend_key in self.keys():
+                        self.get_client(backend_key)._recreate_client()
                 except Exception:
                     log.exception("Failed to refresh slot counts after backend state change")
 
