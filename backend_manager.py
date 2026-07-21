@@ -224,9 +224,12 @@ class BackendManager:
     async def discover_models(self) -> dict[str, DiscoveredModel]:
         """Discover models across all backends. Returns merged registry.
         Always performs fresh discovery. Result stored in _discovered_models.
+        Skips backends that the liveness checker has marked as down.
         """
         all_discovered: dict[str, list[tuple[str, int]]] = {}
         for backend_key in self.keys():
+            if not self._backend_state.get(backend_key, False):
+                continue
             models = await self.get_client(backend_key).discover_models()
             log.info("discover_models on backend '%s': %s", backend_key, models)
             if not models:
@@ -376,6 +379,11 @@ class BackendManager:
 
     async def _liveness_loop(self):
         """Ping backends every 5s, trigger discovery on state change."""
+        # Initialize all backends as up so discover_models() doesn't skip them
+        # before the first health check runs
+        for backend_key in self.keys():
+            self._backend_state.setdefault(backend_key, True)
+
         while True:
             await asyncio.sleep(5.0)
             changed = False
@@ -413,6 +421,12 @@ class BackendManager:
                         "new_state": "up",
                     })
             if changed:
+                # Recreate httpx clients for backends that just came back up
+                # so discover_models() uses a fresh connection pool
+                for sc in state_changes:
+                    if sc["new_state"] is True:
+                        self.get_client(sc["backend"])._recreate_client()
+
                 try:
                     await self.discover_models()
                 except Exception as e:
