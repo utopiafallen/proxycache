@@ -238,7 +238,7 @@ class LlamaClient:
             resp = await self.client.get(f"/slots/{slot_id}")
             resp.raise_for_status()
             return resp.json()
-        except Exception as e:
+        except httpx.HTTPError as e:
             log.warning("Failed to get slot status for slot %d: %s", slot_id, e)
             return None
 
@@ -253,7 +253,7 @@ class LlamaClient:
             resp = await self.client.get("/models")
             resp.raise_for_status()
             data = resp.json()
-        except Exception as e:
+        except httpx.HTTPError as e:
             log.warning("Failed to parse router models from %s: %s", self.base_url, e)
             return []
 
@@ -285,7 +285,7 @@ class LlamaClient:
             resp = await self.client.get(f"{child_url}/slots")
             resp.raise_for_status()
             return resp.json()
-        except Exception as e:
+        except httpx.HTTPError as e:
             log.warning("Failed to get slots from child process %s: %s", child_url, e)
             return None
 
@@ -314,7 +314,7 @@ class LlamaClient:
                 )
                 return await self._get_slots_via_router_models(model_name)
             raise
-        except Exception as e:
+        except httpx.HTTPError as e:
             log.warning("Failed to get slots info from %s: %s", self.base_url, e)
             return None
 
@@ -395,7 +395,7 @@ class LlamaClient:
                 if models:
                     return models
                 log.warning("Router /models returned no loaded models on %s", self.base_url)
-        except Exception as e:
+        except httpx.HTTPError as e:
              log.warning("Router /models failed on %s: %s", self.base_url, e)
 
         # Non-router mode: GET /v1/models
@@ -411,7 +411,7 @@ class LlamaClient:
                         n_ctx = meta.get("n_ctx", DEFAULT_N_CTX)
                     if name:
                         return [(name, int(n_ctx))]
-        except Exception as e:
+        except httpx.HTTPError as e:
              log.warning("Non-router /v1/models failed on %s: %s", self.base_url, e)
 
         log.warning("discover_models returned empty on %s (both router and non-router failed)", self.base_url)

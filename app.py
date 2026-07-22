@@ -1229,9 +1229,11 @@ async def metrics_cache():
 
 
 @app.get("/metrics/diagnostics")
-async def metrics_diagnostics(request_id: str = None, liveness: bool = False, timeline: bool = False):
+async def metrics_diagnostics(request_id: str = None, liveness: bool = False, timeline: bool = False, liveness_diag: bool = False):
     if timeline:
         return {"timeline": metrics.get_timeline(limit=200)}
+    if liveness_diag:
+        return {"liveness_diagnostics": metrics.get_events(event_type="liveness_diag", limit=50)}
     if liveness:
         return {"liveness_events": metrics.get_events(event_type="liveness_change", limit=50)}
     if request_id:

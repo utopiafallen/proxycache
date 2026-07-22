@@ -64,6 +64,7 @@ class BackendManager:
         self._backend_last_used: dict[str, float] = {}
         self._backend_latency_ema: dict[str, float] = {}
         self._discovery_task: asyncio.Task | None = None
+        self._last_discover_timing: List[Dict[str, Any]] = []
 
         for be in backends_config:
             url = be["url"].rstrip("/")
@@ -227,11 +228,16 @@ class BackendManager:
         Skips backends that the liveness checker has marked as down.
         """
         all_discovered: dict[str, list[tuple[str, int]]] = {}
+        self._last_discover_timing: List[Dict[str, Any]] = []
         for backend_key in self.keys():
             if not self._backend_state.get(backend_key, False):
+                self._last_discover_timing.append({"backend": backend_key, "skipped": True})
                 continue
+            t_be = time.time()
             models = await self.get_client(backend_key).discover_models()
-            log.info("discover_models on backend '%s': %s", backend_key, models)
+            elapsed_ms = (time.time() - t_be) * 1000
+            self._last_discover_timing.append({"backend": backend_key, "ms": round(elapsed_ms, 1), "models": len(models)})
+            log.info("discover_models on backend '%s': %s (%.0fms)", backend_key, models, elapsed_ms)
             if not models:
                 log.warning("No models discovered on backend '%s'", backend_key)
                 continue
@@ -385,28 +391,44 @@ class BackendManager:
             self._backend_state.setdefault(backend_key, True)
 
         while True:
+            loop_t0 = time.time()
             await asyncio.sleep(5.0)
             changed = False
             state_changes: List[Dict[str, Any]] = []
+            health_results: List[Dict[str, Any]] = []
+
             for backend_key in self.keys():
                 client = self.get_client(backend_key)
                 old_state = self._backend_state.get(backend_key, False)
                 is_up = False
+                hc_t0 = time.time()
+                hc_error = None
+                recreated = False
+                retry_succeeded = False
                 try:
                     await client.client.get("/health", timeout=2.0)
                     is_up = True
-                except Exception:
-                    # Backend marked down — pool may be poisoned from a prior
-                    # ReadError. Recreate client and retry once to detect recovery
-                    # without waiting for an external state transition.
-                    if not old_state:
-                        client._recreate_client()
-                        try:
-                            await client.client.get("/health", timeout=2.0)
-                            is_up = True
-                        except Exception:
-                            pass
+                except Exception as e:
+                    hc_error = type(e).__name__
+                    # Health check failed — recreate client (pool may be poisoned
+                    # from a prior ReadError or CancelledError) and retry once
+                    # before flipping state. This prevents a single transient
+                    # failure from marking an up backend as down, which would
+                    # trigger discovery and potentially start an oscillation cycle.
+                    recreated = True
+                    client._recreate_client()
+                    try:
+                        await client.client.get("/health", timeout=2.0)
+                        is_up = True
+                        hc_error = None
+                        retry_succeeded = True
+                    except Exception as e2:
+                        hc_error = type(e2).__name__
+                hc_ms = (time.time() - hc_t0) * 1000
+
+                state_changed = False
                 if is_up != old_state:
+                    state_changed = True
                     self._backend_state[backend_key] = is_up
                     changed = True
                     state_changes.append({
@@ -418,6 +440,19 @@ class BackendManager:
                     # poisoned the connection pool (httpcore ReadError bug),
                     # up transition needs fresh pool for discovery
                     client._recreate_client()
+                    recreated = True
+
+                health_results.append({
+                    "backend": backend_key,
+                    "is_up": is_up,
+                    "old_state": old_state,
+                    "state_changed": state_changed,
+                    "ms": round(hc_ms, 1),
+                    "error": hc_error,
+                    "recreated": recreated,
+                    "retry_succeeded": retry_succeeded,
+                })
+
             # Also trigger if an up backend has no models in the registry
             # (discovery previously failed or never ran for that backend)
             up_keys = {k for k, v in self._backend_state.items() if v}
@@ -433,23 +468,38 @@ class BackendManager:
                         "old_state": "up_no_models",
                         "new_state": "up",
                     })
+
+            disc_ms = None
+            disc_error = None
+            slots_ms = None
+            slots_error = None
             if changed:
+                disc_t0 = time.time()
                 try:
-                    await asyncio.wait_for(self.discover_models(), timeout=10.0)
+                    results = await asyncio.wait_for(
+                        asyncio.gather(
+                            self.discover_models(),
+                            self.refresh_slot_counts(),
+                            return_exceptions=True,
+                        ),
+                        timeout=10.0,
+                    )
+                    disc_ms = (time.time() - disc_t0) * 1000
+                    slots_ms = disc_ms
+                    if isinstance(results[0], Exception):
+                        disc_error = type(results[0]).__name__
+                        log.error("discover_models failed: %s", results[0])
+                    if isinstance(results[1], Exception):
+                        slots_error = type(results[1]).__name__
+                        log.error("refresh_slot_counts failed: %s", results[1])
                 except asyncio.TimeoutError:
-                    log.warning("discover_models timed out during liveness check — recreating clients")
+                    disc_ms = 10000.0
+                    slots_ms = 10000.0
+                    disc_error = "timeout"
+                    slots_error = "timeout"
+                    log.warning("discovery/refresh timed out during liveness check — recreating clients")
                     for backend_key in self.keys():
                         self.get_client(backend_key)._recreate_client()
-                except Exception as e:
-                    log.error("discover_models failed during liveness check: %s", e)
-                try:
-                    await asyncio.wait_for(self.refresh_slot_counts(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    log.warning("refresh_slot_counts timed out during liveness check — recreating clients")
-                    for backend_key in self.keys():
-                        self.get_client(backend_key)._recreate_client()
-                except Exception:
-                    log.exception("Failed to refresh slot counts after backend state change")
 
                 # Record liveness event for diagnostics
                 discovered_models = {name: list(info.backends)
@@ -458,6 +508,25 @@ class BackendManager:
                     "event": "liveness_change",
                     "state_changes": state_changes,
                     "discovered_models": discovered_models,
+                })
+
+            # Record diagnostic event only when something noteworthy happened
+            has_errors = any(h.get("error") for h in health_results)
+            has_retries = any(h.get("retry_succeeded") for h in health_results)
+            worth_recording = changed or has_errors or has_retries or disc_error or slots_error
+            if worth_recording:
+                metrics.record({
+                    "event": "liveness_diag",
+                    "health": health_results,
+                    "states": dict(self._backend_state),
+                    "changed": changed,
+                    "discovered_models": len(self._discovered_models),
+                    "discover_timing": list(self._last_discover_timing),
+                    "discover_ms": round(disc_ms, 1) if disc_ms is not None else None,
+                    "discover_error": disc_error,
+                    "slots_ms": round(slots_ms, 1) if slots_ms is not None else None,
+                    "slots_error": slots_error,
+                    "total_ms": round((time.time() - loop_t0) * 1000, 1),
                 })
 
 
