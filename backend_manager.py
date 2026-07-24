@@ -152,9 +152,17 @@ class BackendManager:
             return await be.agent_client.delete(key)
         if be.cache_dir:
             import os
+            import glob as globmod
             cache_path = os.path.join(be.cache_dir, key)
             if os.path.exists(cache_path):
                 os.remove(cache_path)
+                # Delete ckpt sidecar files (<key>.ckpt, <key>.ckpt.0, etc.)
+                pattern = os.path.join(be.cache_dir, key + ".ckpt*")
+                for sidecar_path in globmod.glob(pattern):
+                    try:
+                        os.remove(sidecar_path)
+                    except OSError:
+                        pass
                 return True
         return False
 

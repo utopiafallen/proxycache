@@ -115,6 +115,25 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Delete ckpt sidecar files (<key>.ckpt, <key>.ckpt.0, etc.)
+	if entries, err := os.ReadDir(cacheDir); err == nil {
+		prefix := key + ".ckpt"
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if name == prefix || len(name) > len(prefix)+1 && name[:len(prefix)+1] == prefix+"."{
+				sidecar := cacheDir + "/" + name
+				if err := os.Remove(sidecar); err == nil {
+					log.Printf("cache delete: sidecar %s\n", name)
+				} else {
+					log.Printf("cache delete: failed to remove sidecar %s: %v\n", name, err)
+				}
+			}
+		}
+	}
+
 	log.Printf("cache delete: %s\n", key)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
