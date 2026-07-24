@@ -782,6 +782,17 @@ async def chat(req: Request):
         try:
             templated = await first_client.apply_chat_template(messages)
             first_token_ids = await first_client.tokenize(templated, add_special=True)
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text or str(exc)
+            log.warning("Backend %s returned %d for model '%s': %s",
+                        first_opt.backends[0], exc.response.status_code, client_model, detail[:512])
+            metrics.record({
+                "request_id": request_id,
+                "model": client_model,
+                "latency_ms": (time.time() - t0) * 1000,
+                "status": "backend_error",
+            })
+            return JSONResponse({"error": detail}, status_code=exc.response.status_code)
         except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
             log.error("Backend %s error for model '%s' from client %s",
                       first_opt.backends[0], client_model, client_ip)
