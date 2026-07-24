@@ -37,12 +37,26 @@ log = logging.getLogger(__name__)
 EXTRACT_PREVIEW_MAX_LEN = 200
 
 
+def _extract_from_content(content) -> str:
+    """Extract text from a content field (str or list of parts)."""
+    if isinstance(content, str):
+        stripped = content.strip()
+        if stripped:
+            return stripped[:EXTRACT_PREVIEW_MAX_LEN]
+    elif isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip():
+                return c["text"][:EXTRACT_PREVIEW_MAX_LEN]
+    return ""
+
+
 def extract_prompt_preview(request_json: dict) -> str:
     """Extract a prompt preview string from a chat request JSON.
 
     Scans messages in reverse order, returning the text content of the most
-    recent user or assistant message with non-empty content. Skips assistant
-    messages with empty content (e.g. model turn completions).
+    recent user or assistant message. Checks ``content`` first, then falls
+    back to ``reasoning_content`` for messages that use it (e.g. reasoning
+    models like DeepSeek R1).
 
     Args:
         request_json: The full request body containing a "messages" list.
@@ -56,14 +70,12 @@ def extract_prompt_preview(request_json: dict) -> str:
     messages = request_json.get("messages", [])
     for msg in reversed(messages):
         if msg.get("role") in ("user", "assistant"):
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                if content.strip():
-                    return content[:EXTRACT_PREVIEW_MAX_LEN]
-            elif isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip():
-                        return c["text"][:EXTRACT_PREVIEW_MAX_LEN]
+            preview = _extract_from_content(msg.get("content", ""))
+            if preview:
+                return preview
+            preview = _extract_from_content(msg.get("reasoning_content", ""))
+            if preview:
+                return preview
     return ""
 
 
