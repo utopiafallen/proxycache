@@ -1,6 +1,6 @@
 ---
 name: proxycache-architecture
-description: Proxycache KV cache slot management, cache hit scanning, slot acquisition, restore/save logic, skip-restore, pending slot hits, and backend error handling. Use when working with slots, cache hits, KV cache state, restore, save, routing, or any proxycache request flow.
+description: Proxycache KV cache slot management, cache hit scanning, slot acquisition, restore/save logic, skip-restore, pending slot hits, backend error handling, liveness loop, and httpx client lifecycle. Use when working with slots, cache hits, KV cache state, restore, save, routing, request flow, health checks, or backend discovery.
 ---
 
 # Proxycache Architecture
@@ -86,6 +86,43 @@ When a request completes and starts saving, subsequent requests that arrive duri
 4. **During steps 1-2:** Pending slot scan finds the in-flight slot's KV state and uses it as a cache hit candidate
 5. **After step 3:** Disk scan picks up the new meta file
 
+## Backend Discovery & Liveness Loop (`BackendManager._liveness_loop`)
+
+Pings backends every 5s, triggers model discovery on state change.
+
+**Health check flow (per backend):**
+1. `await client.client.get("/health", timeout=2.0)` — uses the current httpx client directly
+2. If it fails: recreate client via `_recreate_client()`, retry once with fresh client
+3. Record per-backend health result: `is_up`, timing, error name, whether recreated/retried
+
+**State change triggers:**
+- Backend up↔down transition → sets `changed=True`
+- Up backend has no models in registry (`up_no_models`) → also triggers discovery
+- When `changed`: runs `discover_models()` and `refresh_slot_counts()` **concurrently** via `asyncio.gather`, shared 10s timeout
+
+**Model discovery (`discover_models`):**
+- Iterates backends sequentially, skipping those marked down
+- For each: calls `LlamaClient.discover_models()` which tries router `/models` then fallback `/v1/models`
+- Stores per-backend timing in `_last_discover_timing`
+- Result stored in `_discovered_models`, used by slot manager and routing
+
+**Slot refresh (`refresh_slot_counts`):**
+- Iterates discovered models → queries each backend's slots via `get_slots_info()`
+- Updates `slot_counts[backend_key][canonical_name]`
+- Used by fallback sorting and EMA latency tracking
+
+## Liveness Diagnostics
+
+On every noteworthy liveness iteration (state change, health errors, retries, or discover/refresh errors), a `liveness_diag` event is recorded with:
+- Per-backend health results: `is_up`, `old_state`, `state_changed`, timing in ms, error name, `recreated`, `retry_succeeded`
+- Current backend states dict
+- Whether discovery ran (`changed`) and count of discovered models
+- Per-backend discovery timing from `_last_discover_timing`
+- Discovery/refresh timing and error names (or `None` if none)
+- Total loop duration in ms
+
+Query via `GET /metrics/diagnostics?liveness_diag=true`.
+
 ## Gotchas
 
 - **Tokenization is backend-specific**: Each backend applies its own chat template and tokenizer. Different backends may produce different token IDs for the same messages.
@@ -99,6 +136,9 @@ When a request completes and starts saving, subsequent requests that arrive duri
 - **`_NO_PREV` sentinel in `should_skip_restore`**: `prev_blocks` parameter defaults to sentinel `_NO_PREV` (not `None`) to distinguish "not passed" (fallback to `_slot_kv_state` for backward compat with tests) from "explicitly `None`" (fresh slot, always return False — can't skip restore on a slot with no tracked state).
 - **Backend key sanitization**: Filesystem paths use `sanitize_backend_dir()` (colons → dashes, e.g. `10.0.0.1:8000` → `10.0.0.1-8000`). But in-memory `_backends` dict keys, `DiscoveredModel.backends`, and all app-level code use raw colon keys. Tests that manually construct `BackendManager` must use raw colon keys for `_backends` dict.
 - **Module-level config imports**: `app.py`, `hashing.py`, `slot_manager.py` all import config values (like `WORDS_PER_BLOCK`, `LCP_TH`) at module load time. Changing `config.WORDS_PER_BLOCK` in tests doesn't affect already-imported copies — must patch the importing module directly (e.g. `app_mod.WORDS_PER_BLOCK = 3`).
+- **httpx CancelledError propagation**: All httpx calls in `LlamaClient` use `except httpx.HTTPError`, NOT `except Exception`. This is critical because `asyncio.wait_for` cancels the inner task on timeout by injecting `CancelledError`. If the task catches it (via broad `except Exception`), the task never terminates, and `asyncio.wait_for` hangs indefinitely waiting for the task to finish. Narrowing to `except httpx.HTTPError` lets `CancelledError` propagate, `asyncio.wait_for` detects the cancellation and raises `TimeoutError`, and the liveness loop can recover. The liveness loop uses `asyncio.wait_for(asyncio.gather(...), timeout=10.0)` for concurrent discovery + refresh.
+- **Health check retry**: Every failed health check gets a client recreation + retry before flipping state. This prevents a single transient failure from marking an up backend as down, which would trigger discovery (potentially timing out) and start an oscillation cycle.
+- **Discovery + refresh are concurrent**: `discover_models()` and `refresh_slot_counts()` run in parallel via `asyncio.gather` with a shared 10s timeout. If either raises an exception, it appears in the result list (`return_exceptions=True`) — check `results[0]` / `results[1]` individually rather than relying on the outer try/except.
 
 ## Key Functions
 
@@ -117,3 +157,7 @@ When a request completes and starts saving, subsequent requests that arrive duri
 | `save_after()` | `slot_manager.py` | Save KV cache to disk, write meta file, update ring buffer, update `_slot_kv_state` |
 | `StreamReader._save()` | `app.py` | Detect recompute, call `save_after()`, return ok/cache_size |
 | `StreamReader._cleanup()` | `app.py` | Stream lifecycle: save, invalidate, release slot, record metrics |
+| `BackendManager.discover_models()` | `backend_manager.py` | Discover models across all up backends sequentially, store in `_discovered_models` |
+| `BackendManager.refresh_slot_counts()` | `backend_manager.py` | Query slots for each discovered model+backend pair |
+| `BackendManager._liveness_loop()` | `backend_manager.py` | 5s health check loop, concurrent discovery/refresh on state change |
+| `LlamaClient.discover_models()` | `llama_client.py` | Try router `/models`, fallback `/v1/models`; uses `except httpx.HTTPError` |

@@ -1,6 +1,6 @@
 ---
 name: metrics-architecture
-description: Metrics collector with multi-phase request recording, routing diagnostics, skip-restore tracking, ring buffer, liveness events, and dashboard. Use when working with request metrics, routing diagnostics, performance data, cache hit analysis, dashboard, or any proxycache observability.
+description: Metrics collector with multi-phase request recording, routing diagnostics, skip-restore tracking, ring buffer, liveness events, liveness diagnostics, and dashboard. Use when working with request metrics, routing diagnostics, performance data, cache hit analysis, dashboard, or any proxycache observability.
 ---
 
 # Metrics Architecture
@@ -16,7 +16,9 @@ Requests flow through multiple recording phases, all updating the same ring buff
    - **`"cancelled"`** — streaming request where client disconnected (`_cancelled=True`, `_stream_complete=False`).
    - **`"backend_error"`** — backend timeout, connection error, streaming response non-200, or generic exception. Recorded by error handlers and streaming `_cleanup()` (backend disconnect case).
 
-**Liveness events**: The backend manager's `_liveness_loop()` records `event="liveness_change"` entries when backend state changes (up/down) or models are missing from discovery. These use synthetic `request_id` values (`liveness:<timestamp_ms>`) and `status="complete"`.
+**Liveness events**: The backend manager's `_liveness_loop()` records two event types:
+- `event="liveness_change"` — when backend state changes (up/down) or models are missing from discovery. Uses synthetic `request_id` (`liveness:<timestamp_ms>`), includes `state_changes` and `discovered_models`.
+- `event="liveness_diag"` — on every noteworthy liveness iteration (state change, health errors, retries, discover/refresh errors). Includes per-backend health timing, error names, retry status, discovery timing.
 
 **Key behavior:**
 - `_by_id: Dict[str, int]` maps request_id → index in ring buffer, rebuilt after every append (deque auto-evicts without notification, leaving stale indices)
@@ -84,7 +86,7 @@ Captured during the routing phase (phase 2) and stored as `routing_diagnostics` 
 
 ## Ring Buffer
 
-Single `deque(maxlen=retention)` (default 200) holds both request records and diagnostic events. Events are distinguished by the `event` field (e.g. `"liveness_change"`). When full, the oldest entry is auto-evicted on append.
+Single `deque(maxlen=retention)` (default 200) holds both request records and diagnostic events. Events are distinguished by the `event` field (e.g. `"liveness_change"`, `"liveness_diag"`). When full, the oldest entry is auto-evicted on append.
 
 **Request queries** (events filtered out automatically):
 - `get_requests(limit, offset)` — returns request records **newest-first**
@@ -93,11 +95,54 @@ Single `deque(maxlen=retention)` (default 200) holds both request records and di
 - `get_performance()` — computes metrics from complete requests only
 
 **Event queries**:
-- `get_events(event_type, limit)` — returns events, optionally filtered by type, **newest-first**
+- `get_events(event_type, limit)` — returns events, optionally filtered by type (`"liveness_change"` or `"liveness_diag"`), **newest-first**
 - `get_timeline(limit)` — returns unified timeline (requests + events), **newest-first**
 
 **Recording**:
 - `record(ctx)` — if `ctx` has `event` key, appends as event (append-only). Otherwise, treats as request (two-phase with in-place update via `request_id`).
+
+## Liveness Diagnostics (`liveness_diag` events)
+
+Recorded when a liveness iteration has state changes, health errors, retries, or discover/refresh errors. Structure:
+
+```python
+{
+    "event": "liveness_diag",
+    "health": [
+        {
+            "backend": "10.0.0.1-8000",
+            "is_up": True,
+            "old_state": False,
+            "state_changed": True,
+            "ms": 45.2,
+            "error": None,
+            "recreated": True,
+            "retry_succeeded": True,
+        }
+    ],
+    "states": {"10.0.0.1-8000": True, "other.lan-9000": False},
+    "changed": True,
+    "discovered_models": 2,
+    "discover_timing": [
+        {"backend": "10.0.0.1-8000", "ms": 320.5, "models": 1},
+        {"backend": "other.lan-9000", "skipped": True},
+    ],
+    "discover_ms": 320.5,
+    "discover_error": None,
+    "slots_ms": 320.5,
+    "slots_error": None,
+    "total_ms": 410.3,
+}
+```
+
+**Key fields:**
+- `health[].retry_succeeded` — the health check failed initially but recovered after client recreation + retry (indicates transient connection issue)
+- `health[].recreated` — client was recreated for this backend in this iteration
+- `discover_timing[].skipped` — backend was marked down, discovery skipped it
+- `discover_ms` / `slots_ms` — timing of concurrent discovery/refresh operations (shared 10s timeout)
+- `discover_error` / `slots_error` — error name (`"timeout"`, `"CancelledError"`, etc.) or `None`
+
+Query via `GET /metrics/diagnostics?liveness_diag=true`.
 
 ## Diagnostics Endpoint
 
@@ -107,6 +152,7 @@ Single `deque(maxlen=retention)` (default 200) holds both request records and di
 |-------------|---------|
 | `?request_id=UUID` | `routing_diagnostics` for a specific request |
 | `?liveness=true` | Recent `liveness_change` events with `state_changes` and `discovered_models` |
+| `?liveness_diag=true` | Recent `liveness_diag` events with per-backend health timing, discovery timing, and error details |
 | (no params) | `routing_diagnostics` for all recent requests |
 
 ## Dashboard
@@ -126,7 +172,7 @@ Single `deque(maxlen=retention)` (default 200) holds both request records and di
 | `MetricsCollector.get_total_count()` | `metrics.py` | Return actual ring buffer size for pagination |
 | `MetricsCollector.get_summary()` | `metrics.py` | Full summary including incomplete_count |
 | `StreamReader._cleanup()` | `app.py` | Stream lifecycle: save, invalidate_slot, release slot, record metrics with terminal status |
-| `BackendManager._liveness_loop()` | `backend_manager.py` | Ping backends every 5s, record state changes as liveness events |
+| `BackendManager._liveness_loop()` | `backend_manager.py` | Ping backends every 5s, record liveness_change + liveness_diag events |
 
 ## Gotchas
 
