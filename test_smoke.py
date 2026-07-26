@@ -742,11 +742,13 @@ def test_adaptive_cooldown_on_failure():
     backend_manager._backends.clear()
     backend_manager._refresh_state.clear()
     backend_manager._discovered_models.clear()
+    backend_manager._backend_state.clear()
 
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(side_effect=Exception("connection refused"))
     mock_client.discover_models = AsyncMock(return_value=[("ModelA", 4096)])
     backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None, 'cache_dir': None})()
+    backend_manager._backend_state["10.0.0.1:8000"] = True
 
     async def _run():
         # First discover models to populate _discovered_models
@@ -1289,10 +1291,11 @@ def test_discover_models_non_router_meta_null():
 
 def test_discover_models_both_endpoints_fail():
     """Mock both /models and /v1/models to fail."""
+    import httpx
     from llama_client import LlamaClient
 
     client = LlamaClient("http://10.0.0.1:8000")
-    client.client.get = AsyncMock(side_effect=Exception("connection refused"))
+    client.client.get = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
 
     async def _run():
         return await client.discover_models()

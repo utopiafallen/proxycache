@@ -412,7 +412,7 @@ class LlamaClient:
                     if name:
                         return [(name, int(n_ctx))]
         except httpx.HTTPError as e:
-             log.warning("Non-router /v1/models failed on %s: %s", self.base_url, e)
+              log.warning("Non-router /v1/models failed on %s: %s", self.base_url, e)
 
         log.warning("discover_models returned empty on %s (both router and non-router failed)", self.base_url)
         return []
