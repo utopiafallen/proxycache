@@ -78,7 +78,8 @@ class BackendManager:
                     f"Backend {url}: cache_dir and agent_port are mutually exclusive. "
                     "Use cache_dir for local cache management or agent_port for remote cache-agent."
                 )
-            if "agent_port" not in be and not cache_dir:
+            cache_max_size_gb = float(be.get("cache_max_size_gb", 25.0))
+            if "agent_port" not in be and not cache_dir and cache_max_size_gb > 0:
                 raise ValueError(
                     f"Backend {url}: must specify either cache_dir or agent_port. "
                     "cache_dir for local filesystem cache management, agent_port for remote cache-agent."
@@ -86,7 +87,6 @@ class BackendManager:
             if "agent_port" in be:
                 host = raw_key.rsplit(":", 1)[0]
                 agent_client = CacheAgentClient(f"http://{host}:{be['agent_port']}")
-            cache_max_size_gb = float(be.get("cache_max_size_gb", 25.0))
             self._backends[key] = BackendInfo(client=client, agent_client=agent_client, cache_dir=cache_dir, cache_max_size_gb=cache_max_size_gb)
             if self._first_key is None:
                 self._first_key = key
