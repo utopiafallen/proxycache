@@ -126,6 +126,10 @@ class BackendManager:
             raise KeyError(f"Unknown backend key: {key}")
         return getattr(be, 'cache_max_size_gb', 25.0)
 
+    def cache_enabled(self, key: str) -> bool:
+        """Return False if cache_max_size_gb is 0 (cache management disabled)."""
+        return self.get_cache_max_size_gb(key) > 0
+
     def touch_backend(self, backend_id: str):
         """Mark a backend as recently used."""
         self._backend_last_used[backend_id] = time.time()

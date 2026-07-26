@@ -278,6 +278,8 @@ class BackendSlotManager:
                          key: str, blocks: Optional[List[str]],
                          n_tokens: int) -> Tuple[bool, int]:
         """Save slot to disk, write meta, update ring buffer, evict if needed."""
+        if not backend_manager.cache_enabled(self.backend_id):
+            return False, 0
         client = backend_manager.get_client(self.backend_id)
         ok, size = await client.save_slot(slot_id, key, model_name)
 

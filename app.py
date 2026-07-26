@@ -849,41 +849,47 @@ async def chat(req: Request):
                     "model": opt.name, "backend": be_id,
                     "n_blocks": len(opt_blocks), "n_tokens": len(opt_token_ids),
                 }
-                cand = kv_meta.find_best_restore_candidate(opt_blocks, WORDS_PER_BLOCK, LCP_TH, opt.name, be_id)
-                if cand:
-                    diag_entry["cache_file_key"] = cand[0][:16]
-                    diag_entry["cache_file_ratio"] = round(cand[1], 4)
-                    if cand[1] > best_ratio:
-                        best_ratio = cand[1]
-                        restore_key = cand[0]
-                        restore_backend = be_id
-                        canonical_name = opt.name
-                        hit_type = CacheHitType.DISK_RESTORE
-                        log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
-                                 restore_key[:16], canonical_name, restore_backend, best_ratio)
+
+                # Skip cache-hit lookups for backends with cache disabled (cache_max_size_gb == 0)
+                if backend_manager.cache_enabled(be_id):
+                    cand = kv_meta.find_best_restore_candidate(opt_blocks, WORDS_PER_BLOCK, LCP_TH, opt.name, be_id)
+                    if cand:
+                        diag_entry["cache_file_key"] = cand[0][:16]
+                        diag_entry["cache_file_ratio"] = round(cand[1], 4)
+                        if cand[1] > best_ratio:
+                            best_ratio = cand[1]
+                            restore_key = cand[0]
+                            restore_backend = be_id
+                            canonical_name = opt.name
+                            hit_type = CacheHitType.DISK_RESTORE
+                            log.info("Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
+                                     restore_key[:16], canonical_name, restore_backend, best_ratio)
+                    else:
+                        diag_entry["cache_file_ratio"] = None
+
+                    # Check pending slots for cache hits
+                    be_sm = sm.get(be_id)
+                    pending_ratios: List[Dict[str, Any]] = []
+                    for slot_id, kv_blocks in be_sm.get_kv_states().items():
+                        lcp = hs.lcp_blocks(opt_blocks, kv_blocks)
+                        ratio = lcp / len(opt_blocks)
+                        pending_ratios.append({"slot": slot_id, "lcp_blocks": lcp,
+                                              "slot_blocks": len(kv_blocks), "ratio": round(ratio, 4)})
+                        if ratio >= LCP_TH and ratio >= best_ratio:
+                            best_ratio = ratio
+                            restore_key = None
+                            restore_backend = be_id
+                            canonical_name = opt.name
+                            hit_type = CacheHitType.SKIP
+                            log.info("Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
+                                     canonical_name, restore_backend, slot_id, ratio)
+                    diag_entry["pending_slots"] = pending_ratios
                 else:
                     diag_entry["cache_file_ratio"] = None
-
-                # Check pending slots for cache hits
-                be_sm = sm.get(be_id)
-                pending_ratios: List[Dict[str, Any]] = []
-                for slot_id, kv_blocks in be_sm.get_kv_states().items():
-                    lcp = hs.lcp_blocks(opt_blocks, kv_blocks)
-                    ratio = lcp / len(opt_blocks)
-                    pending_ratios.append({"slot": slot_id, "lcp_blocks": lcp,
-                                          "slot_blocks": len(kv_blocks), "ratio": round(ratio, 4)})
-                    if ratio >= LCP_TH and ratio >= best_ratio:
-                        best_ratio = ratio
-                        restore_key = None
-                        restore_backend = be_id
-                        canonical_name = opt.name
-                        hit_type = CacheHitType.SKIP
-                        log.info("Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
-                                 canonical_name, restore_backend, slot_id, ratio)
-                diag_entry["pending_slots"] = pending_ratios
+                    diag_entry["pending_slots"] = []
                 scan_diagnostics.append(diag_entry)
                 be_best = diag_entry.get("cache_file_ratio") or 0.0
-                for ps in pending_ratios:
+                for ps in diag_entry.get("pending_slots", []):
                     if ps["ratio"] > be_best:
                         be_best = ps["ratio"]
                 if be_best > 0:
