@@ -162,6 +162,9 @@ class KVMetaManager:
         if int(meta.get("wpb") or 0) != wpb:
             return None
 
+        if len(cand_blocks) > len(req_blocks):
+            return None
+
         lcp = hs.lcp_blocks(req_blocks, cand_blocks)
         ratio = lcp / max(1, len(req_blocks))
 
@@ -192,6 +195,8 @@ class KVMetaManager:
                 continue
 
             cand_blocks = meta.get("blocks") or []
+            if len(cand_blocks) > len(req_blocks):
+                continue
             lcp = hs.lcp_blocks(req_blocks, cand_blocks)
             ratio = lcp / max(1, len(req_blocks))
             penalty = meta.get("recompute_penalty", 0)
