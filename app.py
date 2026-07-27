@@ -871,6 +871,10 @@ async def chat(req: Request):
                     be_sm = sm.get(be_id)
                     pending_ratios: List[Dict[str, Any]] = []
                     for slot_id, kv_blocks in be_sm.get_kv_states().items():
+                        if len(opt_blocks) < len(kv_blocks):
+                            pending_ratios.append({"slot": slot_id, "lcp_blocks": 0,
+                                                  "slot_blocks": len(kv_blocks), "ratio": 0.0})
+                            continue
                         lcp = hs.lcp_blocks(opt_blocks, kv_blocks)
                         ratio = lcp / len(opt_blocks)
                         pending_ratios.append({"slot": slot_id, "lcp_blocks": lcp,
