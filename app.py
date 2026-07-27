@@ -916,7 +916,7 @@ async def chat(req: Request):
 
         candidate_backends.sort(
             key=lambda cb: (
-                -backend_cache_ratios.get(cb[0], 0.0),
+                backend_cache_ratios.get(cb[0], 0.0),
                 sm.get(cb[0]).get_ring_size(),
                 backend_manager.get_backend_latency_ema(cb[0]),
                 backend_manager.get_backend_last_used(cb[0]),
