@@ -2321,7 +2321,11 @@ def test_chat_save_performed_when_ratio_below_threshold():
         client = TestClient(app_mod.app)
         resp = client.post("/v1/chat/completions", json={
             "model": "test-model",
-            "messages": [{"role": "user", "content": "big prompt for testing"}],
+            "messages": [
+                {"role": "user", "content": "big prompt for testing"},
+                {"role": "assistant", "content": "previous response"},
+                {"role": "user", "content": "follow up"}
+            ],
             "stream": False,
         })
 

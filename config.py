@@ -59,6 +59,28 @@ KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT = float(os.getenv("KV_CACHE_SKIP_MAX_BLOCK_DIFF
 # When a cached prompt already matches well (>= threshold), no need to save a duplicate
 CACHE_SAVE_RATIO_THRESHOLD = float(os.getenv("CACHE_SAVE_RATIO_THRESHOLD", "0.8"))
 
+# Cache save context length threshold (0..1) — skip save if request tokens >= this
+# fraction of backend's max context. Conversations near max context will likely be
+# compacted soon, invalidating the saved KV cache prefix.
+CACHE_SAVE_CTX_THRESHOLD = float(os.getenv("CACHE_SAVE_CTX_THRESHOLD", "0.7"))
+
+
+def should_skip_save_heuristic(prompt_tokens: int, n_ctx: int, messages: list = None) -> bool:
+    """Skip save for requests unlikely to produce reusable cache entries.
+
+    Returns True (skip) when:
+    - Request is >= CACHE_SAVE_CTX_THRESHOLD of backend's max context (impending compaction)
+    - Request is a single user message (likely a one-off summarization, not conversation start)
+      (only checked when messages is provided)
+    """
+    if n_ctx > 0 and isinstance(prompt_tokens, int) and prompt_tokens / n_ctx >= CACHE_SAVE_CTX_THRESHOLD:
+        return True
+    if messages is not None:
+        roles = [m.get("role") for m in messages]
+        if roles.count("user") <= 1 and roles.count("assistant") == 0:
+            return True
+    return False
+
 
 def should_save_cache(best_ratio: float, recompute_happened: bool) -> bool:
     """Decide whether to save a slot's cache to disk.

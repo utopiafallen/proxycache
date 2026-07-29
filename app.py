@@ -39,7 +39,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 from config import (BACKENDS, WORDS_PER_BLOCK,
                     LCP_TH, MODEL_ID, PORT, DEFAULT_N_CTX,
-                    should_save_cache,
+                    should_save_cache, should_skip_save_heuristic,
                     CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT,
                     CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, CACHE_HIT_WAIT_MAX_PENDING_REQS)
 
@@ -176,7 +176,8 @@ async def _acquire_slot_for_request(
         if skip_entry:
             if len(skip_entry) >= 6:
                 save_key, save_blocks, save_n_tokens, _, skip_ratio, skip_recompute = skip_entry
-                if should_save_cache(skip_ratio, skip_recompute):
+                n_ctx_flush = backend_manager.get_backend_n_ctx(canonical_name, be_sm.backend_id)
+                if not should_skip_save_heuristic(save_n_tokens, n_ctx_flush) and should_save_cache(skip_ratio, skip_recompute):
                     await be_sm.save_after(canonical_name, slot_id, save_key, save_blocks, save_n_tokens)
                     log.info(
                         "Saved skipped cache for model '%s' on backend '%s' slot %d before restore",
@@ -553,6 +554,14 @@ class StreamReader:
                     kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
 
         serving_be_ratio = self._backend_cache_ratios.get(self.backend_id, 0.0)
+        if should_skip_save_heuristic(self.n_tokens, backend_manager.get_backend_n_ctx(self.model_name, self.backend_id), self._request_json.get("messages") if self._request_json else None):
+            log.info(
+                "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): heuristic skip",
+                self.model_name, self.backend_id, self.slot_id, self.key_short,
+            )
+            be_sm.mark_save_skipped(self.slot_id,
+                                    (self.key, self.blocks, self.n_tokens, self._hit_type, serving_be_ratio, recompute_happened))
+            return False, 0
         if not should_save_cache(serving_be_ratio, recompute_happened):
             log.info(
                 "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): "
@@ -1114,7 +1123,10 @@ async def chat(req: Request):
             save_ok = False
             cache_size = 0
             serving_be_ratio = backend_cache_ratios.get(be_id, 0.0)
-            if should_save_cache(serving_be_ratio, recompute_happened):
+            if should_skip_save_heuristic(prompt_tokens, backend_manager.get_backend_n_ctx(model_name, be_id), request_json.get("messages") if request_json else None):
+                be_sm.mark_save_skipped(slot_id,
+                                        (key, blocks, prompt_tokens, hit_type, serving_be_ratio, recompute_happened))
+            elif should_save_cache(serving_be_ratio, recompute_happened):
                 try:
                     ok, cache_size = await be_sm.save_after(
                         model_name, slot_id, key, blocks, prompt_tokens,
