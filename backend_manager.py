@@ -235,25 +235,28 @@ class BackendManager:
     # --- Model discovery ---
 
     def _generate_lcp_models(self, model_names: list[str]) -> list[str]:
-        """Generate synthetic LCP model names from pairwise longest common prefixes.
+        """Generate synthetic model aliases from chunk-level prefixes.
 
-        Filters out prefixes that are too generic (fewer than 2 /-separated components)
-        and strips trailing - or _.
+        Splits each model name by - and _, takes all prefix combinations of 1..N-1
+        chunks, and keeps those that substring-match >= 2 models and contain at
+        least one / (provider + model name).
         """
         if len(model_names) < 2:
             return []
-        lcp_set: set[str] = set()
-        for i in range(len(model_names)):
-            for j in range(i + 1, len(model_names)):
-                a, b = model_names[i], model_names[j]
-                k = 0
-                while k < len(a) and k < len(b) and a[k] == b[k]:
-                    k += 1
-                if k > 0:
-                    prefix = a[:k].rstrip("-_")
-                    if prefix.count("/") >= 1:
-                        lcp_set.add(prefix)
-        return sorted(lcp_set)
+        import re
+        prefix_models: dict[str, set[str]] = {}
+        for name in model_names:
+            parts = re.split(r"[-_]", name)
+            for n in range(1, len(parts)):
+                prefix = "-".join(parts[:n]).rstrip("-_")
+                if prefix not in prefix_models:
+                    prefix_models[prefix] = set()
+                prefix_models[prefix].add(name)
+        result = []
+        for prefix, models in prefix_models.items():
+            if len(models) >= 2 and prefix.count("/") >= 1:
+                result.append(prefix)
+        return sorted(result)
 
     async def discover_models(self) -> dict[str, DiscoveredModel]:
         """Discover models across all backends. Returns merged registry.
