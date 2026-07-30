@@ -246,9 +246,9 @@ class BackendManager:
         import re
         prefix_models: dict[str, set[str]] = {}
         for name in model_names:
-            parts = re.split(r"[-_]", name)
-            for n in range(1, len(parts)):
-                prefix = "-".join(parts[:n]).rstrip("-_")
+            pieces = [p for p in re.split(r'([-_])', name) if p]
+            for n in range(1, len(pieces)):
+                prefix = "".join(pieces[:n]).rstrip("-_")
                 if prefix not in prefix_models:
                     prefix_models[prefix] = set()
                 prefix_models[prefix].add(name)

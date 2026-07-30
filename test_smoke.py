@@ -1305,6 +1305,114 @@ def test_discover_models_both_endpoints_fail():
     print("PASS: test_discover_models_both_endpoints_fail")
 
 
+# ── Synthetic LCP model tests ─────────────────────────────────────────
+
+def test_generate_lcp_models_basic():
+    """Chunk-level LCP should generate prefixes that match multiple models."""
+    from backend_manager import BackendManager
+
+    bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": "/tmp/cache"}])
+    names = [
+        "unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K",
+        "unsloth/Qwen3.6-27B-GGUF:Q5_K_S",
+    ]
+    result = bm._generate_lcp_models(names)
+    assert "unsloth/Qwen3.6" in result, f"Expected 'unsloth/Qwen3.6' in {result}"
+    assert "unsloth/Qwen3.6-27B" in result, f"Expected 'unsloth/Qwen3.6-27B' in {result}"
+    print("PASS: test_generate_lcp_models_basic")
+
+
+def test_generate_lcp_models_filters_provider_only():
+    """LCP should filter out prefixes that are just the provider name."""
+    from backend_manager import BackendManager
+
+    bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": "/tmp/cache"}])
+    names = [
+        "unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K",
+        "unsloth/Llama-3.1-8B-GGUF:Q4_K_M",
+    ]
+    result = bm._generate_lcp_models(names)
+    for prefix in result:
+        assert prefix != "unsloth", f"Provider-only prefix 'unsloth' should be filtered, got {result}"
+    assert "unsloth" not in result, f"Provider-only prefix should be filtered, got {result}"
+    print("PASS: test_generate_lcp_models_filters_provider_only")
+
+
+def test_generate_lcp_models_strips_trailing_separators():
+    """LCP prefixes should not end with - or _."""
+    from backend_manager import BackendManager
+
+    bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": "/tmp/cache"}])
+    names = [
+        "unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K",
+        "unsloth/Qwen3.6-27B-GGUF:Q5_K_S",
+    ]
+    result = bm._generate_lcp_models(names)
+    for prefix in result:
+        assert not prefix.endswith("-"), f"Prefix '{prefix}' should not end with '-'"
+        assert not prefix.endswith("_"), f"Prefix '{prefix}' should not end with '_'"
+    print("PASS: test_generate_lcp_models_strips_trailing_separators")
+
+
+def test_generate_lcp_models_single_model():
+    """LCP should return empty list for a single model."""
+    from backend_manager import BackendManager
+
+    bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": "/tmp/cache"}])
+    result = bm._generate_lcp_models(["unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K"])
+    assert result == [], f"Expected empty list for single model, got {result}"
+    print("PASS: test_generate_lcp_models_single_model")
+
+
+def test_generate_lcp_models_underscore_separator():
+    """LCP should handle _ as a separator alongside -."""
+    from backend_manager import BackendManager
+
+    bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": "/tmp/cache"}])
+    names = [
+        "unsloth/Qwen3.6_27B-MTP-GGUF:Q6_K",
+        "unsloth/Qwen3.6_27B-GGUF:Q5_K_S",
+    ]
+    result = bm._generate_lcp_models(names)
+    assert "unsloth/Qwen3.6" in result, f"Expected 'unsloth/Qwen3.6' in {result}"
+    assert "unsloth/Qwen3.6_27B" in result, f"Expected 'unsloth/Qwen3.6_27B' in {result}"
+    print("PASS: test_generate_lcp_models_underscore_separator")
+
+
+def test_discover_models_includes_lcp_synthetics():
+    """discover_models should include synthetic LCP models in the registry."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    from backend_manager import backend_manager, DiscoveredModel
+    from llama_client import LlamaClient
+
+    backend_manager._backends.clear()
+    backend_manager._discovered_models.clear()
+    backend_manager._first_key = "10.0.0.1:8000"
+    backend_manager._backend_state = {"10.0.0.1:8000": True}
+
+    mock_client = AsyncMock(spec=LlamaClient)
+    mock_client.discover_models = AsyncMock(return_value=[
+        ("unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K", 32768),
+        ("unsloth/Qwen3.6-27B-GGUF:Q5_K_S", 32768),
+    ])
+    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {
+        'client': mock_client, 'agent_client': None, 'cache_dir': None
+    })()
+
+    async def _run():
+        return await backend_manager.discover_models()
+
+    result = asyncio.run(_run())
+    assert "unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K" in result
+    assert "unsloth/Qwen3.6-27B-GGUF:Q5_K_S" in result
+    assert "unsloth/Qwen3.6" in result, f"Expected synthetic 'unsloth/Qwen3.6' in {list(result.keys())}"
+    assert "unsloth/Qwen3.6-27B" in result, f"Expected synthetic 'unsloth/Qwen3.6-27B' in {list(result.keys())}"
+    assert result["unsloth/Qwen3.6-27B"].n_ctx == 32768
+    assert len(result["unsloth/Qwen3.6-27B"].backends) == 1
+    print("PASS: test_discover_models_includes_lcp_synthetics")
+
+
 # ── Per-backend cache_dir tests ───────────────────────────────────────
 
 def test_backend_cache_dir_per_backend():
@@ -2881,6 +2989,15 @@ if __name__ == "__main__":
     test_discover_models_router_loaded_info_n_ctx()
     test_discover_models_non_router_meta_null()
     test_discover_models_both_endpoints_fail()
+
+    # ── Synthetic LCP model tests ──────────────────────────────────────
+
+    test_generate_lcp_models_basic()
+    test_generate_lcp_models_filters_provider_only()
+    test_generate_lcp_models_strips_trailing_separators()
+    test_generate_lcp_models_single_model()
+    test_generate_lcp_models_underscore_separator()
+    test_discover_models_includes_lcp_synthetics()
 
     # ── Model resolution tests ─────────────────────────────────────────
 
