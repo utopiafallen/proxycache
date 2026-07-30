@@ -64,6 +64,41 @@ python test_smoke.py                           # smoke tests (no framework, uses
 - **test_smoke.py**: some tests reference backend keys with colons (e.g. `"10.0.0.1:8000"`) instead of the sanitized form (`"10.0.0.1-8000"`). Tests that manually construct `BackendManager` instances may assert against the wrong key format — verify against `sanitize_backend_dir()` output.
 - `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, `run-proxycache.ps1`, `uv.lock`, and `cache-agent.exe`.
 
+## Commits
+
+All commits must follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+```
+
+**Types**: `feat`, `fix`, `refactor`, `perf`, `chore`, `docs`, `test`
+
+**Requirements**:
+- The subject line must be detailed enough to understand **what changed** and **why** without reading the diff.
+- A body is **required** for every commit — explain the reasoning, trade-offs, or context.
+- Scope should be the file or component affected (e.g., `slot_manager`, `hashing`, `metrics`).
+
+**Examples**:
+```
+fix(slot_manager): skip restore when KV cache LCP ratio exceeds threshold
+
+Restoring to a slot with nearly-identical KV cache is wasteful. Added
+LCP comparison against _slot_kv_state before restore, skipping when
+ratio >= KV_CACHE_SKIP_THRESHOLD (0.9). Only safe on single-slot
+backends where the slot is dedicated to one request at a time.
+```
+
+```
+refactor(hashing): extract backend key sanitization to dedicated function
+
+Colon-to-dash replacement was inline in multiple places. Centralized
+into sanitize_backend_dir() to ensure consistency across meta I/O,
+cache agent client, and test fixtures.
+```
+
 ## Writing Skills
 
 When creating or updating skills under `.opencode/skills/`, follow these guidelines:
