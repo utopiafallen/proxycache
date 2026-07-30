@@ -234,6 +234,27 @@ class BackendManager:
 
     # --- Model discovery ---
 
+    def _generate_lcp_models(self, model_names: list[str]) -> list[str]:
+        """Generate synthetic LCP model names from pairwise longest common prefixes.
+
+        Filters out prefixes that are too generic (fewer than 2 /-separated components)
+        and strips trailing - or _.
+        """
+        if len(model_names) < 2:
+            return []
+        lcp_set: set[str] = set()
+        for i in range(len(model_names)):
+            for j in range(i + 1, len(model_names)):
+                a, b = model_names[i], model_names[j]
+                k = 0
+                while k < len(a) and k < len(b) and a[k] == b[k]:
+                    k += 1
+                if k > 0:
+                    prefix = a[:k].rstrip("-_")
+                    if prefix.count("/") >= 1:
+                        lcp_set.add(prefix)
+        return sorted(lcp_set)
+
     async def discover_models(self) -> dict[str, DiscoveredModel]:
         """Discover models across all backends. Returns merged registry.
         Always performs fresh discovery. Result stored in _discovered_models.
@@ -269,6 +290,25 @@ class BackendManager:
                 total_slots=0,
                 last_discovered=time.time(),
             )
+
+        # Add synthetic LCP models
+        for lcp_name in self._generate_lcp_models(list(all_discovered.keys())):
+            matching = [m for m in merged if lcp_name.lower() in m.lower()]
+            if len(matching) >= 2:
+                lcp_backends = sorted(set(be for m in matching for be in merged[m].backends))
+                lcp_backend_n_ctx = {}
+                for m in matching:
+                    lcp_backend_n_ctx.update(merged[m].backend_n_ctx)
+                lcp_n_ctx = min(merged[m].n_ctx for m in matching)
+                merged[lcp_name] = DiscoveredModel(
+                    name=lcp_name, n_ctx=lcp_n_ctx, backends=lcp_backends,
+                    backend_n_ctx=lcp_backend_n_ctx,
+                    total_slots=0,
+                    last_discovered=time.time(),
+                )
+                log.info("Synthetic LCP model '%s' matches %d models on backends %s",
+                         lcp_name, len(matching), lcp_backends)
+
         self._discovered_models = merged
         for name, info in merged.items():
             log.info("Discovered model '%s' on backends %s with n_ctx=%d",
