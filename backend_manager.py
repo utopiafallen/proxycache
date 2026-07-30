@@ -238,16 +238,18 @@ class BackendManager:
     def _generate_lcp_models(self, model_names: list[str]) -> list[str]:
         """Generate synthetic model aliases from chunk-level prefixes.
 
-        Splits each model name by - and _, takes all prefix combinations of 1..N-1
-        chunks, and keeps those that substring-match >= 2 models and contain at
-        least one / (provider + model name).
+        Strips the provider prefix (everything up to and including the first /),
+        then splits by - and _. Takes all prefix combinations of 1..N-1 chunks.
+        Keeps those that substring-match >= 2 models.
         """
         if len(model_names) < 2:
             return []
         import re
         prefix_models: dict[str, set[str]] = {}
         for name in model_names:
-            pieces = [p for p in re.split(r'([-_])', name) if p]
+            slash = name.find("/")
+            model_part = name[slash + 1:] if slash >= 0 else name
+            pieces = [p for p in re.split(r'([-_])', model_part) if p]
             for n in range(1, len(pieces)):
                 prefix = "".join(pieces[:n]).rstrip("-_")
                 if prefix not in prefix_models:
@@ -255,7 +257,7 @@ class BackendManager:
                 prefix_models[prefix].add(name)
         result = []
         for prefix, models in prefix_models.items():
-            if len(models) >= 2 and prefix.count("/") >= 1:
+            if len(models) >= 2:
                 result.append(prefix)
         return sorted(result)
 

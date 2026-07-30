@@ -1317,13 +1317,14 @@ def test_generate_lcp_models_basic():
         "unsloth/Qwen3.6-27B-GGUF:Q5_K_S",
     ]
     result = bm._generate_lcp_models(names)
-    assert "unsloth/Qwen3.6" in result, f"Expected 'unsloth/Qwen3.6' in {result}"
-    assert "unsloth/Qwen3.6-27B" in result, f"Expected 'unsloth/Qwen3.6-27B' in {result}"
+    assert "Qwen3.6" in result, f"Expected 'Qwen3.6' in {result}"
+    assert "Qwen3.6-27B" in result, f"Expected 'Qwen3.6-27B' in {result}"
+    assert not any("/" in p for p in result), f"Prefixes should not contain /, got {result}"
     print("PASS: test_generate_lcp_models_basic")
 
 
-def test_generate_lcp_models_filters_provider_only():
-    """LCP should filter out prefixes that are just the provider name."""
+def test_generate_lcp_models_strips_provider():
+    """LCP should strip the provider prefix entirely."""
     from backend_manager import BackendManager
 
     bm = BackendManager([{"url": "http://10.0.0.1:8000", "cache_dir": "/tmp/cache"}])
@@ -1332,10 +1333,8 @@ def test_generate_lcp_models_filters_provider_only():
         "unsloth/Llama-3.1-8B-GGUF:Q4_K_M",
     ]
     result = bm._generate_lcp_models(names)
-    for prefix in result:
-        assert prefix != "unsloth", f"Provider-only prefix 'unsloth' should be filtered, got {result}"
-    assert "unsloth" not in result, f"Provider-only prefix should be filtered, got {result}"
-    print("PASS: test_generate_lcp_models_filters_provider_only")
+    assert not any("unsloth" in p for p in result), f"Provider prefix should be stripped, got {result}"
+    print("PASS: test_generate_lcp_models_strips_provider")
 
 
 def test_generate_lcp_models_strips_trailing_separators():
@@ -1374,8 +1373,8 @@ def test_generate_lcp_models_underscore_separator():
         "unsloth/Qwen3.6_27B-GGUF:Q5_K_S",
     ]
     result = bm._generate_lcp_models(names)
-    assert "unsloth/Qwen3.6" in result, f"Expected 'unsloth/Qwen3.6' in {result}"
-    assert "unsloth/Qwen3.6_27B" in result, f"Expected 'unsloth/Qwen3.6_27B' in {result}"
+    assert "Qwen3.6" in result, f"Expected 'Qwen3.6' in {result}"
+    assert "Qwen3.6_27B" in result, f"Expected 'Qwen3.6_27B' in {result}"
     print("PASS: test_generate_lcp_models_underscore_separator")
 
 
@@ -1406,10 +1405,10 @@ def test_discover_models_includes_lcp_synthetics():
     result = asyncio.run(_run())
     assert "unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K" in result
     assert "unsloth/Qwen3.6-27B-GGUF:Q5_K_S" in result
-    assert "unsloth/Qwen3.6" in result, f"Expected synthetic 'unsloth/Qwen3.6' in {list(result.keys())}"
-    assert "unsloth/Qwen3.6-27B" in result, f"Expected synthetic 'unsloth/Qwen3.6-27B' in {list(result.keys())}"
-    assert result["unsloth/Qwen3.6-27B"].n_ctx == 32768
-    assert len(result["unsloth/Qwen3.6-27B"].backends) == 1
+    assert "Qwen3.6" in result, f"Expected synthetic 'Qwen3.6' in {list(result.keys())}"
+    assert "Qwen3.6-27B" in result, f"Expected synthetic 'Qwen3.6-27B' in {list(result.keys())}"
+    assert result["Qwen3.6-27B"].n_ctx == 32768
+    assert len(result["Qwen3.6-27B"].backends) == 1
     print("PASS: test_discover_models_includes_lcp_synthetics")
 
 
@@ -2993,7 +2992,7 @@ if __name__ == "__main__":
     # ── Synthetic LCP model tests ──────────────────────────────────────
 
     test_generate_lcp_models_basic()
-    test_generate_lcp_models_filters_provider_only()
+    test_generate_lcp_models_strips_provider()
     test_generate_lcp_models_strips_trailing_separators()
     test_generate_lcp_models_single_model()
     test_generate_lcp_models_underscore_separator()
