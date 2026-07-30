@@ -35,6 +35,7 @@ class DiscoveredModel:
     backend_n_ctx: dict[str, int]
     total_slots: int
     last_discovered: float
+    synthetic: bool = False
 
 
 @dataclass
@@ -308,6 +309,7 @@ class BackendManager:
                     backend_n_ctx=lcp_backend_n_ctx,
                     total_slots=0,
                     last_discovered=time.time(),
+                    synthetic=True,
                 )
                 log.info("Synthetic LCP model '%s' matches %d models on backends %s",
                          lcp_name, len(matching), lcp_backends)

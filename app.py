@@ -119,7 +119,7 @@ async def models():
     discovered = backend_manager._discovered_models
     models_list = []
     for name, info in discovered.items():
-        models_list.append({"id": name, "object": "model", "owned_by": "backend", "n_ctx": info.n_ctx})
+        models_list.append({"id": name, "object": "model", "owned_by": "synthetic" if info.synthetic else "backend", "n_ctx": info.n_ctx})
     min_ctx = min(m.n_ctx for m in discovered.values()) if discovered else DEFAULT_N_CTX
     models_list.append({"id": "any", "object": "model", "owned_by": "proxycache", "n_ctx": min_ctx})
     return {"data": models_list}
@@ -1331,7 +1331,7 @@ def _get_backend_health() -> dict:
             "models": {},
         }
         for model_name, model_info in backend_manager._discovered_models.items():
-            if key not in model_info.backends:
+            if model_info.synthetic or key not in model_info.backends:
                 continue
             in_use = 0
             total_slots = 0
