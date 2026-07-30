@@ -15,13 +15,13 @@ proxycache sits between clients and one or more `llama.cpp` backends. It interce
 
 - **Model discovery** — automatically discovers models served by each backend via `GET /models` (router mode) or `GET /v1/models` (non-router). A liveness checker pings backends every 5s and triggers discovery on state changes.
 
-- **Name resolution** — resolves client model names (e.g. "qwen3.6-32b") to canonical names discovered from backends. Exact match first, then case-insensitive substring match. The special name "any" matches all discovered models. Using a more generic name (e.g. "qwen3.6") matches multiple canonical models and distributes requests across all backends that serve them.
+- **Name resolution** — resolves client model names (e.g. "qwen3.6-32b") to canonical names discovered from backends. Exact match first, then case-insensitive substring match. The special name "any" matches all discovered models. In addition, chunk-level prefix aliases are auto-generated from pairwise model names (e.g. `unsloth/Qwen3.6-27B` matches both `unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K` and `unsloth/Qwen3.6-27B-GGUF:Q5_K_S`). Prefixes shorter than `provider/model` (fewer than 1 `/`) are filtered out. Using a more generic name (e.g. "qwen3.6") matches multiple canonical models and distributes requests across all backends that serve them.
 
 - **Cache-first routing** — when multiple backends serve the same model, requests are routed to the backend that holds the matching cache file. The proxy also scans in-flight (pending) slots for matches during the save window, allowing subsequent requests to reuse slots before the cache is persisted. If the preferred backend's slots are busy, the proxy falls back to other backends. For cache-miss requests (no matching cache file), fallback backends are sorted by a composite score: cache ratio (lowest first, to minimize redundant cache), ring buffer size (fewest entries first, to spread cache and reduce eviction pressure), average request latency (fastest first, learned via EMA), then LRU (least recently used first, to distribute load). Routing diagnostics capture the full per-backend scan trace for post-hoc analysis.
 
 - **Slot management** — per-model, per-backend slot pools with lazy discovery. Free slots are preferred; when none are available, the least-recently-used slot is reclaimed. The proxy tracks per-backend last-used time and average request latency (EMA) for fallback sorting on cache-miss requests. For cache-hit requests whose backend is busy, the proxy polls every 5s (up to an EMA-derived timeout, limited concurrency) before falling back. Slots with existing KV cache that already matches the incoming prompt skip restore entirely.
 
-- **Cache lifecycle** — KV state is saved to disk after a response completes, but only when the new state is worth persisting: skipped for cancelled streams, and skipped when the serving backend's cache ratio >= threshold with no recompute. Recompute is detected by comparing llama.cpp's `cached_tokens` against request length, covering both disk cache restores and pending slot hits. A per-backend ring buffer evicts expired entries (age-first) then LRU when cache exceeds the configured size. Orphaned/corrupted metadata is reconciled on startup.
+- **Cache lifecycle** — KV state is saved to disk after a response completes, but only when the new state is worth persisting: skipped for cancelled streams, skipped when the serving backend's cache ratio >= threshold with no recompute, skipped when request tokens exceed `CACHE_SAVE_CTX_THRESHOLD` of the backend's max context (impending compaction), and skipped for single-user-message requests (likely one-off summarization). Recompute is detected by comparing llama.cpp's `cached_tokens` against request length, covering both disk cache restores and pending slot hits. A per-backend ring buffer evicts expired entries (age-first) then LRU when cache exceeds the configured size. Orphaned/corrupted metadata is reconciled on startup.
 
 ### Request flow
 
@@ -50,6 +50,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `LCP_TH` | `0.2` | LCP similarity threshold for cache match (0–1) |
 | `KV_CACHE_SKIP_THRESHOLD` | `0.9` | Skip restore if slot KV cache matches >= this ratio |
 | `CACHE_SAVE_RATIO_THRESHOLD` | `0.8` | Skip cache save if restore ratio >= this (avoids overwriting good cache) |
+| `CACHE_SAVE_CTX_THRESHOLD` | `0.7` | Skip cache save if request tokens >= this fraction of backend's max context (avoids saving cache that will be invalidated by compaction) |
 | `SLOT_TIMEOUT` | `30` | Timeout for slot save/restore operations (seconds) |
 | `REQUEST_TIMEOUT` | `600` | HTTP timeout to backend (seconds) |
 | `CLIENT_RECREATE_INTERVAL` | `50` | Recreate the httpx client after this many requests per backend to avoid stale connections |
@@ -69,7 +70,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | Main chat endpoint (proxied to backend) |
-| `GET` | `/v1/models` | Returns discovered models with `n_ctx`, plus `"any"` option |
+| `GET` | `/v1/models` | Returns discovered models with `n_ctx`, auto-generated chunk-level prefix aliases, plus `"any"` option |
 | `GET` | `/metrics/summary` | Full metrics summary (backends, slots, cache, performance, requests) |
 | `GET` | `/metrics/health` | Backend health: up/down, model info, slot counts |
 | `GET` | `/metrics/slots` | Per-slot state: in_use, last_used, KV block count |
