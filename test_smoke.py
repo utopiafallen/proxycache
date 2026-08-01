@@ -1858,7 +1858,7 @@ def test_no_cache_fallback_lru():
 
 
 def test_no_cache_lru_backend_routing():
-    """Cache-miss routing uses composite sort: cache ratio (lowest), ring size (fewest), latency (fastest), LRU (least recent)."""
+    """Cache-miss routing uses composite sort: cache ratio (lowest), LRU (least recent), ring size (fewest), latency (fastest)."""
     from slot_manager import SlotManager
     from backend_manager import backend_manager
     import time
@@ -1866,9 +1866,9 @@ def test_no_cache_lru_backend_routing():
     sm = SlotManager()
 
     # Backend state:
-    #   be1: ratio=0.0, ring=5, latency=200ms, last_used=recent
-    #   be2: ratio=0.0, ring=5, latency=50ms,  last_used=old
-    #   be3: ratio=0.8, ring=1, latency=100ms, last_used=never
+    #   be1: ratio=0.0, last_used=recent, ring=5, latency=200ms
+    #   be2: ratio=0.0, last_used=old,    ring=5, latency=50ms
+    #   be3: ratio=0.8, last_used=never,  ring=1, latency=100ms
     now = time.time()
     backend_manager._backend_last_used["10.0.0.1:8000"] = now
     backend_manager._backend_last_used["10.0.0.2:8000"] = now - 1000
@@ -1894,18 +1894,18 @@ def test_no_cache_lru_backend_routing():
     candidate_backends.sort(
         key=lambda cb: (
             backend_cache_ratios.get(cb[0], 0.0),
+            backend_manager.get_backend_last_used(cb[0]),
             len(sm.get(cb[0])._cache_ring),
             backend_manager.get_backend_latency_ema(cb[0]),
-            backend_manager.get_backend_last_used(cb[0]),
         ),
     )
 
-    # Expected order:
-    # 1. be2 (ratio=0.0, ring=5, latency=50ms, last_used=old) — fastest of equal-ratio backends
-    # 2. be1 (ratio=0.0, ring=5, latency=200ms, last_used=recent) — slower of equal-ratio backends
-    # 3. be3 (ratio=0.8, ring=1, latency=100ms, last_used=0.0) — high ratio, always last
-    assert candidate_backends[0][0] == "10.0.0.2:8000", f"Expected be2 first (fastest), got {candidate_backends[0][0]}"
-    assert candidate_backends[1][0] == "10.0.0.1:8000", f"Expected be1 second (slower), got {candidate_backends[1][0]}"
+    # Expected order (cache_ratio primary, last_used as tiebreaker):
+    # 1. be2 (ratio=0.0, last_used=old) — same ratio as be1 but less recently used
+    # 2. be1 (ratio=0.0, last_used=recent) — same ratio as be2 but more recently used
+    # 3. be3 (ratio=0.8) — high ratio, always last
+    assert candidate_backends[0][0] == "10.0.0.2:8000", f"Expected be2 first (low ratio, older), got {candidate_backends[0][0]}"
+    assert candidate_backends[1][0] == "10.0.0.1:8000", f"Expected be1 second (low ratio, recent), got {candidate_backends[1][0]}"
     assert candidate_backends[2][0] == "10.0.0.3:8000", f"Expected be3 last (high ratio), got {candidate_backends[2][0]}"
 
     # Verify latency EMA tracking
