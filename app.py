@@ -247,10 +247,9 @@ async def _acquire_slot_for_request(
             "[diag] _try_cache_backend: slot %d, old_kv blocks=%d, cache_blocks=%d",
             slot_id, len(old_kv) if old_kv else 0, len(cache_blocks) if cache_blocks else 0,
         )
-        # Set KV state: use request blocks for disk restore, preserve existing for pending hit
-        if cache_blocks:
-            be_sm.set_kv_state(slot_id, cache_blocks)
-        # For pending slot hit (cache_blocks is None), keep existing KV state intact
+        # Set KV state: always update on acquire so subsequent pending scans see current state
+        acquire_blocks = backend_blocks.get(restore_backend)
+        be_sm.set_kv_state(slot_id, acquire_blocks if acquire_blocks else [])
         restored = await _do_restore_call(be_sm, slot_id, restore_key, cache_blocks, old_kv)
         backend_manager.touch_backend(restore_backend)
         return (canonical_name, restore_backend, slot_id), restored, skip_restore_diag, old_kv
