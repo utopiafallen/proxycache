@@ -13,12 +13,14 @@ e.g. "http://10.0.0.1:8000" -> "10.0.0.1:8000"
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import BACKENDS, DEFAULT_N_CTX, CACHE_HIT_WAIT_EMA_ALPHA
+from config import BACKENDS, DEFAULT_N_CTX, CACHE_HIT_WAIT_EMA_ALPHA, META_DIR
 from llama_client import LlamaClient
 from cache_agent_client import CacheAgentClient
 from hashing import sanitize_backend_dir
@@ -96,6 +98,9 @@ class BackendManager:
         log.info("Backend manager initialized with %d backends: %s",
                  len(self._backends), list(self._backends.keys()))
 
+        # Load persisted latency data
+        self._load_latency_data()
+
     # --- Accessors ---
 
     def get_client(self, key: str) -> LlamaClient:
@@ -144,6 +149,7 @@ class BackendManager:
         """Update the EMA latency for a backend."""
         old = self._backend_latency_ema.get(backend_id, latency_ms)
         self._backend_latency_ema[backend_id] = CACHE_HIT_WAIT_EMA_ALPHA * latency_ms + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * old
+        self._save_latency_data(backend_id)
 
     def get_backend_latency_ema(self, backend_id: str) -> float:
         """Return the EMA latency for a backend."""
@@ -154,6 +160,7 @@ class BackendManager:
         key = (backend_id, model_name, req_type)
         old = self._backend_model_latency_ema.get(key, latency_ms)
         self._backend_model_latency_ema[key] = CACHE_HIT_WAIT_EMA_ALPHA * latency_ms + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * old
+        self._save_latency_data(backend_id)
 
     def get_backend_model_latency_ema(self, backend_id: str, model_name: str, req_type: str) -> float:
         """Return the EMA latency for a backend-model-type pair.
@@ -165,6 +172,52 @@ class BackendManager:
         if key in self._backend_model_latency_ema:
             return self._backend_model_latency_ema[key]
         return self._backend_latency_ema.get(backend_id, 0.0)
+
+    def _perf_file(self, backend_id: str) -> str:
+        """Path to a backend's persisted latency data file."""
+        be_dir = os.path.join(META_DIR, sanitize_backend_dir(backend_id))
+        return os.path.join(be_dir, "backend_perf.json")
+
+    def _load_latency_data(self):
+        """Load persisted latency data from disk for all backends."""
+        for backend_id in self._backends:
+            perf_file = self._perf_file(backend_id)
+            if not os.path.isfile(perf_file):
+                continue
+            try:
+                with open(perf_file) as f:
+                    data = json.load(f)
+                if backend_id in data.get("latency_ema", {}):
+                    self._backend_latency_ema[backend_id] = data["latency_ema"][backend_id]
+                for key_str, value in data.get("model_latency_ema", {}).items():
+                    parts = key_str.split("|")
+                    if len(parts) == 3:
+                        self._backend_model_latency_ema[tuple(parts)] = value
+                log.info("Loaded latency data for backend '%s': ema=%.0fms, %d model-type entries",
+                         backend_id, self._backend_latency_ema.get(backend_id, 0),
+                         len(self._backend_model_latency_ema))
+            except (json.JSONDecodeError, OSError, KeyError) as e:
+                log.warning("Failed to load latency data for backend '%s': %s", backend_id, e)
+
+    def _save_latency_data(self, backend_id: str):
+        """Persist latency data for a backend to disk."""
+        perf_file = self._perf_file(backend_id)
+        be_dir = os.path.dirname(perf_file)
+        os.makedirs(be_dir, exist_ok=True)
+        # Collect model latency entries for this backend only
+        # Serialize tuple keys as "backend|model|type" strings for JSON compatibility
+        model_ema = {"|".join(k): v for k, v in self._backend_model_latency_ema.items() if k[0] == backend_id}
+        data = {
+            "latency_ema": {backend_id: self._backend_latency_ema.get(backend_id, 0.0)},
+            "model_latency_ema": model_ema,
+        }
+        try:
+            tmp_file = perf_file + ".tmp"
+            with open(tmp_file, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_file, perf_file)
+        except OSError as e:
+            log.warning("Failed to save latency data for backend '%s': %s", backend_id, e)
 
     async def cache_delete(self, backend_id: str, key: str) -> bool:
         """Delete a cache file via agent or local filesystem."""
