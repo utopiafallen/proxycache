@@ -96,7 +96,7 @@ def should_save_cache(best_ratio: float, recompute_happened: bool) -> bool:
 
 # Strong summarization keywords — imperative/action-oriented, low false positive rate
 _SUMMARIZATION_KEYWORDS_STRONG = {
-    "summarize", "summarise", "tl;dr", "tl; dr", "condense",
+    "summarize", "summarise", "summarization", "tl;dr", "tl; dr", "condense",
     "give me a summary", "sum it up", "wrap up", "recap",
     "in short",
 }
