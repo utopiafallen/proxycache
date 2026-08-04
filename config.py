@@ -65,19 +65,18 @@ CACHE_SAVE_RATIO_THRESHOLD = float(os.getenv("CACHE_SAVE_RATIO_THRESHOLD", "0.8"
 CACHE_SAVE_CTX_THRESHOLD = float(os.getenv("CACHE_SAVE_CTX_THRESHOLD", "0.7"))
 
 
-def should_skip_save_heuristic(prompt_tokens: int, n_ctx: int, messages: list = None) -> bool:
+def should_skip_save_heuristic(prompt_tokens: int, n_ctx: int, messages: list = None, request_json: dict = None) -> bool:
     """Skip save for requests unlikely to produce reusable cache entries.
 
     Returns True (skip) when:
     - Request is >= CACHE_SAVE_CTX_THRESHOLD of backend's max context (impending compaction)
-    - Request is a single user message (likely a one-off summarization, not conversation start)
-      (only checked when messages is provided)
+    - Request is classified as summarization (one-off content, won't be reused)
     """
     if n_ctx > 0 and isinstance(prompt_tokens, int) and prompt_tokens / n_ctx >= CACHE_SAVE_CTX_THRESHOLD:
         return True
     if messages is not None:
-        roles = [m.get("role") for m in messages]
-        if roles.count("user") <= 1 and roles.count("assistant") == 0:
+        req_class = classify_request(messages, request_json)
+        if req_class["score"] >= 0.4:
             return True
     return False
 

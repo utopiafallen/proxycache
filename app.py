@@ -337,7 +337,8 @@ class StreamReader:
                  restore_key: Optional[str] = None, restore_backend: Optional[str] = None,
                  t0: float = 0, request_json: Optional[Dict] = None,
                  request_id: Optional[str] = None, routing_reason: str = "cache_miss",
-                 backend_cache_ratios: Optional[Dict[str, float]] = None):
+                 backend_cache_ratios: Optional[Dict[str, float]] = None,
+                 summarization_score: float = 0.0):
         self.resp = resp
         self.req = req
         self.model_name = model_name
@@ -366,6 +367,7 @@ class StreamReader:
         self._sse_line_buffer: str = ""
         self._sse_prompt_tokens: int = 0
         self._sse_cached_tokens: int = 0
+        self._summarization_score = summarization_score
         self.key_short = key[:16]
 
     def _log_response_info(self):
@@ -553,7 +555,7 @@ class StreamReader:
                     kv_meta.increment_recompute_penalty(self.restore_key, self.restore_backend)
 
         serving_be_ratio = self._backend_cache_ratios.get(self.backend_id, 0.0)
-        if should_skip_save_heuristic(self.n_tokens, backend_manager.get_backend_n_ctx(self.model_name, self.backend_id), self._request_json.get("messages") if self._request_json else None):
+        if should_skip_save_heuristic(self.n_tokens, backend_manager.get_backend_n_ctx(self.model_name, self.backend_id), self._request_json.get("messages") if self._request_json else None, self._request_json):
             log.info(
                 "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): heuristic skip",
                 self.model_name, self.backend_id, self.slot_id, self.key_short,
@@ -667,6 +669,8 @@ class StreamReader:
                 "status": stream_status,
             })
             backend_manager.update_backend_latency(self.backend_id, latency_ms)
+            req_type = "summarization" if self._summarization_score >= 0.4 else "conversation"
+            backend_manager.update_backend_model_latency(self.backend_id, self.model_name, latency_ms, req_type)
 
         log.info("Stream reader finished for model '%s' on backend '%s' slot %d (key %s): saved=%s",
                   self.model_name, self.backend_id, self.slot_id, self.key_short, ok)
@@ -882,7 +886,7 @@ async def chat(req: Request):
                     be_sm = sm.get(be_id)
                     pending_ratios: List[Dict[str, Any]] = []
                     for slot_id, kv_blocks in be_sm.get_kv_states().items():
-                        if len(opt_blocks) < len(kv_blocks):
+                        if abs(len(opt_blocks) - len(kv_blocks)) > 1:
                             pending_ratios.append({"slot": slot_id, "lcp_blocks": 0,
                                                   "slot_blocks": len(kv_blocks), "ratio": 0.0})
                             continue
@@ -930,7 +934,9 @@ async def chat(req: Request):
                 backend_cache_ratios.get(cb[0], 0.0),
                 backend_manager.get_backend_last_used(cb[0]),
                 sm.get(cb[0]).get_ring_size(),
-                backend_manager.get_backend_latency_ema(cb[0]),
+                backend_manager.get_backend_model_latency_ema(
+                    cb[0], cb[1],
+                    "summarization" if req_class["score"] >= 0.4 else "conversation"),
             ),
         )
 
@@ -1051,12 +1057,13 @@ async def chat(req: Request):
                 )
 
             reader = StreamReader(resp, req, model_name, be_id, slot_id,
-                                   key, prompt_tokens, blocks, sm, best_ratio,
-                                   hit_type=hit_type,
-                                   restore_key=restore_key, restore_backend=restore_backend,
-                                   t0=t0, request_json=request_json,
-                                   request_id=request_id, routing_reason=routing_reason,
-                                   backend_cache_ratios=backend_cache_ratios)
+                                    key, prompt_tokens, blocks, sm, best_ratio,
+                                    hit_type=hit_type,
+                                    restore_key=restore_key, restore_backend=restore_backend,
+                                    t0=t0, request_json=request_json,
+                                    request_id=request_id, routing_reason=routing_reason,
+                                    backend_cache_ratios=backend_cache_ratios,
+                                    summarization_score=req_class["score"])
             gen = reader.stream()
             _reader_created = True
 
@@ -1125,7 +1132,7 @@ async def chat(req: Request):
             save_ok = False
             cache_size = 0
             serving_be_ratio = backend_cache_ratios.get(be_id, 0.0)
-            if should_skip_save_heuristic(prompt_tokens, backend_manager.get_backend_n_ctx(model_name, be_id), request_json.get("messages") if request_json else None):
+            if should_skip_save_heuristic(prompt_tokens, backend_manager.get_backend_n_ctx(model_name, be_id), request_json.get("messages") if request_json else None, request_json):
                 be_sm.mark_save_skipped(slot_id,
                                         (key, blocks, prompt_tokens, hit_type, serving_be_ratio, recompute_happened))
             elif should_save_cache(serving_be_ratio, recompute_happened):
@@ -1167,6 +1174,8 @@ async def chat(req: Request):
                 "status": "complete",
             })
             backend_manager.update_backend_latency(be_id, latency_ms)
+            req_type = "summarization" if req_class["score"] >= 0.4 else "conversation"
+            backend_manager.update_backend_model_latency(be_id, model_name, latency_ms, req_type)
 
             return JSONResponse(content=out, status_code=200)
 

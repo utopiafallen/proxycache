@@ -64,6 +64,7 @@ class BackendManager:
         self._backend_state: dict[str, bool] = {}
         self._backend_last_used: dict[str, float] = {}
         self._backend_latency_ema: dict[str, float] = {}
+        self._backend_model_latency_ema: dict[tuple[str, str, str], float] = {}
         self._discovery_task: asyncio.Task | None = None
         self._last_discover_timing: List[Dict[str, Any]] = []
 
@@ -146,6 +147,23 @@ class BackendManager:
 
     def get_backend_latency_ema(self, backend_id: str) -> float:
         """Return the EMA latency for a backend."""
+        return self._backend_latency_ema.get(backend_id, 0.0)
+
+    def update_backend_model_latency(self, backend_id: str, model_name: str, latency_ms: float, req_type: str):
+        """Update the EMA latency for a backend-model-type pair."""
+        key = (backend_id, model_name, req_type)
+        old = self._backend_model_latency_ema.get(key, latency_ms)
+        self._backend_model_latency_ema[key] = CACHE_HIT_WAIT_EMA_ALPHA * latency_ms + (1 - CACHE_HIT_WAIT_EMA_ALPHA) * old
+
+    def get_backend_model_latency_ema(self, backend_id: str, model_name: str, req_type: str) -> float:
+        """Return the EMA latency for a backend-model-type pair.
+
+        Falls back to per-backend EMA if no type-specific data exists,
+        then to 0.0 if no backend data exists either.
+        """
+        key = (backend_id, model_name, req_type)
+        if key in self._backend_model_latency_ema:
+            return self._backend_model_latency_ema[key]
         return self._backend_latency_ema.get(backend_id, 0.0)
 
     async def cache_delete(self, backend_id: str, key: str) -> bool:
