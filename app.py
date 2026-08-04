@@ -1258,18 +1258,26 @@ async def metrics_dashboard():
             bp["conversation"] = bp_conv if bp_conv.get("total_requests", 0) > 0 else None
             backend_perf[be_id] = bp
 
-    # Per backend-model performance
+    # Per backend-model performance — extract unique (backend, model) pairs from
+    # request records, since metrics stores canonical model names (e.g. "Qwen3.6")
+    # while backends health uses full GGUF names.
     backend_model_perf = {}
     for be_id in summary["backends"]:
         backend_model_perf[be_id] = {}
-        for model_name, model_info in (summary["backends"][be_id].get("models") or {}).items():
-            bp = metrics.get_performance(backend=be_id, model=model_name)
-            if bp.get("total_requests", 0) > 0:
-                bp_sum = metrics.get_performance(backend=be_id, model=model_name, req_type="summarization")
-                bp_conv = metrics.get_performance(backend=be_id, model=model_name, req_type="conversation")
-                bp["summarization"] = bp_sum if bp_sum.get("total_requests", 0) > 0 else None
-                bp["conversation"] = bp_conv if bp_conv.get("total_requests", 0) > 0 else None
-                backend_model_perf[be_id][model_name] = bp
+    model_pairs = set()
+    for req in metrics.get_requests(limit=metrics._retention):
+        if req.get("status") == "complete":
+            model_pairs.add((req.get("backend", ""), req.get("model", "")))
+    for be_id, model_name in model_pairs:
+        if be_id not in backend_model_perf:
+            continue
+        bp = metrics.get_performance(backend=be_id, model=model_name)
+        if bp.get("total_requests", 0) > 0:
+            bp_sum = metrics.get_performance(backend=be_id, model=model_name, req_type="summarization")
+            bp_conv = metrics.get_performance(backend=be_id, model=model_name, req_type="conversation")
+            bp["summarization"] = bp_sum if bp_sum.get("total_requests", 0) > 0 else None
+            bp["conversation"] = bp_conv if bp_conv.get("total_requests", 0) > 0 else None
+            backend_model_perf[be_id][model_name] = bp
     summary["backend_model_performance"] = backend_model_perf
     return summary
 
