@@ -94,18 +94,34 @@ def should_save_cache(best_ratio: float, recompute_happened: bool) -> bool:
     return recompute_happened or best_ratio <= CACHE_SAVE_RATIO_THRESHOLD
 
 
-# Strong summarization keywords — imperative/action-oriented, low false positive rate
-_SUMMARIZATION_KEYWORDS_STRONG = {
-    "summarize", "summarise", "summarization", "tl;dr", "tl; dr", "condense",
-    "give me a summary", "sum it up", "wrap up", "recap",
-    "in short",
-}
+# Compiled regex patterns for keyword matching — handles inflections, s/z spellings.
+# Each tuple: (compiled_pattern, weight, label_for_signals)
+# Strong: imperative/action-oriented, low false positive rate (0.30)
+# Weak: common nouns/verbs that appear in non-summarization context (0.15)
+import re
 
-# Weak summarization keywords — common nouns/verbs that appear in non-summarization context
-_SUMMARIZATION_KEYWORDS_WEAK = {
-    "summary", "key points", "bullet points", "overview", "abstract",
-    "digest", "extract", "highlights", "main points", "brief",
-}
+_SUMMARIZATION_PATTERNS = [
+    # Strong keywords (0.30) — [sz] handles summarize/summarise, summarization/summarisation
+    (re.compile(r'\bsummar[i][sz](e([dsw]|es?)?|[ed]|ing|e?ing|ation[es]?)?\b', re.IGNORECASE), 0.30, "summarize"),
+    (re.compile(r'\btl;?\s?dr\b', re.IGNORECASE), 0.30, "tl;dr"),
+    (re.compile(r'\bcondens(e|ed|ing|es|ation)\b', re.IGNORECASE), 0.30, "condense"),
+    (re.compile(r'\bgive\s+me\s+a\s+summar[i][sz](e([dsw]|es?)?|[ed]|ing|e?ing|ation[es]?)?\b', re.IGNORECASE), 0.30, "give me a summary"),
+    (re.compile(r'\bsum\s+it\s+up\b', re.IGNORECASE), 0.30, "sum it up"),
+    (re.compile(r'\bwrap\s+up\b', re.IGNORECASE), 0.30, "wrap up"),
+    (re.compile(r'\brecap\b', re.IGNORECASE), 0.30, "recap"),
+    (re.compile(r'\bin\s+short\b', re.IGNORECASE), 0.30, "in short"),
+    # Weak keywords (0.15)
+    (re.compile(r'\bsummar(ies|y)\b', re.IGNORECASE), 0.15, "summary"),
+    (re.compile(r'\bkey\s+points?\b', re.IGNORECASE), 0.15, "key points"),
+    (re.compile(r'\bbullet\s+points?\b', re.IGNORECASE), 0.15, "bullet points"),
+    (re.compile(r'\boverview\b', re.IGNORECASE), 0.15, "overview"),
+    (re.compile(r'\babstract\b', re.IGNORECASE), 0.15, "abstract"),
+    (re.compile(r'\bdigest\b', re.IGNORECASE), 0.15, "digest"),
+    (re.compile(r'\bextract\b', re.IGNORECASE), 0.15, "extract"),
+    (re.compile(r'\bhighlights?\b', re.IGNORECASE), 0.15, "highlights"),
+    (re.compile(r'\bmain\s+points?\b', re.IGNORECASE), 0.15, "main points"),
+    (re.compile(r'\bbrief\b', re.IGNORECASE), 0.15, "brief"),
+]
 
 # Patterns that suggest content is being pasted for processing
 _PASTE_PATTERNS = (
@@ -183,14 +199,12 @@ def classify_request(messages: list, request_json: dict = None) -> dict:
 
     def _strip_delimited(text):
         """Remove content inside XML-style delimiters to isolate the instruction."""
-        import re
         return re.sub(r'<[^>]*>.*?</[^>]*>', ' ', text, flags=re.DOTALL)
 
     def _extract_instruction(text):
         """Extract just the instruction part of a user message.
         Takes text before the first ':' followed by newline or whitespace+newline,
         capped at 100 chars."""
-        import re
         # Look for pattern like "instruction:\ncontent" or "instruction:  \ncontent"
         m = re.search(r':\s*\n', text)
         if m:
@@ -203,19 +217,13 @@ def classify_request(messages: list, request_json: dict = None) -> dict:
         text = _get_text(last_user)
         instruction = _strip_delimited(text)
         instruction = _extract_instruction(instruction)
-        for kw in _SUMMARIZATION_KEYWORDS_STRONG:
-            if kw in instruction:
-                score += 0.30
-                signals.append(f"keyword:{kw}")
+        # Check strong patterns first, then weak
+        for pattern, weight, label in _SUMMARIZATION_PATTERNS:
+            if pattern.search(instruction):
+                score += weight
+                signals.append(f"keyword:{label}")
                 keyword_found = True
                 break
-        if not keyword_found:
-            for kw in _SUMMARIZATION_KEYWORDS_WEAK:
-                if kw in instruction:
-                    score += 0.15
-                    signals.append(f"keyword:{kw}")
-                    keyword_found = True
-                    break
 
     # 3. One message dominates >70% of text (0.15)
     # Only meaningful with 2+ messages — for a single message the ratio is always
