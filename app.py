@@ -1243,8 +1243,25 @@ async def metrics_dashboard():
     for be_id in summary["backends"]:
         bp = metrics.get_performance(backend=be_id)
         if bp.get("total_requests", 0) > 0:
+            bp_sum = metrics.get_performance(backend=be_id, req_type="summarization")
+            bp_conv = metrics.get_performance(backend=be_id, req_type="conversation")
+            bp["summarization"] = bp_sum if bp_sum.get("total_requests", 0) > 0 else None
+            bp["conversation"] = bp_conv if bp_conv.get("total_requests", 0) > 0 else None
             backend_perf[be_id] = bp
-    summary["backend_performance"] = backend_perf
+
+    # Per backend-model performance
+    backend_model_perf = {}
+    for be_id in summary["backends"]:
+        backend_model_perf[be_id] = {}
+        for model_name, model_info in (summary["backends"][be_id].get("models") or {}).items():
+            bp = metrics.get_performance(backend=be_id, model=model_name)
+            if bp.get("total_requests", 0) > 0:
+                bp_sum = metrics.get_performance(backend=be_id, model=model_name, req_type="summarization")
+                bp_conv = metrics.get_performance(backend=be_id, model=model_name, req_type="conversation")
+                bp["summarization"] = bp_sum if bp_sum.get("total_requests", 0) > 0 else None
+                bp["conversation"] = bp_conv if bp_conv.get("total_requests", 0) > 0 else None
+                backend_model_perf[be_id][model_name] = bp
+    summary["backend_model_performance"] = backend_model_perf
     return summary
 
 

@@ -95,12 +95,17 @@ def should_save_cache(best_ratio: float, recompute_happened: bool) -> bool:
     return recompute_happened or best_ratio <= CACHE_SAVE_RATIO_THRESHOLD
 
 
-# Keywords that strongly indicate summarization intent
-_SUMMARIZATION_KEYWORDS = {
-    "summarize", "summarise", "summary", "tl;dr", "tl; dr", "key points",
-    "bullet points", "overview", "abstract", "digest", "condense",
-    "extract", "highlights", "main points", "brief", "in short",
+# Strong summarization keywords — imperative/action-oriented, low false positive rate
+_SUMMARIZATION_KEYWORDS_STRONG = {
+    "summarize", "summarise", "tl;dr", "tl; dr", "condense",
     "give me a summary", "sum it up", "wrap up", "recap",
+    "in short",
+}
+
+# Weak summarization keywords — common nouns/verbs that appear in non-summarization context
+_SUMMARIZATION_KEYWORDS_WEAK = {
+    "summary", "key points", "bullet points", "overview", "abstract",
+    "digest", "extract", "highlights", "main points", "brief",
 }
 
 # Patterns that suggest content is being pasted for processing
@@ -128,11 +133,14 @@ def classify_request(messages: list, request_json: dict = None) -> dict:
       - score: float 0..1 (higher = more likely summarization)
       - signals: list of str (which signals fired)
 
-    Heuristics (weights sum to ~1.0):
-      - Single user message, no assistant (0.30)
-      - Summarization keyword in final user/system message (0.25)
-      - One message dominates token count >70% (0.20)
-      - Prompt tokens > 4096 (0.10)
+    Threshold: 0.4
+
+    Heuristics:
+      - Strong summarization keyword in user instruction (0.30) — imperative: summarize, tl;dr, etc.
+      - Weak summarization keyword in user instruction (0.15) — noun: summary, key points, etc.
+      - Single user message, no assistant (0.10) — weak, every conversation starts this way
+      - One message dominates >70% of text (0.15) — only for 2+ messages, meaningless for single
+      - Prompt text > 8192 chars (~2048 tok) (0.10) — long content paste
       - Structural delimiters / paste markers present (0.05)
       - Content introduction phrases present (0.05)
       - System prompt present (-0.10, slight conversation bias)
@@ -160,62 +168,98 @@ def classify_request(messages: list, request_json: dict = None) -> dict:
                     return part.get("text", "").lower()
         return ""
 
-    # 1. Single user message, no assistant (0.30)
+    # 1. Single user message, no assistant (0.10)
+    # Weak signal — every new conversation starts this way.
     if n_user == 1 and n_assistant == 0:
-        score += 0.30
+        score += 0.10
         signals.append("single_user_msg")
 
-    # 2. Summarization keyword in final user message or system prompt (0.25)
-    final_texts = []
-    for m in messages:
-        if m.get("role") in ("user", "system"):
-            final_texts.append(_get_text(m))
-    # Also check the last message specifically
+    # 2. Summarization keyword in user message instruction
+    # Only check user messages (not system prompts). Strip delimited content
+    # blocks (<document>...</document>, etc.) so keywords inside pasted content
+    # don't fire. Only check the instruction portion — text before the first
+    # colon+newline or first 100 chars, whichever comes first.
+    # Strong keywords (imperative): 0.30. Weak keywords (common nouns): 0.15.
     last_text = _get_text(messages[-1]) if messages else ""
 
-    for text in (last_text,) + tuple(final_texts[:-1]):
-        for kw in _SUMMARIZATION_KEYWORDS:
-            if kw in text:
-                score += 0.25
-                signals.append(f"keyword:{kw}")
-                break
-        else:
-            continue
-        break
+    def _strip_delimited(text):
+        """Remove content inside XML-style delimiters to isolate the instruction."""
+        import re
+        return re.sub(r'<[^>]*>.*?</[^>]*>', ' ', text, flags=re.DOTALL)
 
-    # 3. One message dominates token count >70% (0.20)
-    # Approximate token count by text length (good enough for heuristic)
+    def _extract_instruction(text):
+        """Extract just the instruction part of a user message.
+        Takes text before the first ':' followed by newline or whitespace+newline,
+        capped at 100 chars."""
+        import re
+        # Look for pattern like "instruction:\ncontent" or "instruction:  \ncontent"
+        m = re.search(r':\s*\n', text)
+        if m:
+            text = text[:m.start()]
+        return text[:100]
+
+    keyword_found = False
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if last_user:
+        text = _get_text(last_user)
+        instruction = _strip_delimited(text)
+        instruction = _extract_instruction(instruction)
+        for kw in _SUMMARIZATION_KEYWORDS_STRONG:
+            if kw in instruction:
+                score += 0.30
+                signals.append(f"keyword:{kw}")
+                keyword_found = True
+                break
+        if not keyword_found:
+            for kw in _SUMMARIZATION_KEYWORDS_WEAK:
+                if kw in instruction:
+                    score += 0.15
+                    signals.append(f"keyword:{kw}")
+                    keyword_found = True
+                    break
+
+    # 3. One message dominates >70% of text (0.15)
+    # Only meaningful with 2+ messages — for a single message the ratio is always
+    # 100% and tells us nothing. Skipped when n_total < 2.
+    if n_total >= 2:
+        msg_lengths = [len(_get_text(m)) for m in messages]
+        total_length = sum(msg_lengths)
+        if total_length > 0:
+            max_ratio = max(msg_lengths) / total_length
+            if max_ratio > 0.7:
+                score += 0.15
+                signals.append(f"dominant_msg:{max_ratio:.0%}")
+
+    # 4. Prompt text > 8192 chars (~2048 tok estimate) (0.10)
     msg_lengths = [len(_get_text(m)) for m in messages]
     total_length = sum(msg_lengths)
-    if total_length > 0:
-        max_ratio = max(msg_lengths) / total_length
-        if max_ratio > 0.7:
-            score += 0.20
-            signals.append(f"dominant_msg:{max_ratio:.0%}")
-
-    # 4. Prompt tokens > 4096 (approximate from text length, ~4 chars/token)
-    if total_length > 4096 * 4:
+    if total_length > 8192:
         score += 0.10
         signals.append(f"long_prompt:{total_length // 4}tok_est")
 
     # 5. Structural delimiters / paste markers (0.05)
-    last_lower = last_text
+    # Check last user message for delimiters
+    last_user_text = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user_text = _get_text(m)
+            break
     for pat in _PASTE_PATTERNS:
-        if pat in last_lower:
+        if pat in last_user_text:
             score += 0.05
             signals.append(f"delimiter:{pat}")
             break
 
     # 6. Content introduction phrases (0.05)
+    # Check instruction portion of last user message
+    last_user_instruction = _strip_delimited(last_user_text)[:500]
     for phrase in _CONTENT_INTRO_PHRASES:
-        if phrase in last_lower:
+        if phrase in last_user_instruction:
             score += 0.05
             signals.append(f"intro:{phrase}")
             break
 
     # 7. System prompt present — slight negative bias (-0.10)
-    # System prompts are common in both, but slightly more common in
-    # structured conversations vs one-off summarization dumps
     if n_system > 0:
         score -= 0.10
         signals.append("system_prompt")

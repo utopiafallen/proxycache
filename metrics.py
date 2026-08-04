@@ -360,7 +360,7 @@ class MetricsCollector:
 
     # ── Performance ────────────────────────────────────────────────
 
-    def get_performance(self, model: str = None, backend: str = None) -> Dict[str, Any]:
+    def get_performance(self, model: str = None, backend: str = None, req_type: str = None) -> Dict[str, Any]:
         """Compute performance metrics from the buffer.
 
         Only uses requests with status="complete" (events excluded).
@@ -368,6 +368,8 @@ class MetricsCollector:
         Args:
             model: Filter by model name (optional)
             backend: Filter by backend key (optional)
+            req_type: Filter by request type — "summarization" (score >= 0.4) or
+                      "conversation" (score < 0.4). None for all requests.
 
         Returns:
             Dict with cache hit rate, mispredict rate, save rate, latency percentiles.
@@ -385,15 +387,27 @@ class MetricsCollector:
                             if not _is_event(r) and r.get("status") == "complete"]
                 counters = self._get_global_counters()
 
-        total = counters["total"]
-        if total == 0:
-            return self._empty_performance()
+            # Filter by request type
+            if req_type == "summarization":
+                requests = [r for r in requests if r.get("summarization_score", 0) >= 0.4]
+            elif req_type == "conversation":
+                requests = [r for r in requests if r.get("summarization_score", 0) < 0.4]
 
-        hits = counters["hits"]
-        misses = counters["misses"]
-        recomputes = counters["recomputes"]
-        saved = counters["saved"]
-        save_skipped = counters["save_skipped"]
+        # When filtered by req_type, recompute counters from filtered requests
+        if req_type:
+            total = len(requests)
+            hits = sum(1 for r in requests if r.get("cache_hit"))
+            misses = total - hits
+            recomputes = sum(1 for r in requests if r.get("recompute"))
+            saved = sum(1 for r in requests if r.get("saved") is True)
+            save_skipped = sum(1 for r in requests if r.get("saved") is False)
+        else:
+            total = counters["total"]
+            hits = counters["hits"]
+            misses = counters["misses"]
+            recomputes = counters["recomputes"]
+            saved = counters["saved"]
+            save_skipped = counters["save_skipped"]
 
         hit_rate = hits / total if total > 0 else 0
         mispredict_rate = recomputes / hits if hits > 0 else 0

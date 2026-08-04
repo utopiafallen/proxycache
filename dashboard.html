@@ -684,9 +684,71 @@ function renderCachePerformance(perf, backendPerf, summary) {
           avg=${blat.avg_ms}ms &nbsp; p50=${blat.p50_ms}ms &nbsp; p95=${blat.p95_ms}ms &nbsp; p99=${blat.p99_ms}ms
         </div>`;
       }
+      // Per-type latency breakdown
+      if (bp.summarization || bp.conversation) {
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;">';
+        if (bp.summarization) {
+          const sl = bp.summarization.latency || {};
+          html += `<div style="font-size:11px;padding:4px 8px;background:var(--purple-bg);border-radius:4px;">
+            <span style="color:var(--purple);font-weight:600;">summarization</span> (${bp.summarization.total_requests})<br>
+            <span style="color:var(--text-secondary);">avg=${sl.avg_ms || '-'}ms p50=${sl.p50_ms || '-'}ms p95=${sl.p95_ms || '-'}ms</span>
+          </div>`;
+        } else {
+          html += '<div></div>';
+        }
+        if (bp.conversation) {
+          const cl = bp.conversation.latency || {};
+          html += `<div style="font-size:11px;padding:4px 8px;background:var(--blue-bg);border-radius:4px;">
+            <span style="color:var(--blue);font-weight:600;">conversation</span> (${bp.conversation.total_requests})<br>
+            <span style="color:var(--text-secondary);">avg=${cl.avg_ms || '-'}ms p50=${cl.p50_ms || '-'}ms p95=${cl.p95_ms || '-'}ms</span>
+          </div>`;
+        } else {
+          html += '<div></div>';
+        }
+        html += '</div>';
+      }
       html += `</div>`;
     }
     html += '</div>';
+  }
+
+  // Per backend-model performance
+  const backendModelPerf = arguments[2] && arguments[2].backend_model_performance;
+  if (backendModelPerf) {
+    const hasAny = Object.values(backendModelPerf).some(vm => Object.keys(vm).length > 0);
+    if (hasAny) {
+      html += '<div style="margin-top:16px;padding-top:12px;border-top:2px solid var(--border);">';
+      html += '<div style="font-size:13px;font-weight:600;margin-bottom:8px;">Per Backend-Model Latency</div>';
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(350px, 1fr));gap:24px;">';
+      for (const [beId, models] of Object.entries(backendModelPerf)) {
+        const modelKeys = Object.keys(models);
+        if (!modelKeys.length) continue;
+        html += `<div><div style="font-size:12px;font-weight:600;font-family:var(--mono);margin-bottom:6px;">${beId}</div>`;
+        for (const [modelName, bmp] of Object.entries(models)) {
+          html += `<div style="font-size:11px;margin-bottom:4px;padding:4px 8px;background:var(--bg);border-radius:4px;">
+            <span style="font-weight:600;font-family:var(--mono);">${modelName}</span>
+            <span style="color:var(--text-secondary);">(${bmp.total_requests} req)</span>`;
+          if (bmp.summarization || bmp.conversation) {
+            html += '<div style="display:flex;gap:8px;margin-top:3px;">';
+            if (bmp.summarization) {
+              const sl = bmp.summarization.latency || {};
+              html += `<span style="color:var(--purple);">sum: ${sl.avg_ms || '-'}ms avg (${bmp.summarization.total_requests})</span>`;
+            }
+            if (bmp.conversation) {
+              const cl = bmp.conversation.latency || {};
+              html += `<span style="color:var(--blue);">conv: ${cl.avg_ms || '-'}ms avg (${bmp.conversation.total_requests})</span>`;
+            }
+            html += '</div>';
+          } else {
+            const bl = bmp.latency || {};
+            html += `<span style="color:var(--text-secondary);">avg=${bl.avg_ms || '-'}ms</span>`;
+          }
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
   }
 
   // Summarization breakdown
