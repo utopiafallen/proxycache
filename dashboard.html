@@ -505,7 +505,7 @@ async function fetchMetrics() {
     const resp = await fetch(API_BASE + '/metrics/dashboard');
     if (!resp.ok) return;
     const data = await resp.json();
-    renderBackendHealth(data.backends || {}, data.cache || {}, data.slots || {});
+    renderBackendHealth(data.backends || {}, data.cache || {}, data.slots || {}, data.backend_model_performance || {});
     renderCachePerformance(data.performance || {}, data.backend_performance || {}, data);
     updateBackendFilter(data.backends || {});
     if (!expandedRequests.size) {
@@ -567,7 +567,7 @@ function updateBackendFilter(backends) {
   sel.innerHTML = options.join('');
 }
 
-function renderBackendHealth(backends, cache, slots) {
+function renderBackendHealth(backends, cache, slots, backendModelPerf) {
   const el = document.getElementById('backendHealth');
   if (!Object.keys(backends).length) {
     el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No backends configured</p>';
@@ -610,8 +610,25 @@ function renderBackendHealth(backends, cache, slots) {
           ${modelName} | ${modelInfo.total_slots} slots (${modelInfo.in_use} in use), n_ctx=${modelInfo.n_ctx}
           <div style="display:flex;flex-wrap:wrap;gap:2px;margin-top:4px;margin-left:22px;align-items:center;">
             <span style="font-size:11px;color:var(--text-secondary);margin-right:4px;">slots:</span>${slotCells}
-          </div>
-        </div>`;
+          </div>`;
+        // Show EMA latency per type if available
+        const bmp = backendModelPerf && backendModelPerf[key] && backendModelPerf[key][modelName];
+        if (bmp) {
+          const parts = [];
+          if (bmp.summarization && bmp.summarization.latency && bmp.summarization.latency.avg_ms) {
+            parts.push(`<span style="color:var(--purple);">sum: ${bmp.summarization.latency.avg_ms.toFixed(0)}ms avg</span>`);
+          }
+          if (bmp.conversation && bmp.conversation.latency && bmp.conversation.latency.avg_ms) {
+            parts.push(`<span style="color:var(--blue);">conv: ${bmp.conversation.latency.avg_ms.toFixed(0)}ms avg</span>`);
+          }
+          if (!parts.length && bmp.latency && bmp.latency.avg_ms) {
+            parts.push(`<span style="color:var(--text-secondary);">avg: ${bmp.latency.avg_ms.toFixed(0)}ms</span>`);
+          }
+          if (parts.length) {
+            html += `<div style="font-size:11px;margin-top:3px;margin-left:22px;">${parts.join(' &middot; ')}</div>`;
+          }
+        }
+        html += `</div>`;
       }
     }
     html += `</div>`;
