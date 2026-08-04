@@ -328,7 +328,9 @@ class MetricsCollector:
                   "routing_reason": r.get("routing_reason"),
                   "routing_diagnostics": r.get("routing_diagnostics"),
                   "status": r.get("status", "incomplete"),
-                  "request_id": r.get("request_id")} for r in sliced]
+                  "request_id": r.get("request_id"),
+                  "summarization_score": r.get("summarization_score"),
+                  "summarization_signals": r.get("summarization_signals")} for r in sliced]
 
     # ── Event queries ──────────────────────────────────────────────
 
@@ -489,12 +491,29 @@ class MetricsCollector:
             incomplete_count = sum(1 for r in self._buffer
                                    if not _is_event(r) and r.get("status") != "complete")
 
+            # Summarization breakdown
+            complete = [r for r in self._buffer
+                        if not _is_event(r) and r.get("status") == "complete"]
+            sum_requests = [r for r in complete if r.get("summarization_score", 0) >= 0.4]
+            conv_requests = [r for r in complete if r.get("summarization_score", 0) < 0.4]
+
+            sum_latencies = sorted([r["latency_ms"] for r in sum_requests if r["latency_ms"] > 0])
+            conv_latencies = sorted([r["latency_ms"] for r in conv_requests if r["latency_ms"] > 0])
+
+        summarization_stats = {
+            "total": len(sum_requests),
+            "conversation_total": len(conv_requests),
+            "latency": self._compute_percentiles(sum_latencies),
+            "conversation_latency": self._compute_percentiles(conv_latencies),
+        }
+
         return {
             "uptime_seconds": round(time.time() - self._start_time, 1),
             "performance": perf,
             "requests": requests_full,
             "requests_summary": requests_summary,
             "incomplete_count": incomplete_count,
+            "summarization": summarization_stats,
         }
 
 

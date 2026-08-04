@@ -27,7 +27,7 @@ def fetch_requests(limit=100, offset=0):
 
 
 def fetch_summary():
-    url = f"{BASE_URL}/metrics/summary"
+    url = f"{BASE_URL}/metrics/dashboard"
     with urllib.request.urlopen(url) as resp:
         return json.loads(resp.read())
 

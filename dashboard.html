@@ -19,6 +19,8 @@
   --yellow-bg: #fff8e1;
   --blue: #1565c0;
   --blue-bg: #e3f2fd;
+  --purple: #7b1fa2;
+  --purple-bg: #f3e5f5;
   --gray: #9e9e9e;
   --gray-bg: #fafafa;
   --accent: #0d47a1;
@@ -40,6 +42,8 @@
     --yellow-bg: #3a3a1b;
     --blue: #42a5f5;
     --blue-bg: #1b2a3a;
+    --purple: #ce93d8;
+    --purple-bg: #2a1b3a;
     --gray: #777;
     --gray-bg: #1a1a2e;
     --accent: #64b5f6;
@@ -316,6 +320,7 @@ header .controls select, header .controls button {
 .request-badge.incomplete { background: var(--blue-bg); color: var(--blue); }
 .request-badge.cancelled { background: var(--gray-bg); color: var(--gray); }
 .request-badge.backend_error { background: var(--red-bg); color: var(--red); }
+.request-badge.summarization { background: var(--purple-bg, #f3e5f5); color: var(--purple, #7b1fa2); }
 .request-latency { color: var(--text-secondary); margin-left: auto; }
 .request-body {
   display: none;
@@ -411,6 +416,7 @@ header .controls select, header .controls button {
         <button onclick="setFilter('hit', this)">Hits</button>
         <button onclick="setFilter('miss', this)">Misses</button>
         <button onclick="setFilter('recompute', this)">Recomputes</button>
+        <button onclick="setFilter('summarization', this)">Summarization</button>
         <select id="backendFilter" style="margin-left:auto;padding:4px 6px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);">
           <option value="">All backends</option>
         </select>
@@ -422,6 +428,10 @@ header .controls select, header .controls button {
         <span class="request-badge recompute" style="font-size:10px;">DISK HIT / RECOMPUTE</span><span style="color:var(--text-secondary);">restore was useless</span>
         <span class="request-badge miss" style="font-size:10px;">NO ENTRY</span><span style="color:var(--text-secondary);">no cache entry</span>
         <span class="request-badge backend_unavail" style="font-size:10px;">BACKEND UNAVAIL</span><span style="color:var(--text-secondary);">cache hit but backend busy, fell back</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px;padding:8px;background:var(--surface);border-radius:6px;font-size:11px;align-items:center;">
+        <span style="color:var(--text-secondary);font-weight:600;">Type:</span>
+        <span class="request-badge summarization" style="font-size:10px;">SUMMARIZATION</span><span style="color:var(--text-secondary);">heuristic score >= 0.4</span>
       </div>
       <div id="requestsList"></div>
       <div style="display:flex;gap:8px;align-items:center;">
@@ -492,11 +502,11 @@ function escapeHtml(str) {
 
 async function fetchMetrics() {
   try {
-    const resp = await fetch(API_BASE + '/metrics/summary');
+    const resp = await fetch(API_BASE + '/metrics/dashboard');
     if (!resp.ok) return;
     const data = await resp.json();
     renderBackendHealth(data.backends || {}, data.cache || {}, data.slots || {});
-    renderCachePerformance(data.performance || {}, data.backend_performance || {});
+    renderCachePerformance(data.performance || {}, data.backend_performance || {}, data);
     updateBackendFilter(data.backends || {});
     if (!expandedRequests.size) {
       refreshRequests();
@@ -610,7 +620,7 @@ function renderBackendHealth(backends, cache, slots) {
   el.innerHTML = html;
 }
 
-function renderCachePerformance(perf) {
+function renderCachePerformance(perf, backendPerf, summary) {
   const el = document.getElementById('cachePerformance');
   const g = perf;
   if (!g.total_requests) {
@@ -644,8 +654,7 @@ function renderCachePerformance(perf) {
   </div></div>`;
 
   // Per-backend performance
-  const backendPerf = arguments[1] || {};
-  const backends = Object.keys(backendPerf);
+  const backends = Object.keys(backendPerf || {});
   if (backends.length) {
     html += '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(350px, 1fr));gap:24px;">';
     for (const [beId, bp] of Object.entries(backendPerf)) {
@@ -679,6 +688,39 @@ function renderCachePerformance(perf) {
     }
     html += '</div>';
   }
+
+  // Summarization breakdown
+  const sumStats = summary && summary.summarization;
+  if (sumStats && (sumStats.total > 0 || sumStats.conversation_total > 0)) {
+    html += '<div style="margin-top:16px;padding-top:12px;border-top:2px solid var(--border);">';
+    html += '<div style="font-size:13px;font-weight:600;margin-bottom:8px;">Request Type Breakdown</div>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">';
+
+    // Summarization column
+    html += '<div style="padding:8px 12px;background:var(--purple-bg);border-radius:6px;">';
+    html += `<div style="font-size:12px;font-weight:600;color:var(--purple);margin-bottom:4px;">Summarization (${sumStats.total} requests)</div>`;
+    const slat = sumStats.latency || {};
+    if (slat.avg_ms) {
+      html += `<div style="font-size:11px;color:var(--text-secondary);">avg=${slat.avg_ms}ms &nbsp; p50=${slat.p50_ms}ms &nbsp; p95=${slat.p95_ms}ms</div>`;
+    } else {
+      html += '<div style="font-size:11px;color:var(--text-secondary);">no latency data</div>';
+    }
+    html += '</div>';
+
+    // Conversation column
+    html += '<div style="padding:8px 12px;background:var(--blue-bg);border-radius:6px;">';
+    html += `<div style="font-size:12px;font-weight:600;color:var(--blue);margin-bottom:4px;">Conversation (${sumStats.conversation_total} requests)</div>`;
+    const clat = sumStats.conversation_latency || {};
+    if (clat.avg_ms) {
+      html += `<div style="font-size:11px;color:var(--text-secondary);">avg=${clat.avg_ms}ms &nbsp; p50=${clat.p50_ms}ms &nbsp; p95=${clat.p95_ms}ms</div>`;
+    } else {
+      html += '<div style="font-size:11px;color:var(--text-secondary);">no latency data</div>';
+    }
+    html += '</div>';
+
+    html += '</div></div>';
+  }
+
   el.innerHTML = html;
 }
 
@@ -763,6 +805,8 @@ function _doRenderFilteredRequests() {
     filtered = filtered.filter(r => !r.cache_hit);
   } else if (currentFilter === 'recompute') {
     filtered = filtered.filter(r => r.recompute);
+  } else if (currentFilter === 'summarization') {
+    filtered = filtered.filter(r => r.summarization_score != null && r.summarization_score >= 0.4);
   }
   if (!filtered.length) {
     el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No matching requests</p>';
@@ -785,6 +829,10 @@ function _doRenderFilteredRequests() {
       'no_cache_entry': 'miss',
       'cache_backend_unavailable': 'backend_unavail',
     }[routingReason] || 'miss');
+    const sumScore = req.summarization_score;
+    const sumBadge = sumScore != null && sumScore >= 0.4
+      ? `<span class="request-badge summarization" style="font-size:10px;" data-tooltip="Signals: ${(req.summarization_signals || []).join(', ')}">SUMMARIZATION (${sumScore.toFixed(2)})</span>`
+      : '';
     const expanded = expandedRequests.has(req.timestamp) ? 'open' : '';
     const bodyOpen = expanded ? 'open' : '';
     const arrowOpen = expanded ? 'open' : '';
@@ -808,6 +856,7 @@ function _doRenderFilteredRequests() {
         <span class="request-backend">${req.backend}</span>
         <span class="request-slot">S${req.slot_id}</span>
         <span class="request-badge ${routingClass}" style="font-size:10px;">${routingLabel}</span>
+        ${sumBadge}
         ${statusBadge}
         <span class="request-latency">${req.latency_ms.toFixed(0)}ms</span>
       </div>

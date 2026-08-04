@@ -94,6 +94,137 @@ def should_save_cache(best_ratio: float, recompute_happened: bool) -> bool:
     """
     return recompute_happened or best_ratio <= CACHE_SAVE_RATIO_THRESHOLD
 
+
+# Keywords that strongly indicate summarization intent
+_SUMMARIZATION_KEYWORDS = {
+    "summarize", "summarise", "summary", "tl;dr", "tl; dr", "key points",
+    "bullet points", "overview", "abstract", "digest", "condense",
+    "extract", "highlights", "main points", "brief", "in short",
+    "give me a summary", "sum it up", "wrap up", "recap",
+}
+
+# Patterns that suggest content is being pasted for processing
+_PASTE_PATTERNS = (
+    "<document>", "</document>", "<context>", "</context>",
+    "<article>", "</article>", "<text>", "</text>",
+    "<content>", "</content>", "<passage>", "</passage>",
+    "<input>", "</input>", "<transcript>", "</transcript>",
+)
+
+# Phrases that introduce pasted content
+_CONTENT_INTRO_PHRASES = (
+    "here is a", "here's a", "here is the", "here's the",
+    "below is", "below is a", "below is the",
+    "attached is", "following is", "following text",
+    "read this", "analyze this", "review this",
+    "the following", "consider the following",
+)
+
+
+def classify_request(messages: list, request_json: dict = None) -> dict:
+    """Classify a request as summarization-like or conversation-like.
+
+    Returns a dict with:
+      - score: float 0..1 (higher = more likely summarization)
+      - signals: list of str (which signals fired)
+
+    Heuristics (weights sum to ~1.0):
+      - Single user message, no assistant (0.30)
+      - Summarization keyword in final user/system message (0.25)
+      - One message dominates token count >70% (0.20)
+      - Prompt tokens > 4096 (0.10)
+      - Structural delimiters / paste markers present (0.05)
+      - Content introduction phrases present (0.05)
+      - System prompt present (-0.10, slight conversation bias)
+    """
+    if not messages:
+        return {"score": 0.0, "signals": []}
+
+    signals = []
+    score = 0.0
+
+    roles = [m.get("role", "") for m in messages]
+    n_user = roles.count("user")
+    n_assistant = roles.count("assistant")
+    n_system = roles.count("system")
+    n_total = len(messages)
+
+    # Get text content from messages for keyword/pattern matching
+    def _get_text(msg):
+        c = msg.get("content", "")
+        if isinstance(c, str):
+            return c.lower()
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    return part.get("text", "").lower()
+        return ""
+
+    # 1. Single user message, no assistant (0.30)
+    if n_user == 1 and n_assistant == 0:
+        score += 0.30
+        signals.append("single_user_msg")
+
+    # 2. Summarization keyword in final user message or system prompt (0.25)
+    final_texts = []
+    for m in messages:
+        if m.get("role") in ("user", "system"):
+            final_texts.append(_get_text(m))
+    # Also check the last message specifically
+    last_text = _get_text(messages[-1]) if messages else ""
+
+    for text in (last_text,) + tuple(final_texts[:-1]):
+        for kw in _SUMMARIZATION_KEYWORDS:
+            if kw in text:
+                score += 0.25
+                signals.append(f"keyword:{kw}")
+                break
+        else:
+            continue
+        break
+
+    # 3. One message dominates token count >70% (0.20)
+    # Approximate token count by text length (good enough for heuristic)
+    msg_lengths = [len(_get_text(m)) for m in messages]
+    total_length = sum(msg_lengths)
+    if total_length > 0:
+        max_ratio = max(msg_lengths) / total_length
+        if max_ratio > 0.7:
+            score += 0.20
+            signals.append(f"dominant_msg:{max_ratio:.0%}")
+
+    # 4. Prompt tokens > 4096 (approximate from text length, ~4 chars/token)
+    if total_length > 4096 * 4:
+        score += 0.10
+        signals.append(f"long_prompt:{total_length // 4}tok_est")
+
+    # 5. Structural delimiters / paste markers (0.05)
+    last_lower = last_text
+    for pat in _PASTE_PATTERNS:
+        if pat in last_lower:
+            score += 0.05
+            signals.append(f"delimiter:{pat}")
+            break
+
+    # 6. Content introduction phrases (0.05)
+    for phrase in _CONTENT_INTRO_PHRASES:
+        if phrase in last_lower:
+            score += 0.05
+            signals.append(f"intro:{phrase}")
+            break
+
+    # 7. System prompt present — slight negative bias (-0.10)
+    # System prompts are common in both, but slightly more common in
+    # structured conversations vs one-off summarization dumps
+    if n_system > 0:
+        score -= 0.10
+        signals.append("system_prompt")
+
+    return {
+        "score": round(max(0.0, min(1.0, score)), 3),
+        "signals": signals,
+    }
+
 # Timeout for slot save/restore operations (seconds) — separate from REQUEST_TIMEOUT
 # because chat completions can take minutes, but slot operations should fail fast
 SLOT_TIMEOUT = float(os.getenv("SLOT_TIMEOUT", "30"))

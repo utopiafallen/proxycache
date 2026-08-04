@@ -39,7 +39,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 from config import (BACKENDS, WORDS_PER_BLOCK,
                     LCP_TH, MODEL_ID, PORT, DEFAULT_N_CTX,
-                    should_save_cache, should_skip_save_heuristic,
+                    should_save_cache, should_skip_save_heuristic, classify_request,
                     CACHE_HIT_WAIT_EMA_MIN_TIMEOUT, CACHE_HIT_WAIT_EMA_MAX_TIMEOUT,
                     CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT, CACHE_HIT_WAIT_MAX_PENDING_REQS)
 
@@ -757,6 +757,7 @@ async def chat(req: Request):
 
     request_id = str(uuid.uuid4())
     prompt_preview = extract_prompt_preview(request_json)
+    req_class = classify_request(messages, request_json)
     try:
         metrics.record({
             "request_id": request_id,
@@ -765,6 +766,8 @@ async def chat(req: Request):
             "stream": stream,
             "status": "incomplete",
             "prompt_preview": prompt_preview,
+            "summarization_score": req_class["score"],
+            "summarization_signals": req_class["signals"],
         })
     except Exception as e:
         log.warning("Failed to record request arrival for request_id=%s: %s", request_id, e)
@@ -1230,8 +1233,8 @@ async def chat(req: Request):
 
 # ── Metrics & Dashboard Endpoints ────────────────────────────────────
 
-@app.get("/metrics/summary")
-async def metrics_summary():
+@app.get("/metrics/dashboard")
+async def metrics_dashboard():
     summary = metrics.get_summary()
     summary["backends"] = _get_backend_health()
     summary["slots"] = _get_slot_status()

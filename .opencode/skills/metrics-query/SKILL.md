@@ -12,7 +12,7 @@ Querying and parsing proxycache request history from the metrics dashboard.
 | Endpoint | Description |
 |----------|-------------|
 | `GET /metrics/requests?limit=N&offset=M` | Full request records including `request_json` |
-| `GET /metrics/summary` | Aggregated stats + last 20 requests (via `requests_summary`) |
+| `GET /metrics/dashboard` | Full dashboard data: backends, slots, cache, performance, requests, summarization stats |
 | `GET /metrics/health` | Backend health and model discovery |
 | `GET /metrics/slots` | Per-slot status |
 | `GET /metrics/cache` | Per-backend cache utilization |
@@ -204,7 +204,7 @@ python .opencode/skills/metrics-query/query_metrics.py --limit 200              
 ## Gotchas
 
 - **Incomplete records**: Arrival records have `status="incomplete"`, `backend="unknown"`, `slot_id=-1`. Filter them out with `r.get('status') == 'complete'`.
-- **`request_json` is large**: Use `requests_summary` from `/metrics/summary` for bulk queries, or omit `request_json` when printing.
+- **`request_json` is large**: Use `requests_summary` from `/metrics/dashboard` for bulk queries, or omit `request_json` when printing.
 - **`cache_hit` vs `restored`**: `cache_hit=True` means a cache match was found. `restored=True` means the KV cache was actually loaded from disk. They can differ: pending slot hits have `cache_hit=True` but `restored=False` (slot already has content).
 - **`cached_tokens=0` on pending slot hit**: Means `_slot_kv_state` was wrong — the proxy thought the slot had matching blocks, but llama.cpp's actual KV cache didn't match. Common when the slot was evicted or served a different conversation.
 - **Ring buffer size**: Single ring buffer for requests + events (`METRICS_RETENTION`, default 200). `get_requests()` filters out events automatically. Use `?timeline=true` to see all entries.

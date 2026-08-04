@@ -71,7 +71,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | Main chat endpoint (proxied to backend) |
 | `GET` | `/v1/models` | Returns discovered models with `n_ctx`, auto-generated chunk-level prefix aliases, plus `"any"` option |
-| `GET` | `/metrics/summary` | Full metrics summary (backends, slots, cache, performance, requests) |
+| `GET` | `/metrics/dashboard` | Full dashboard data (backends, slots, cache, performance, requests, summarization stats) |
 | `GET` | `/metrics/health` | Backend health: up/down, model info, slot counts |
 | `GET` | `/metrics/slots` | Per-slot state: in_use, last_used, KV block count |
 | `GET` | `/metrics/cache` | Per-backend cache utilization: ring size, bytes, utilization % |
