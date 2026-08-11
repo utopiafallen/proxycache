@@ -173,6 +173,23 @@ class BackendManager:
             return self._backend_model_latency_ema[key]
         return self._backend_latency_ema.get(backend_id, 0.0)
 
+    def get_all_latency_ema(self) -> Dict[str, Dict[str, Dict[str, float]]]:
+        """Return all in-memory EMA latency data as a nested dict.
+
+        Returns {backend_id: {model_name: {"summarization": ema_ms, "conversation": ema_ms}}}
+        Only includes entries with non-zero EMA values.
+        """
+        result: Dict[str, Dict[str, Dict[str, float]]] = {}
+        for (be_id, model, req_type), ema in self._backend_model_latency_ema.items():
+            if ema <= 0:
+                continue
+            if be_id not in result:
+                result[be_id] = {}
+            if model not in result[be_id]:
+                result[be_id][model] = {}
+            result[be_id][model][req_type] = round(ema, 1)
+        return result
+
     def _perf_file(self, backend_id: str) -> str:
         """Path to a backend's persisted latency data file."""
         be_dir = os.path.join(META_DIR, sanitize_backend_dir(backend_id))
