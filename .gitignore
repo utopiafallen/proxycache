@@ -4,3 +4,4 @@ __pycache__/
 run-proxycache.ps1
 uv.lock
 cache-agent.exe
+proxycache.exe
