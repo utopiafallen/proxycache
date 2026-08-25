@@ -53,7 +53,7 @@ The cache hit scan lives in the chat handler in `app.py`, between model resoluti
 
 **Phase 2 — Retry loop:**
 - Iterates all candidate backends (fallback only, excludes cache backend), sorted by composite score: `(cache_ratio, ring_size, latency_ema, last_used)` to minimize cache churn and latency
-- Sleeps 5s between attempts (up to 11 attempts)
+- Retries forever until a slot frees (backoff grows 5s, 10s, 15s, ...); aborts only on client disconnect / context cancellation
 - Picks first available slot
 
 **After slot acquisition succeeds (all phases):**

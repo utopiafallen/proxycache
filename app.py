@@ -52,7 +52,6 @@ log = logging.getLogger(__name__)
 from backend_manager import backend_manager
 from kv_meta_manager import kv_meta
 
-ACQUIRE_TIMEOUT = 120.0
 STREAM_QUEUE_SIZE = 16
 STREAM_QUEUE_TIMEOUT = 5.0
 RECOMPUTE_THRESHOLD_RATIO = 0.7
@@ -281,9 +280,9 @@ async def _acquire_slot_for_request(
             finally:
                 sm._cache_wait_pending[restore_backend] -= 1
 
-    # Retry loop: cache backend + fallbacks
-    RETRY_COUNT = 11
-    for attempt in range(RETRY_COUNT):
+    # Retry loop: cache backend + fallbacks, retries forever until a slot frees
+    attempt = 0
+    while True:
         # Phase 1: cache backend
         if restore_backend and hit_type and prompt_tokens < backend_manager.get_backend_n_ctx(canonical_name, restore_backend):
             result = await _try_cache_backend()
@@ -316,13 +315,11 @@ async def _acquire_slot_for_request(
             backend_manager.touch_backend(be_id)
             return (model_name, be_id, slot_id), restored, skip_restore_diag, old_kv
 
-        if attempt < RETRY_COUNT - 1:
-            backoff = (attempt + 1) * 5
-            log.info("No slots available across all backends, retrying in %ds (attempt %d/%d)",
-                     backoff, attempt + 1, RETRY_COUNT)
-            await asyncio.sleep(backoff)
-
-    raise RuntimeError(f"No slots available for candidate_backends={len(candidate_backends)}")
+        attempt += 1
+        backoff = attempt * 5
+        log.info("No slots available across all backends, retrying in %ds (attempt %d)",
+                 backoff, attempt)
+        await asyncio.sleep(backoff)
 
 
 # ── Streaming ──────────────────────────────────────────────────────────
@@ -940,13 +937,10 @@ async def chat(req: Request):
             ),
         )
 
-        # 6. Acquire slot (cache backend first, then fallbacks)
-        g, restored, skip_restore_diag, prev_kv = await asyncio.wait_for(
-            _acquire_slot_for_request(
-                sm, candidate_backends, restore_backend, canonical_name,
-                hit_type, restore_key, backend_blocks, prompt_tokens,
-            ),
-            timeout=ACQUIRE_TIMEOUT,
+        # 6. Acquire slot (cache backend first, then fallbacks; retries forever)
+        g, restored, skip_restore_diag, prev_kv = await _acquire_slot_for_request(
+            sm, candidate_backends, restore_backend, canonical_name,
+            hit_type, restore_key, backend_blocks, prompt_tokens,
         )
     except (asyncio.TimeoutError, RuntimeError) as e:
         log.error("Could not acquire slot from client %s for model '%s': %s", client_ip, client_model, e)

@@ -21,9 +21,8 @@ import (
 var dashboardHTML []byte
 
 const (
-	acquireTimeout            = 120 * time.Second
-	streamQueueSize           = 16
-	recomputeThresholdRatio   = 0.7
+	streamQueueSize         = 16
+	recomputeThresholdRatio = 0.7
 )
 
 type candidateBackend struct {
@@ -430,8 +429,9 @@ func acquireSlotForRequest(
 		}
 	}
 
-	const retryCount = 11
-	for attempt := 0; attempt < retryCount; attempt++ {
+	// Retry forever until a slot frees (aborts only on context cancellation)
+	attempt := 0
+	for {
 		if restoreBackend != "" && hitType != nil && promptTokens < backendManager.GetBackendNCtx(canonicalName, restoreBackend) {
 			if g, restored, prevKV, ok := tryCacheBackend(); ok {
 				return g, restored, skipRestoreDiag, prevKV, nil
@@ -460,15 +460,13 @@ func acquireSlotForRequest(
 			backendManager.TouchBackend(cb.BackendID)
 			return GSlot{ModelName: cb.ModelName, BackendID: cb.BackendID, SlotID: slotID}, restored, skipRestoreDiag, prevKV, nil
 		}
-		if attempt < retryCount-1 {
-			backoff := float64(attempt+1) * 5
-			logInfo("app", "No slots available across all backends, retrying in %ds (attempt %d/%d)", int(backoff), attempt+1, retryCount)
-			if err := ctxSleep(ctx, backoff); err != nil {
-				return GSlot{}, nil, skipRestoreDiag, nil, err
-			}
+		attempt++
+		backoff := float64(attempt) * 5
+		logInfo("app", "No slots available across all backends, retrying in %ds (attempt %d)", int(backoff), attempt)
+		if err := ctxSleep(ctx, backoff); err != nil {
+			return GSlot{}, nil, skipRestoreDiag, nil, err
 		}
 	}
-	return GSlot{}, nil, skipRestoreDiag, nil, fmt.Errorf("No slots available for candidate_backends=%d", len(candidateBackends))
 }
 
 func chatHandler(w http.ResponseWriter, r *http.Request) {
@@ -716,11 +714,9 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 			backendManager.GetBackendModelLatencyEMA(b.BackendID, b.ModelName, reqType)
 	})
 
-	acqCtx, acqCancel := context.WithTimeout(r.Context(), acquireTimeout)
 	g, restored, skipRestoreDiag, prevKV, acqErr := acquireSlotForRequest(
-		acqCtx, candidateBackends, restoreBackend, canonicalName, hitType, restoreKey, backendBlocks, promptTokens,
+		r.Context(), candidateBackends, restoreBackend, canonicalName, hitType, restoreKey, backendBlocks, promptTokens,
 	)
-	acqCancel()
 	if acqErr != nil {
 		logError("app", "Could not acquire slot from client %s for model '%s': %v", ip, clientModel, acqErr)
 		recordEarlyError(requestID, clientModel, t0)
