@@ -724,15 +724,8 @@ func (m *MetricsCollector) GetSummary() map[string]any {
 }
 
 func roundTo(v float64, digits int) float64 {
-	switch digits {
-	case 1:
-		return round1(v)
-	case 3:
-		return roundTo3(v)
-	case 4:
-		return round4(v)
-	}
-	return v
+	p := math.Pow(10, float64(digits))
+	return math.Round(v*p) / p
 }
 
 func round1(v float64) float64 { return math.Round(v*10) / 10 }
