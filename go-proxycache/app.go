@@ -1212,6 +1212,15 @@ func (ss *streamState) readLoop() {
 			if sseDone {
 				logInfo("app", "SSE [DONE] received for model '%s' on backend '%s' slot %d (key %s)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
 				ss.streamComplete = true
+				// Forward the [DONE] chunk itself: clients treat a stream that
+				// ends without data: [DONE] as truncated even when all content
+				// arrived.
+				select {
+				case ss.chunks <- chunk:
+					chunksReceived++
+				default:
+					logWarn("app", "Stream queue full while flushing SSE [DONE] for model '%s' on backend '%s' slot %d (key %s)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
+				}
 				ss.finish()
 				return
 			}

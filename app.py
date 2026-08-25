@@ -480,6 +480,15 @@ class StreamReader:
                                 self.model_name, self.backend_id, self.slot_id, self.key_short,
                             )
                             self._stream_complete = True
+                            # Forward the [DONE] chunk itself: clients treat a stream
+                            # that ends without data: [DONE] as truncated even when
+                            # all content arrived.
+                            try:
+                                self.queue.put_nowait(chunk)
+                                chunks_received += 1
+                            except asyncio.QueueFull:
+                                log.warning("Stream queue full while flushing SSE [DONE] for model '%s' on backend '%s' slot %d (key %s)",
+                                            self.model_name, self.backend_id, self.slot_id, self.key_short)
                             self._disconnect_event.set()
                             for t in pending:
                                 t.cancel()

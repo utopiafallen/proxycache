@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -530,5 +531,69 @@ func TestChatSavePerformedWhenRatioBelowThreshold(t *testing.T) {
 	}
 	if meta := kvMeta.ReadMeta(MetaKey("test-model", reqTokens), be); meta == nil {
 		t.Error("no meta written for full request key, want one after save")
+	}
+}
+
+// splitReader delivers its parts one Read per call, to control chunk boundaries.
+type splitReader struct {
+	parts [][]byte
+	idx   int
+}
+
+func (r *splitReader) Read(p []byte) (int, error) {
+	if r.idx >= len(r.parts) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.parts[r.idx])
+	r.idx++
+	return n, nil
+}
+
+func (r *splitReader) Close() error { return nil }
+
+func TestReadLoopForwardsDoneChunk(t *testing.T) {
+	cases := []struct {
+		name  string
+		parts [][]byte
+	}{
+		{"done in own chunk", [][]byte{
+			[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+			[]byte("data: [DONE]\n\n"),
+		}},
+		{"done coalesced with content", [][]byte{
+			[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := &streamState{
+				resp:   &http.Response{Body: &splitReader{parts: tc.parts}},
+				chunks: make(chan []byte, 8),
+				done:   make(chan struct{}),
+			}
+			go ss.readLoop()
+			<-ss.done
+			// readLoop enqueues the [DONE] chunk before closing done, so the
+			// channel is fully populated here.
+			var all []byte
+			for {
+				select {
+				case c := <-ss.chunks:
+					all = append(all, c...)
+				default:
+					goto drained
+				}
+			}
+		drained:
+			if !strings.Contains(string(all), "[DONE]") {
+				t.Errorf("client stream missing data: [DONE]: %q", all)
+			}
+			if !strings.Contains(string(all), "hi") {
+				t.Errorf("client stream missing content: %q", all)
+			}
+			if !ss.streamComplete {
+				t.Error("streamComplete = false, want true")
+			}
+		})
 	}
 }
