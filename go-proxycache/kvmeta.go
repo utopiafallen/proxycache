@@ -10,12 +10,33 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
 // KVMetaManager manages kv-meta files: read, write, list, delete, reconcile.
 // It is stateless; all state lives in files under META_DIR.
-type KVMetaManager struct{}
+//
+// writeMu serializes meta file writes: os.WriteFile truncates in place, so a
+// concurrent reader (scan/reconcile) could observe a half-written file, and
+// the recompute-penalty read-modify-write would lose updates.
+type KVMetaManager struct {
+	writeMu sync.Mutex
+}
+
+// atomicWriteFile writes to path+".tmp" then renames over path, so readers
+// never observe a partial file. Callers must hold writeMu.
+func (kv *KVMetaManager) atomicWriteFile(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
 
 // kvMeta is the singleton instance.
 var kvMeta = &KVMetaManager{}
@@ -170,9 +191,10 @@ func (kv *KVMetaManager) WriteMeta(key string, nTokens int, blocks []string, wpb
 		return
 	}
 	path := filepath.Join(d, key+MetaSuffix)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	kv.writeMu.Lock()
+	defer kv.writeMu.Unlock()
+	if err := kv.atomicWriteFile(path, data); err != nil {
 		logWarn("kv_meta", "Failed to write meta file %s: %s", path, err)
-		return
 	}
 	logInfo("kv_meta", "Saved cache for key %s (model_id: %s, backend: %s, %d blocks, %d bytes)",
 		truncateKey(key), modelID, backendID, len(blocks), cacheSize)
@@ -226,7 +248,10 @@ func (kv *KVMetaManager) DeleteMetaFile(key string) bool {
 }
 
 // IncrementRecomputePenalty increments the recompute_penalty counter on a meta file.
+// The lock spans read-modify-write so concurrent increments don't lose updates.
 func (kv *KVMetaManager) IncrementRecomputePenalty(key, backendID string) {
+	kv.writeMu.Lock()
+	defer kv.writeMu.Unlock()
 	path := kv.MetaFilePath(key, backendID)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -246,7 +271,7 @@ func (kv *KVMetaManager) IncrementRecomputePenalty(key, backendID string) {
 		logWarn("kv_meta", "Failed to increment recompute_penalty for key %s: %s", truncateKey(key), err)
 		return
 	}
-	if err := os.WriteFile(path, out, 0o644); err != nil {
+	if err := kv.atomicWriteFile(path, out); err != nil {
 		logWarn("kv_meta", "Failed to increment recompute_penalty for key %s: %s", truncateKey(key), err)
 		return
 	}

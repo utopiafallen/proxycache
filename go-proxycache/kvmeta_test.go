@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -172,6 +173,63 @@ func TestIncrementRecomputePenalty(t *testing.T) {
 		t.Error("last_updated_penalty missing after increment")
 	}
 	kvMeta.IncrementRecomputePenalty("nope", "be1")
+}
+
+func TestIncrementRecomputePenaltyConcurrent(t *testing.T) {
+	withTempMetaDir(t)
+	kvMeta.WriteMeta("k", 5, []string{"a"}, 64, "m", "be1", 0)
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			kvMeta.IncrementRecomputePenalty("k", "be1")
+		}()
+	}
+	wg.Wait()
+	meta := kvMeta.ReadMeta("k", "be1")
+	if meta == nil {
+		t.Fatal("meta disappeared after concurrent penalty increments")
+	}
+	if metaFloat(meta, "recompute_penalty") != n {
+		t.Errorf("recompute_penalty = %v, want %d (lost updates)", meta["recompute_penalty"], n)
+	}
+}
+
+func TestWriteMetaConcurrentWithReads(t *testing.T) {
+	withTempMetaDir(t)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			blocks := make([]string, 64)
+			for b := range blocks {
+				blocks[b] = filepath.Join("blk", "x")
+			}
+			kvMeta.WriteMeta("hot", 1000, blocks, 100, "m", "be1", i)
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		if meta := kvMeta.ReadMeta("hot", "be1"); meta != nil {
+			if _, ok := meta["key"]; !ok {
+				t.Fatalf("corrupt meta read at iteration %d: %v", i, meta)
+			}
+		}
+		kvMeta.ScanAllMeta("be1")
+	}
+	close(stop)
+	wg.Wait()
+	if kvMeta.ReadMeta("hot", "be1") == nil {
+		t.Fatal("meta file unreadable after concurrent writes")
+	}
 }
 
 func TestFindRestoreCandidate(t *testing.T) {
