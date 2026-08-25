@@ -1,0 +1,1080 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Proxycache Monitor</title>
+<style>
+:root {
+  --bg: #f5f5f5;
+  --surface: #ffffff;
+  --text: #1a1a1a;
+  --text-secondary: #666;
+  --border: #e0e0e0;
+  --green: #2e7d32;
+  --green-bg: #e8f5e9;
+  --red: #c62828;
+  --red-bg: #ffebee;
+  --yellow: #f57f17;
+  --yellow-bg: #fff8e1;
+  --blue: #1565c0;
+  --blue-bg: #e3f2fd;
+  --purple: #7b1fa2;
+  --purple-bg: #f3e5f5;
+  --gray: #9e9e9e;
+  --gray-bg: #fafafa;
+  --accent: #0d47a1;
+  --mono: "SF Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --text: #e0e0e0;
+    --text-secondary: #aaa;
+    --border: #2a2a4a;
+    --green: #66bb6a;
+    --green-bg: #1b3a1b;
+    --red: #ef5350;
+    --red-bg: #3a1b1b;
+    --yellow: #ffca28;
+    --yellow-bg: #3a3a1b;
+    --blue: #42a5f5;
+    --blue-bg: #1b2a3a;
+    --purple: #ce93d8;
+    --purple-bg: #2a1b3a;
+    --gray: #777;
+    --gray-bg: #1a1a2e;
+    --accent: #64b5f6;
+  }
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  padding: 16px;
+  font-size: 14px;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 20px; font-weight: 600; }
+header .controls { display: flex; align-items: center; gap: 12px; }
+header .controls label { font-size: 13px; color: var(--text-secondary); }
+header .controls select, header .controls button {
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+}
+.panel-header h2 { font-size: 14px; font-weight: 600; }
+.panel-header .toggle { font-size: 12px; color: var(--text-secondary); transition: transform 0.2s; }
+.panel-header .toggle.collapsed { transform: rotate(-90deg); }
+.panel-body { padding: 12px 14px; }
+.panel-body.collapsed { display: none; }
+
+/* Backend Health */
+.backend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.backend-item:last-child { border-bottom: none; }
+.backend-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.backend-dot.up { background: var(--green); }
+.backend-dot.down { background: var(--red); }
+.backend-dot.warning { background: var(--yellow); }
+.backend-name { font-family: var(--mono); font-size: 13px; flex: 1; }
+.backend-status { font-size: 12px; color: var(--text-secondary); }
+.backend-models { font-size: 12px; color: var(--text-secondary); margin-left: 18px; }
+
+/* Performance */
+.perf-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+}
+.perf-label { font-size: 13px; color: var(--text-secondary); min-width: 130px; display: flex; align-items: center; gap: 4px; }
+.perf-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--text-secondary);
+  font-size: 10px;
+  color: var(--text-secondary);
+  cursor: help;
+  position: relative;
+}
+.perf-info:hover::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 6px;
+  background: var(--text);
+  color: var(--bg);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 400;
+  white-space: normal;
+  width: max-content;
+  max-width: 280px;
+  z-index: 100;
+  pointer-events: none;
+  line-height: 1.4;
+}
+.perf-bar-container {
+  flex: 1;
+  margin: 0 12px;
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.perf-bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.5s ease;
+}
+.perf-bar.green, .cache-bar-fill.green { background: var(--green); }
+.perf-bar.yellow, .cache-bar-fill.yellow { background: var(--yellow); }
+.perf-bar.red, .cache-bar-fill.red { background: var(--red); }
+.perf-bar.gray, .cache-bar-fill.gray { background: var(--gray); }
+.perf-value { font-family: var(--mono); font-size: 13px; min-width: 60px; text-align: right; }
+.latency-stats {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* Cache Utilization */
+.cache-bar-container {
+  margin-bottom: 12px;
+}
+.cache-bar-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.cache-bar {
+  display: flex;
+  height: 12px;
+  background: var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.cache-bar-fill {
+  height: 100%;
+  border-radius: 6px;
+  transition: width 0.5s ease;
+  flex-shrink: 0;
+}
+.cache-backend {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 2px 0;
+}
+
+/* Slot Status */
+.slot-model-header {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--text-secondary);
+}
+.slot-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.slot-cell {
+  width: 32px; height: 24px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-family: var(--mono);
+  cursor: default;
+  position: relative;
+}
+.slot-cell.in-use { background: var(--green); color: white; }
+.slot-cell.free { background: var(--gray-bg); color: var(--gray); border: 1px solid var(--border); }
+.slot-cell.restoring { background: var(--blue); color: white; }
+  white-space: nowrap;
+  z-index: 10;
+  pointer-events: none;
+}
+.slot-legend {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.slot-legend span { display: flex; align-items: center; gap: 4px; }
+.slot-legend .swatch {
+  width: 12px; height: 12px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+/* Requests */
+.requests-filter {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.requests-filter button {
+  padding: 4px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.requests-filter button.active {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+.request-item {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 6px;
+  overflow: hidden;
+}
+.request-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: var(--mono);
+}
+.request-header:hover { background: var(--bg); }
+.request-expand { font-size: 10px; color: var(--text-secondary); transition: transform 0.2s; }
+.request-expand.open { transform: rotate(90deg); }
+.request-time { color: var(--text-secondary); }
+.request-model { font-weight: 600; }
+.request-backend { color: var(--text-secondary); }
+.request-slot { color: var(--accent); }
+.request-badge {
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.request-badge.hit { background: var(--green-bg); color: var(--green); }
+.request-badge.miss { background: var(--yellow-bg); color: var(--yellow); }
+.request-badge.recompute { background: var(--red-bg); color: var(--red); }
+.request-badge.backend_unavail { background: var(--blue-bg); color: var(--blue); }
+.request-badge.incomplete { background: var(--blue-bg); color: var(--blue); }
+.request-badge.cancelled { background: var(--gray-bg); color: var(--gray); }
+.request-badge.backend_error { background: var(--red-bg); color: var(--red); }
+.request-badge.summarization { background: var(--purple-bg, #f3e5f5); color: var(--purple, #7b1fa2); }
+.request-latency { color: var(--text-secondary); margin-left: auto; }
+.request-body {
+  display: none;
+  padding: 8px 10px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 400px;
+  overflow-y: auto;
+}
+.request-body.open { display: block; }
+.request-preview {
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-style: italic;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+.show-all-btn {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  margin-top: 8px;
+}
+.show-all-btn:hover { background: var(--bg); }
+.copy-json-btn:hover { background: var(--bg); }
+
+/* Full width panel */
+.panel.full-width { grid-column: 1 / -1; }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Proxycache Monitor</h1>
+  <div class="controls">
+    <label>Refresh:
+      <select id="refreshInterval">
+        <option value="2">2s</option>
+        <option value="5" selected>5s</option>
+        <option value="10">10s</option>
+        <option value="30">30s</option>
+      </select>
+    </label>
+    <button id="darkModeToggle">Toggle Dark</button>
+  </div>
+</header>
+
+<div class="grid">
+  <!-- Backend Health + Cache Utilization + Slot Status -->
+  <div class="panel full-width">
+    <div class="panel-header" onclick="togglePanel(this)">
+      <h2>Backend Health</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="panel-body" id="backendHealth"></div>
+  </div>
+
+  <!-- Cache Performance -->
+  <div class="panel full-width">
+    <div class="panel-header" onclick="togglePanel(this)">
+      <h2>Cache Performance</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="panel-body" id="cachePerformance"></div>
+  </div>
+
+  <!-- Recent Requests -->
+  <div class="panel full-width">
+    <div class="panel-header" onclick="togglePanel(this)">
+      <h2>Recent Requests</h2>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="panel-body" id="recentRequests">
+      <div class="requests-filter">
+        <button class="active" onclick="setFilter('all', this)">All</button>
+        <button onclick="setFilter('hit', this)">Hits</button>
+        <button onclick="setFilter('miss', this)">Misses</button>
+        <button onclick="setFilter('recompute', this)">Recomputes</button>
+        <button onclick="setFilter('summarization', this)">Summarization</button>
+        <select id="backendFilter" style="margin-left:auto;padding:4px 6px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);">
+          <option value="">All backends</option>
+        </select>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0;padding:8px;background:var(--surface);border-radius:6px;font-size:11px;align-items:center;">
+        <span style="color:var(--text-secondary);font-weight:600;">Routing:</span>
+        <span class="request-badge hit" style="font-size:10px;">DISK HIT</span><span style="color:var(--text-secondary);">cache restored</span>
+        <span class="request-badge hit" style="font-size:10px;">PENDING HIT</span><span style="color:var(--text-secondary);">in-flight slot</span>
+        <span class="request-badge recompute" style="font-size:10px;">DISK HIT / RECOMPUTE</span><span style="color:var(--text-secondary);">restore was useless</span>
+        <span class="request-badge miss" style="font-size:10px;">NO ENTRY</span><span style="color:var(--text-secondary);">no cache entry</span>
+        <span class="request-badge backend_unavail" style="font-size:10px;">BACKEND UNAVAIL</span><span style="color:var(--text-secondary);">cache hit but backend busy, fell back</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px;padding:8px;background:var(--surface);border-radius:6px;font-size:11px;align-items:center;">
+        <span style="color:var(--text-secondary);font-weight:600;">Type:</span>
+        <span class="request-badge summarization" style="font-size:10px;">SUMMARIZATION</span><span style="color:var(--text-secondary);">heuristic score >= 0.4</span>
+      </div>
+      <div id="requestsList"></div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="show-all-btn" id="refreshBtn" onclick="refreshRequests()" style="flex:0 0 auto;width:auto;">Refresh</button>
+        <button class="show-all-btn" id="prevPageBtn" onclick="changePage(-1)" style="flex:0 0 auto;width:auto;">Prev</button>
+        <span id="pageInfo" style="font-size:12px;color:var(--text-secondary);display:flex;align-items:center;height:29px;">Page 1</span>
+        <button class="show-all-btn" id="nextPageBtn" onclick="changePage(1)" style="flex:0 0 auto;width:auto;">Next</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = '';
+let refreshTimer = null;
+let currentFilter = 'all';
+let currentBackendFilter = '';
+let allRequests = [];
+let expandedRequests = new Set();
+let currentPage = parseInt(localStorage.getItem('proxycache_requests_page')) || 1;
+const PAGE_SIZE = 20;
+let totalRequestCount = 0;
+let scrollPositions = {};
+
+function togglePanel(header) {
+  const body = header.nextElementSibling;
+  const toggle = header.querySelector('.toggle');
+  const title = header.querySelector('h2').textContent;
+  body.classList.toggle('collapsed');
+  toggle.classList.toggle('collapsed');
+  localStorage.setItem('proxycache_panel_' + title, body.classList.contains('collapsed') ? '1' : '0');
+}
+
+function setFilter(filter, btn) {
+  currentFilter = filter;
+  document.querySelectorAll('.requests-filter button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderRequests();
+}
+
+function formatTime(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString();
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  while (bytes >= 1024 && i < units.length - 1) { bytes /= 1024; i++; }
+  return bytes.toFixed(1) + ' ' + units[i];
+}
+
+function getBarColor(value) {
+  if (value >= 0.8) return 'green';
+  if (value >= 0.6) return 'yellow';
+  return 'red';
+}
+
+function getBarPct(value) {
+  return Math.min(100, Math.max(0, value * 100));
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function fetchMetrics() {
+  try {
+    const resp = await fetch(API_BASE + '/metrics/dashboard');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderBackendHealth(data.backends || {}, data.cache || {}, data.slots || {}, data.backend_model_performance || {});
+    renderCachePerformance(data.performance || {}, data.backend_performance || {}, data);
+    updateBackendFilter(data.backends || {});
+    if (!expandedRequests.size) {
+      refreshRequests();
+    }
+  } catch (e) {
+    console.error('Failed to fetch metrics:', e);
+  }
+}
+
+async function refreshRequests() {
+  try {
+    const offset = (currentPage - 1) * PAGE_SIZE;
+    const resp = await fetch(API_BASE + `/metrics/requests?limit=${PAGE_SIZE}&offset=${offset}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    totalRequestCount = data.total || 0;
+    const maxPage = Math.max(1, Math.ceil(totalRequestCount / PAGE_SIZE));
+    if (currentPage > maxPage) {
+      currentPage = maxPage;
+      localStorage.setItem('proxycache_requests_page', currentPage);
+      const newOffset = (currentPage - 1) * PAGE_SIZE;
+      const resp2 = await fetch(API_BASE + `/metrics/requests?limit=${PAGE_SIZE}&offset=${newOffset}`);
+      if (resp2.ok) {
+        const data2 = await resp2.json();
+        renderRequests(data2.requests || [], totalRequestCount);
+        updatePageInfo();
+        return;
+      }
+    }
+    renderRequests(data.requests || [], totalRequestCount);
+    updatePageInfo();
+  } catch (e) {
+    console.error('Failed to fetch requests:', e);
+  }
+}
+
+function changePage(delta) {
+  const maxPage = Math.ceil(totalRequestCount / PAGE_SIZE);
+  currentPage = Math.max(1, Math.min(currentPage + delta, maxPage));
+  localStorage.setItem('proxycache_requests_page', currentPage);
+  refreshRequests();
+}
+
+function updatePageInfo() {
+  const maxPage = Math.max(1, Math.ceil(totalRequestCount / PAGE_SIZE));
+  document.getElementById('pageInfo').textContent = `Page ${currentPage} of ${maxPage}`;
+  document.getElementById('prevPageBtn').disabled = currentPage <= 1;
+  document.getElementById('nextPageBtn').disabled = currentPage >= maxPage;
+}
+
+function updateBackendFilter(backends) {
+  const sel = document.getElementById('backendFilter');
+  const current = sel.value;
+  const options = ['<option value="">All</option>'];
+  for (const key of Object.keys(backends)) {
+    options.push(`<option value="${key}" ${key === current ? 'selected' : ''}>${key}</option>`);
+  }
+  sel.innerHTML = options.join('');
+}
+
+function renderBackendHealth(backends, cache, slots, backendModelPerf) {
+  const el = document.getElementById('backendHealth');
+  if (!Object.keys(backends).length) {
+    el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No backends configured</p>';
+    return;
+  }
+  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(250px, 1fr));gap:24px;">';
+  const now = Date.now() / 1000;
+  for (const [key, info] of Object.entries(backends)) {
+    const uptime = info.up ? 'UP' : 'DOWN';
+    let dotClass = info.up ? 'up' : 'down';
+    const cacheInfo = cache && cache[key];
+    const cacheHtml = cacheInfo ? `<div class="cache-bar-container" style="margin:6px 0 4px;">
+      <div class="cache-bar">
+        <div class="cache-bar-fill ${getBarColor(cacheInfo.utilization_pct / 100)}" style="width:${Math.min(100, cacheInfo.utilization_pct)}%"></div>
+      </div>
+      <div class="cache-backend">${cacheInfo.total_gb} / ${cacheInfo.max_gb} GB &middot; ${cacheInfo.ring_size} files${cacheInfo.cache_dir ? ` &middot; ${cacheInfo.cache_dir}` : ''}</div>
+    </div>` : '';
+    html += `<div style="flex:1;min-width:250px;">`;
+    html += `<div class="backend-item" style="margin-bottom:4px;">
+      <span class="backend-dot ${dotClass}"></span>
+      <span class="backend-name">${key}</span>
+      <span class="backend-status">${uptime}</span>
+    </div>
+    ${cacheHtml}`;
+    if (info.models) {
+      for (const [modelName, modelInfo] of Object.entries(info.models)) {
+        // Get slot status for this model/backend
+        let slotCells = '';
+        if (slots && slots[key] && slots[key].models && slots[key].models[modelName]) {
+          const modelSlots = slots[key].models[modelName].slots || {};
+          for (const [slotId, slotInfo] of Object.entries(modelSlots)) {
+            let cls = 'free';
+            if (slotInfo.in_use) cls = 'in-use';
+            else if (slotInfo.last_restore && (now - slotInfo.last_used) < 5) cls = 'restoring';
+            const status = slotInfo.in_use ? 'in-use' : (slotInfo.kv_blocks > 0 ? `${slotInfo.kv_blocks} cached` : 'free');
+            slotCells += `<div class="slot-cell ${cls}" data-tooltip="S${slotId}: ${status}" style="width:24px;height:18px;font-size:9px;">${slotId}</div>`;
+          }
+        }
+        html += `<div class="backend-models">
+          ${modelName} | ${modelInfo.total_slots} slots (${modelInfo.in_use} in use), n_ctx=${modelInfo.n_ctx}
+          <div style="display:flex;flex-wrap:wrap;gap:2px;margin-top:4px;margin-left:22px;align-items:center;">
+            <span style="font-size:11px;color:var(--text-secondary);margin-right:4px;">slots:</span>${slotCells}
+          </div>`;
+        // Show EMA latency per type if available
+        const bmp = backendModelPerf && backendModelPerf[key] && backendModelPerf[key][modelName];
+        if (bmp) {
+          const parts = [];
+          if (bmp.summarization) {
+            parts.push(`<span style="color:var(--purple);">sum: ${bmp.summarization.toFixed(0)}ms avg</span>`);
+          }
+          if (bmp.conversation) {
+            parts.push(`<span style="color:var(--blue);">conv: ${bmp.conversation.toFixed(0)}ms avg</span>`);
+          }
+          if (parts.length) {
+            html += `<div style="font-size:11px;margin-top:3px;margin-left:22px;">${parts.join(' &middot; ')}</div>`;
+          }
+        }
+        html += `</div>`;
+      }
+    }
+    html += `</div>`;
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function renderCachePerformance(perf, backendPerf, summary) {
+  const el = document.getElementById('cachePerformance');
+  const g = perf;
+  if (!g.total_requests) {
+    el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No requests yet</p>';
+    return;
+  }
+
+  // Global performance
+  let html = '<div style="margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid var(--border);">';
+  const rows = [
+    ['Hit Rate', g.cache_hit_rate, 'green', false, 'Percentage of requests that resulted in a cache hit. Higher is better.'],
+    ['Mispredict Rate', g.cache_mispredict_rate, 'red', true, 'Percentage of cache hits that triggered a recompute. Lower is better.'],
+    ['Utility Rate', g.cache_utility_rate, 'green', false, 'Percentage of requests that benefited from cache (hits minus recomputes). Higher is better.'],
+    ['Save Rate', g.save_rate, 'gray', false, 'Percentage of cache hits where the KV state was worth saving to disk.'],
+    ['Restore OK', g.restore_success_rate, 'green', false, 'Percentage of cache restore attempts that succeeded (excludes requests that skipped restore). Higher is better.'],
+  ];
+  for (const [label, value, defaultColor, invert, description] of rows) {
+    const pct = getBarPct(value);
+    const color = defaultColor === 'gray' ? 'gray' : (invert ? getBarColor(1 - value) : getBarColor(value));
+    html += `<div class="perf-row">
+      <span class="perf-label">${label}<span class="perf-info" data-tooltip="${description}">?</span></span>
+      <div class="perf-bar-container">
+        <div class="perf-bar ${color}" style="width:${pct}%"></div>
+      </div>
+      <span class="perf-value">${(value * 100).toFixed(1)}%</span>
+    </div>`;
+  }
+  const lat = g.latency || {};
+  html += `<div class="latency-stats">
+    avg=${lat.avg_ms}ms &nbsp; p50=${lat.p50_ms}ms &nbsp; p95=${lat.p95_ms}ms &nbsp; p99=${lat.p99_ms}ms
+  </div></div>`;
+
+  // Per-backend performance
+  const backends = Object.keys(backendPerf || {});
+  if (backends.length) {
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(350px, 1fr));gap:24px;">';
+    for (const [beId, bp] of Object.entries(backendPerf)) {
+      html += `<div style="padding-bottom:12px;border-bottom:1px solid var(--border);">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;font-family:var(--mono);">${beId} <span style="font-weight:400;color:var(--text-secondary);">(${bp.total_requests} requests)</span></div>`;
+      const bRows = [
+        ['Hit Rate', bp.cache_hit_rate, 'green', false, 'Percentage of requests that resulted in a cache hit.'],
+        ['Mispredict Rate', bp.cache_mispredict_rate, 'red', true, 'Percentage of cache hits that triggered a recompute.'],
+        ['Utility Rate', bp.cache_utility_rate, 'green', false, 'Percentage of requests that benefited from cache.'],
+        ['Save Rate', bp.save_rate, 'gray', false, 'Percentage of cache hits where KV state was worth saving.'],
+        ['Restore OK', bp.restore_success_rate, 'green', false, 'Percentage of restore attempts that succeeded.'],
+      ];
+      for (const [label, value, defaultColor, invert, description] of bRows) {
+        const pct = getBarPct(value);
+        const color = defaultColor === 'gray' ? 'gray' : (invert ? getBarColor(1 - value) : getBarColor(value));
+        html += `<div class="perf-row">
+          <span class="perf-label">${label}<span class="perf-info" data-tooltip="${description}">?</span></span>
+          <div class="perf-bar-container">
+            <div class="perf-bar ${color}" style="width:${pct}%"></div>
+          </div>
+          <span class="perf-value">${(value * 100).toFixed(1)}%</span>
+        </div>`;
+      }
+      const blat = bp.latency || {};
+      if (blat.avg_ms) {
+        html += `<div class="latency-stats">
+          avg=${blat.avg_ms}ms &nbsp; p50=${blat.p50_ms}ms &nbsp; p95=${blat.p95_ms}ms &nbsp; p99=${blat.p99_ms}ms
+        </div>`;
+      }
+      // Per-type latency breakdown
+      if (bp.summarization || bp.conversation) {
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;">';
+        if (bp.summarization) {
+          const sl = bp.summarization.latency || {};
+          html += `<div style="font-size:11px;padding:4px 8px;background:var(--purple-bg);border-radius:4px;">
+            <span style="color:var(--purple);font-weight:600;">summarization</span> (${bp.summarization.total_requests})<br>
+            <span style="color:var(--text-secondary);">avg=${sl.avg_ms || '-'}ms p50=${sl.p50_ms || '-'}ms p95=${sl.p95_ms || '-'}ms</span>
+          </div>`;
+        } else {
+          html += '<div></div>';
+        }
+        if (bp.conversation) {
+          const cl = bp.conversation.latency || {};
+          html += `<div style="font-size:11px;padding:4px 8px;background:var(--blue-bg);border-radius:4px;">
+            <span style="color:var(--blue);font-weight:600;">conversation</span> (${bp.conversation.total_requests})<br>
+            <span style="color:var(--text-secondary);">avg=${cl.avg_ms || '-'}ms p50=${cl.p50_ms || '-'}ms p95=${cl.p95_ms || '-'}ms</span>
+          </div>`;
+        } else {
+          html += '<div></div>';
+        }
+        html += '</div>';
+      }
+      html += `</div>`;
+    }
+    html += '</div>';
+  }
+
+  // Per backend-model performance
+  const backendModelPerf = arguments[2] && arguments[2].backend_model_performance;
+  if (backendModelPerf) {
+    const hasAny = Object.values(backendModelPerf).some(vm => Object.keys(vm).length > 0);
+    if (hasAny) {
+      html += '<div style="margin-top:16px;padding-top:12px;border-top:2px solid var(--border);">';
+      html += '<div style="font-size:13px;font-weight:600;margin-bottom:8px;">Per Backend-Model Latency (persisted EMA)</div>';
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(350px, 1fr));gap:24px;">';
+      for (const [beId, models] of Object.entries(backendModelPerf)) {
+        const modelKeys = Object.keys(models);
+        if (!modelKeys.length) continue;
+        html += `<div><div style="font-size:12px;font-weight:600;font-family:var(--mono);margin-bottom:6px;">${beId}</div>`;
+        for (const [modelName, bmp] of Object.entries(models)) {
+          html += `<div style="font-size:11px;margin-bottom:4px;padding:4px 8px;background:var(--bg);border-radius:4px;">
+            <span style="font-weight:600;font-family:var(--mono);">${modelName}</span>`;
+          if (bmp.summarization || bmp.conversation) {
+            html += '<div style="display:flex;gap:8px;margin-top:3px;">';
+            if (bmp.summarization) {
+              html += `<span style="color:var(--purple);">sum: ${bmp.summarization.toFixed(0)}ms avg</span>`;
+            }
+            if (bmp.conversation) {
+              html += `<span style="color:var(--blue);">conv: ${bmp.conversation.toFixed(0)}ms avg</span>`;
+            }
+            html += '</div>';
+          }
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
+  }
+
+  // Summarization breakdown
+  const sumStats = summary && summary.summarization;
+  if (sumStats && (sumStats.total > 0 || sumStats.conversation_total > 0)) {
+    html += '<div style="margin-top:16px;padding-top:12px;border-top:2px solid var(--border);">';
+    html += '<div style="font-size:13px;font-weight:600;margin-bottom:8px;">Request Type Breakdown</div>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">';
+
+    // Summarization column
+    html += '<div style="padding:8px 12px;background:var(--purple-bg);border-radius:6px;">';
+    html += `<div style="font-size:12px;font-weight:600;color:var(--purple);margin-bottom:4px;">Summarization (${sumStats.total} requests)</div>`;
+    const slat = sumStats.latency || {};
+    if (slat.avg_ms) {
+      html += `<div style="font-size:11px;color:var(--text-secondary);">avg=${slat.avg_ms}ms &nbsp; p50=${slat.p50_ms}ms &nbsp; p95=${slat.p95_ms}ms</div>`;
+    } else {
+      html += '<div style="font-size:11px;color:var(--text-secondary);">no latency data</div>';
+    }
+    html += '</div>';
+
+    // Conversation column
+    html += '<div style="padding:8px 12px;background:var(--blue-bg);border-radius:6px;">';
+    html += `<div style="font-size:12px;font-weight:600;color:var(--blue);margin-bottom:4px;">Conversation (${sumStats.conversation_total} requests)</div>`;
+    const clat = sumStats.conversation_latency || {};
+    if (clat.avg_ms) {
+      html += `<div style="font-size:11px;color:var(--text-secondary);">avg=${clat.avg_ms}ms &nbsp; p50=${clat.p50_ms}ms &nbsp; p95=${clat.p95_ms}ms</div>`;
+    } else {
+      html += '<div style="font-size:11px;color:var(--text-secondary);">no latency data</div>';
+    }
+    html += '</div>';
+
+    html += '</div></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+function renderCacheUtilization(cache) {
+  const el = document.getElementById('cacheUtilization');
+  if (!Object.keys(cache).length) {
+    el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No cache data</p>';
+    return;
+  }
+  let html = '';
+  for (const [key, info] of Object.entries(cache)) {
+    const color = getBarColor(info.utilization_pct / 100);
+    let label = `${key} &middot; ${info.ring_size} files`;
+    if (info.cache_dir) label += ` &middot; ${info.cache_dir}`;
+    html += `<div class="cache-bar-container">
+      <div class="cache-bar-label">
+        <span>${label}</span>
+        <span>${info.total_gb} / ${info.max_gb} GB (${info.utilization_pct}%)</span>
+      </div>
+      <div class="cache-bar">
+        <div class="cache-bar-fill ${color}" style="width:${Math.min(100, info.utilization_pct)}%"></div>
+      </div>
+    </div>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderSlotStatus(slots) {
+  const el = document.getElementById('slotStatus');
+  if (!Object.keys(slots).length) {
+    el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No slot data</p>';
+    return;
+  }
+  let html = '';
+  const now = Date.now() / 1000;
+  for (const [backendId, backendData] of Object.entries(slots)) {
+    for (const [modelName, modelData] of Object.entries(backendData.models)) {
+      html += `<div class="slot-model-header">${modelName} @ ${backendId}</div>`;
+      html += '<div class="slot-grid">';
+      for (const [slotId, slotInfo] of Object.entries(modelData.slots)) {
+        let cls = 'free';
+        if (slotInfo.in_use) cls = 'in-use';
+        else if (slotInfo.last_restore && (now - slotInfo.last_used) < 5) cls = 'restoring';
+        const status = slotInfo.in_use ? 'in-use' : (slotInfo.kv_blocks > 0 ? `${slotInfo.kv_blocks} cached blocks` : 'free');
+        const tooltip = `S${slotId}: ${status}`;
+        html += `<div class="slot-cell ${cls}" data-tooltip="${tooltip}">${slotId}</div>`;
+      }
+      html += '</div>';
+    }
+  }
+  html += `<div class="slot-legend">
+    <span><span class="swatch" style="background:var(--green)"></span> In-use</span>
+    <span><span class="swatch" style="background:var(--gray-bg);border:1px solid var(--border)"></span> Free</span>
+    <span><span class="swatch" style="background:var(--blue)"></span> Restoring</span>
+  </div>`;
+  el.innerHTML = html;
+}
+
+function renderRequests(requests, total) {
+  allRequests = requests;
+  renderFilteredRequests();
+}
+
+function renderFilteredRequests() {
+  _doRenderFilteredRequests();
+}
+
+function _doRenderFilteredRequests() {
+  const el = document.getElementById('requestsList');
+  // Save scroll positions of expanded request bodies
+  const bodies = el.querySelectorAll('.request-body.open');
+  for (const body of bodies) {
+    scrollPositions[body.dataset.timestamp] = body.scrollTop;
+  }
+  let filtered = allRequests;
+  if (currentBackendFilter) {
+    filtered = filtered.filter(r => r.backend === currentBackendFilter);
+  }
+  if (currentFilter === 'hit') {
+    filtered = filtered.filter(r => r.cache_hit && !r.recompute);
+  } else if (currentFilter === 'miss') {
+    filtered = filtered.filter(r => !r.cache_hit);
+  } else if (currentFilter === 'recompute') {
+    filtered = filtered.filter(r => r.recompute);
+  } else if (currentFilter === 'summarization') {
+    filtered = filtered.filter(r => r.summarization_score != null && r.summarization_score >= 0.4);
+  }
+  if (!filtered.length) {
+    el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No matching requests</p>';
+    return;
+  }
+  filtered.sort((a, b) => b.timestamp - a.timestamp);
+  let html = '';
+  for (const req of filtered) {
+    const statusBadge = req.status && req.status !== 'complete' ? `<span class="request-badge ${req.status}" style="font-size:10px;">${req.status.toUpperCase().replace('_', ' ')}</span>` : '';
+    const routingReason = req.routing_reason || 'no_cache_entry';
+    const routingLabel = {
+      'cache_hit': req.recompute ? 'DISK HIT / RECOMPUTE' : 'DISK HIT',
+      'pending_slot_hit': 'PENDING HIT',
+      'no_cache_entry': 'NO ENTRY',
+      'cache_backend_unavailable': 'BACKEND UNAVAIL',
+    }[routingReason] || routingReason.toUpperCase();
+    const routingClass = ({
+      'cache_hit': req.recompute ? 'recompute' : 'hit',
+      'pending_slot_hit': 'hit',
+      'no_cache_entry': 'miss',
+      'cache_backend_unavailable': 'backend_unavail',
+    }[routingReason] || 'miss');
+    const sumScore = req.summarization_score;
+    const sumBadge = sumScore != null && sumScore >= 0.4
+      ? `<span class="request-badge summarization" style="font-size:10px;" data-tooltip="Signals: ${(req.summarization_signals || []).join(', ')}">SUMMARIZATION (${sumScore.toFixed(2)})</span>`
+      : '';
+    const expanded = expandedRequests.has(req.timestamp) ? 'open' : '';
+    const bodyOpen = expanded ? 'open' : '';
+    const arrowOpen = expanded ? 'open' : '';
+    const preview = req.prompt_preview ? `<div class="request-preview">"${escapeHtml(req.prompt_preview)}${req.prompt_preview.length >= 200 ? '...' : ''}"</div>` : '';
+    const metricsParts = [];
+    if (req.cache_hit && req.n_tokens) metricsParts.push(`${req.cached_tokens || 0}/${req.n_tokens} cached`);
+    if (req.n_tokens && !req.cache_hit) metricsParts.push(`${req.n_tokens} prompt tokens`);
+    if (req.saved) metricsParts.push(req.cache_size_bytes ? `saved (${formatBytes(req.cache_size_bytes)})` : 'saved');
+    if (req.restored && !req.saved) metricsParts.push('restored');
+    const metricsHtml = metricsParts.length ? `<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">${metricsParts.join(' &middot; ')}</div>` : '';
+    const fullJson = req.full_request_json ? (() => {
+      const obj = JSON.parse(JSON.stringify(req.full_request_json));
+      if (obj.tools) delete obj.tools;
+      return `<pre>${JSON.stringify(obj, null, 2).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
+    })() : '<p style="color:var(--text-secondary);font-size:12px;">No request body available</p>';
+    html += `<div class="request-item">
+      <div class="request-header" onclick="toggleRequest(${req.timestamp})">
+        <span class="request-expand ${arrowOpen}">&#9654;</span>
+        <span class="request-time">${formatTime(req.timestamp)}</span>
+        <span class="request-model">${req.model}</span>
+        <span class="request-backend">${req.backend}</span>
+        <span class="request-slot">S${req.slot_id}</span>
+        <span class="request-badge ${routingClass}" style="font-size:10px;">${routingLabel}</span>
+        ${sumBadge}
+        ${statusBadge}
+        <span class="request-latency">${req.latency_ms.toFixed(0)}ms</span>
+      </div>
+      ${req.full_request_json ? (() => {
+        const obj = JSON.parse(JSON.stringify(req.full_request_json));
+        if (obj.tools) delete obj.tools;
+        const jsonStr = JSON.stringify(obj, null, 2);
+        return `<div class="request-preview" style="display:flex;align-items:center;gap:8px;"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">"${escapeHtml(req.prompt_preview || '')}${(req.prompt_preview || '').length >= 200 ? '...' : ''}"</span><button class="copy-json-btn" data-json="${encodeURIComponent(jsonStr)}" style="font-size:11px;padding:2px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--text);cursor:pointer;flex-shrink:0;">Copy</button></div>`;
+      })() : preview}
+      ${metricsHtml ? `<div class="request-footer" style="font-size:12px;color:var(--text-secondary);padding:4px 10px;border-top:1px solid var(--border);">${metricsHtml}</div>` : ''}
+      <div class="request-footer" style="font-size:11px;color:var(--text-secondary);padding:3px 10px;border-top:1px solid var(--border);display:flex;align-items:center;gap:6px;">
+        <span style="font-family:var(--mono);opacity:0.7;">${req.request_id || '-'}</span>
+        <button class="copy-json-btn" data-json="${encodeURIComponent(req.request_id || '')}" style="font-size:10px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--surface);color:var(--text);cursor:pointer;flex-shrink:0;">Copy UUID</button>
+      </div>
+      <div class="request-body ${bodyOpen}" data-timestamp="${req.timestamp}">${fullJson}</div>
+    </div>`;
+  }
+  el.innerHTML = html;
+  // Restore scroll positions for expanded request bodies
+  for (const [ts, pos] of Object.entries(scrollPositions)) {
+    const body = el.querySelector(`.request-body[data-timestamp="${ts}"]`);
+    if (body) body.scrollTop = pos;
+  }
+}
+
+function toggleRequest(ts) {
+  if (expandedRequests.has(ts)) {
+    expandedRequests.delete(ts);
+  } else {
+    expandedRequests.add(ts);
+  }
+  renderFilteredRequests();
+}
+
+// Dark mode toggle
+document.getElementById('darkModeToggle').addEventListener('click', () => {
+  const html = document.documentElement;
+  const current = html.getAttribute('data-theme');
+  html.setAttribute('data-theme', current === 'dark' ? 'light' : 'dark');
+});
+
+// Refresh interval
+const savedRefresh = localStorage.getItem('proxycache_refresh_interval');
+if (savedRefresh) {
+  document.getElementById('refreshInterval').value = savedRefresh;
+  startAutoRefresh(parseInt(savedRefresh) * 1000);
+}
+document.getElementById('refreshInterval').addEventListener('change', (e) => {
+  const interval = parseInt(e.target.value) * 1000;
+  localStorage.setItem('proxycache_refresh_interval', e.target.value);
+  startAutoRefresh(interval);
+});
+
+document.getElementById('backendFilter').addEventListener('change', (e) => {
+  currentBackendFilter = e.target.value;
+  renderFilteredRequests();
+});
+
+function startAutoRefresh(interval) {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(fetchMetrics, interval || 5000);
+}
+
+// Slot tooltip
+const slotTooltip = document.createElement('div');
+slotTooltip.style.cssText = 'position:fixed;padding:4px 8px;border-radius:4px;font-size:11px;font-family:var(--mono);white-space:nowrap;pointer-events:none;z-index:9999;opacity:0;transition:opacity 0.15s;';
+document.body.appendChild(slotTooltip);
+
+document.addEventListener('mouseenter', (e) => {
+  if (!(e.target instanceof Element)) return;
+  const cell = e.target.closest('.slot-cell');
+  if (!cell || !cell.dataset.tooltip) return;
+  slotTooltip.textContent = cell.dataset.tooltip;
+  slotTooltip.style.background = 'var(--text)';
+  slotTooltip.style.color = 'var(--bg)';
+  slotTooltip.style.opacity = '1';
+  requestAnimationFrame(() => {
+    const rect = cell.getBoundingClientRect();
+    const tooltipRect = slotTooltip.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+    let top = rect.bottom + 4;
+    if (left < 4) left = 4;
+    if (left + tooltipRect.width > window.innerWidth - 4) {
+      left = window.innerWidth - tooltipRect.width - 4;
+    }
+    if (top + tooltipRect.height > window.innerHeight - 4) {
+      top = rect.top - tooltipRect.height - 4;
+    }
+    slotTooltip.style.left = left + 'px';
+    slotTooltip.style.top = top + 'px';
+  });
+}, true);
+
+document.addEventListener('mouseout', (e) => {
+  if (!(e.target instanceof Element)) return;
+  const cell = e.target.closest('.slot-cell');
+  if (!cell) return;
+  const related = e.relatedTarget;
+  if (!related || !related.closest || !related.closest('.slot-cell')) {
+    slotTooltip.style.opacity = '0';
+  }
+}, true);
+
+// Copy JSON button
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.copy-json-btn');
+  if (btn) {
+    const json = decodeURIComponent(btn.dataset.json);
+    const copy = () => {
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(json).then(copy).catch(() => {
+        fallbackCopy(json, copy);
+      });
+    } else {
+      fallbackCopy(json, copy);
+    }
+  }
+});
+
+function fallbackCopy(text, onSuccess) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); onSuccess(); } catch { /* ignore */ }
+  document.body.removeChild(ta);
+}
+
+// Restore panel open/closed state
+document.querySelectorAll('.panel-header').forEach(header => {
+  const title = header.querySelector('h2').textContent;
+  const collapsed = localStorage.getItem('proxycache_panel_' + title) === '1';
+  if (collapsed) {
+    const body = header.nextElementSibling;
+    const toggle = header.querySelector('.toggle');
+    body.classList.add('collapsed');
+    toggle.classList.add('collapsed');
+  }
+});
+
+// Initial fetch and start auto-refresh
+fetchMetrics();
+refreshRequests();
+startAutoRefresh(5000);
+</script>
+</body>
+</html>
