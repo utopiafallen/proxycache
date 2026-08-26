@@ -294,6 +294,15 @@ CACHE_HIT_WAIT_EMA_MAX_TIMEOUT = float(os.getenv("CACHE_HIT_WAIT_EMA_MAX_TIMEOUT
 # Metrics retention (single ring buffer for requests + diagnostic events)
 METRICS_RETENTION = int(os.getenv("METRICS_RETENTION", "200"))
 
+# Liveness event rate limiting: liveness events share the metrics ring
+# buffer with request records, so a sustained noteworthy state (e.g. a
+# health check that keeps failing and retrying while the backend is busy)
+# would otherwise evict all request history. Record liveness_diag at most
+# once per backend per interval, and re-trigger missing-models discovery
+# at most once per backend per interval.
+LIVENESS_DIAG_RECORD_INTERVAL = float(os.getenv("LIVENESS_DIAG_RECORD_INTERVAL", "60"))
+MISSING_MODELS_RETRY_INTERVAL = float(os.getenv("MISSING_MODELS_RETRY_INTERVAL", "30"))
+
 # Dashboard
 DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() in ("true", "1", "yes")
 

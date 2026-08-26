@@ -20,13 +20,37 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import BACKENDS, DEFAULT_N_CTX, CACHE_HIT_WAIT_EMA_ALPHA, META_DIR
+from config import (
+    BACKENDS, DEFAULT_N_CTX, CACHE_HIT_WAIT_EMA_ALPHA, META_DIR,
+    LIVENESS_DIAG_RECORD_INTERVAL, MISSING_MODELS_RETRY_INTERVAL,
+)
 from llama_client import LlamaClient
 from cache_agent_client import CacheAgentClient
 from hashing import sanitize_backend_dir
 from metrics import metrics
 
 log = logging.getLogger(__name__)
+
+
+def liveness_diag_due(
+    noteworthy: List[str],
+    last_recorded: Dict[str, float],
+    changed: bool,
+    now: float,
+    interval: float,
+) -> bool:
+    """Decide whether a liveness_diag event is due this tick.
+
+    State transitions (changed) always record. Otherwise a record is due
+    only if a noteworthy backend has not been recorded within ``interval``
+    seconds. This rate-limits sustained noteworthy states (e.g. a health
+    check that keeps failing and retrying while the backend is busy) so
+    liveness events cannot fill the shared metrics ring buffer and evict
+    request records.
+    """
+    if changed:
+        return True
+    return any(now - last_recorded.get(be, 0.0) >= interval for be in noteworthy)
 
 
 @dataclass
@@ -537,6 +561,11 @@ class BackendManager:
         for backend_key in self.keys():
             self._backend_state.setdefault(backend_key, True)
 
+        # Per-backend rate-limit state for liveness events (loop-local: the
+        # liveness loop is the sole accessor).
+        liveness_diag_last: Dict[str, float] = {}
+        missing_models_last: Dict[str, float] = {}
+
         while True:
             loop_t0 = time.time()
             await asyncio.sleep(5.0)
@@ -601,12 +630,24 @@ class BackendManager:
                 })
 
             # Also trigger if an up backend has no models in the registry
-            # (discovery previously failed or never ran for that backend)
+            # (discovery previously failed or never ran for that backend).
+            # Gated per-backend: retry discovery at most once per
+            # MISSING_MODELS_RETRY_INTERVAL seconds so a persistently
+            # missing model does not trigger discovery + events every tick.
+            now = time.time()
             up_keys = {k for k, v in self._backend_state.items() if v}
             discovered_backends = {be
                                     for info in self._discovered_models.values()
                                     for be in info.backends}
-            missing_models = up_keys - discovered_backends
+            missing_candidates = up_keys - discovered_backends
+            missing_models = set()
+            for be in sorted(missing_candidates):
+                if now - missing_models_last.get(be, 0.0) >= MISSING_MODELS_RETRY_INTERVAL:
+                    missing_models_last[be] = now
+                    missing_models.add(be)
+            for be in list(missing_models_last):
+                if be not in missing_candidates:
+                    del missing_models_last[be]
             if missing_models:
                 changed = True
                 for be in missing_models:
@@ -657,11 +698,19 @@ class BackendManager:
                     "discovered_models": discovered_models,
                 })
 
-            # Record diagnostic event only when something noteworthy happened
-            has_errors = any(h.get("error") for h in health_results)
-            has_retries = any(h.get("retry_succeeded") for h in health_results)
-            worth_recording = changed or has_errors or has_retries or disc_error or slots_error
-            if worth_recording:
+            # Record diagnostic event only when something noteworthy happened,
+            # rate-limited per backend: a sustained noteworthy state records
+            # at most once per LIVENESS_DIAG_RECORD_INTERVAL seconds
+            # (state transitions always record). Liveness events share the
+            # metrics ring buffer with request records, so an unthrottled
+            # firehose would evict the entire request history.
+            noteworthy = [h["backend"] for h in health_results
+                          if h.get("error") or h.get("retry_succeeded")
+                          or h.get("state_changed")]
+            worth_recording = changed or bool(noteworthy) or bool(disc_error) or bool(slots_error)
+            if worth_recording and liveness_diag_due(
+                    noteworthy, liveness_diag_last, changed,
+                    now, LIVENESS_DIAG_RECORD_INTERVAL):
                 metrics.record({
                     "event": "liveness_diag",
                     "health": health_results,
@@ -675,6 +724,8 @@ class BackendManager:
                     "slots_error": slots_error,
                     "total_ms": round((time.time() - loop_t0) * 1000, 1),
                 })
+                for be in noteworthy:
+                    liveness_diag_last[be] = now
 
 
 # Module-level singleton

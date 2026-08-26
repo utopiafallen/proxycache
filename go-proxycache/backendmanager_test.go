@@ -583,3 +583,31 @@ func agentPortFromHostPort(t *testing.T, hostPort string) int {
 	t.Fatalf("no port in %q", hostPort)
 	return 0
 }
+
+func TestLivenessDiagDue(t *testing.T) {
+	// State transitions always record.
+	if !livenessDiagDue(nil, nil, true, 100, 60) {
+		t.Error("changed=true should always be due")
+	}
+	// Nothing noteworthy, no change: not due.
+	if livenessDiagDue(nil, nil, false, 100, 60) {
+		t.Error("nothing noteworthy should not be due")
+	}
+	// First tick of a noteworthy backend: due (no prior record).
+	if !livenessDiagDue([]string{"a"}, map[string]float64{}, false, 100, 60) {
+		t.Error("first noteworthy tick should be due")
+	}
+	// Sustained episode within the interval: suppressed.
+	last := map[string]float64{"a": 100}
+	if livenessDiagDue([]string{"a"}, last, false, 159.9, 60) {
+		t.Error("sustained episode within interval should be suppressed")
+	}
+	// Due again after the interval elapses.
+	if !livenessDiagDue([]string{"a"}, last, false, 160, 60) {
+		t.Error("should be due after interval elapses")
+	}
+	// A second backend's first episode is independent of the first's.
+	if !livenessDiagDue([]string{"b"}, last, false, 110, 60) {
+		t.Error("unrecorded backend should be due regardless of other backends")
+	}
+}

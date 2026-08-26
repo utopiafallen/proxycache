@@ -973,6 +973,11 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 	}
 	bm.mu.Unlock()
 
+	// Loop-local per-backend rate-limit state for liveness events (the
+	// liveness loop is the sole accessor).
+	livenessDiagLast := map[string]float64{}
+	missingModelsLast := map[string]float64{}
+
 	for {
 		loopT0 := nowFloat()
 		select {
@@ -1049,10 +1054,24 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 				discoveredBackends[be] = true
 			}
 		}
+		// Gated per-backend: re-trigger discovery at most once per
+		// MissingModelsRetryInterval seconds per backend so a persistently
+		// missing model does not trigger discovery + events every tick.
+		now := nowFloat()
+		missingCandidates := map[string]bool{}
 		missingModels := []string{}
 		for k := range upKeys {
 			if !discoveredBackends[k] {
-				missingModels = append(missingModels, k)
+				missingCandidates[k] = true
+				if now-missingModelsLast[k] >= MissingModelsRetryInterval {
+					missingModelsLast[k] = now
+					missingModels = append(missingModels, k)
+				}
+			}
+		}
+		for be := range missingModelsLast {
+			if !missingCandidates[be] {
+				delete(missingModelsLast, be)
 			}
 		}
 		bm.mu.RUnlock()
@@ -1127,19 +1146,20 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 			})
 		}
 
-		// Record a diagnostic event only when something noteworthy happened.
-		hasErrors := false
-		hasRetries := false
+		// Record a diagnostic event only when something noteworthy happened,
+		// rate-limited per backend: a sustained noteworthy state records at
+		// most once per LivenessDiagRecordInterval seconds (state
+		// transitions always record). Liveness events share the metrics ring
+		// buffer with request records, so an unthrottled firehose would
+		// evict the entire request history.
+		noteworthy := []string{}
 		for _, h := range healthResults {
-			if h["error"] != "" {
-				hasErrors = true
-			}
-			if h["retry_succeeded"] == true {
-				hasRetries = true
+			if h["error"] != "" || h["retry_succeeded"] == true || h["state_changed"] == true {
+				noteworthy = append(noteworthy, h["backend"].(string))
 			}
 		}
-		worthRecording := changed || hasErrors || hasRetries || discError != "" || slotsError != ""
-		if worthRecording {
+		worthRecording := changed || len(noteworthy) > 0 || discError != "" || slotsError != ""
+		if worthRecording && livenessDiagDue(noteworthy, livenessDiagLast, changed, now, LivenessDiagRecordInterval) {
 			bm.mu.RLock()
 			states := map[string]bool{}
 			for k, v := range bm.backendState {
@@ -1169,8 +1189,29 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 				record["slots_ms"] = round1(*slotsMS)
 			}
 			Metrics.Record(record)
+			for _, be := range noteworthy {
+				livenessDiagLast[be] = now
+			}
 		}
 	}
+}
+
+// livenessDiagDue reports whether a liveness_diag event is due this tick.
+// State transitions (changed) always record. Otherwise a record is due only
+// if a noteworthy backend has not been recorded within interval seconds.
+// This rate-limits sustained noteworthy states (e.g. a health check that
+// keeps failing and retrying while the backend is busy) so liveness events
+// cannot fill the shared metrics ring buffer and evict request records.
+func livenessDiagDue(noteworthy []string, lastRecorded map[string]float64, changed bool, now, interval float64) bool {
+	if changed {
+		return true
+	}
+	for _, be := range noteworthy {
+		if now-lastRecorded[be] >= interval {
+			return true
+		}
+	}
+	return false
 }
 
 // errName produces a Python-flavored exception type name for log/metrics

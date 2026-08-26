@@ -59,7 +59,7 @@ python test_smoke.py                           # smoke tests (no framework, uses
 - **Meta reconciliation**: on startup, orphaned/corrupted `.meta.json` files are deleted via `reconcile_meta()`.
 - **Backend config validation**: each backend MUST specify exactly one of `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). Mutually exclusive. Missing either raises `ValueError` at startup.
 - **BACKENDS default**: when empty, defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`.
-- **Liveness checker**: pings backends every 5s, triggers model discovery and slot refresh on state change.
+- **Liveness checker**: pings backends every 5s, triggers model discovery and slot refresh on state change. Liveness *events* are rate-limited per backend — `liveness_diag` records at most once per `LIVENESS_DIAG_RECORD_INTERVAL` (default 60s) per backend unless state changed, and missing-models discovery re-triggers at most once per `MISSING_MODELS_RETRY_INTERVAL` (default 30s) per backend. Rationale: liveness events share the metrics ring buffer with request records, and unthrottled events (a busy backend flapping its health check) evict all request history.
 - **Model resolution**: exact match → substring match (case-insensitive) → `"any"` matches all discovered models.
 - **test_smoke.py**: some tests reference backend keys with colons (e.g. `"10.0.0.1:8000"`) instead of the sanitized form (`"10.0.0.1-8000"`). Tests that manually construct `BackendManager` instances may assert against the wrong key format — verify against `sanitize_backend_dir()` output.
 - `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, `run-proxycache.ps1`, `uv.lock`, `cache-agent.exe`, and `proxycache.exe`.

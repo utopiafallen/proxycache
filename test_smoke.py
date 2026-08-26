@@ -93,6 +93,26 @@ def test_backend_manager_model_registration():
     print("PASS: test_backend_manager_model_registration")
 
 
+def test_liveness_diag_due():
+    """liveness_diag is rate-limited per backend; state transitions always record."""
+    from backend_manager import liveness_diag_due
+
+    # State transitions always record.
+    assert liveness_diag_due([], {}, True, 100.0, 60.0)
+    # Nothing noteworthy, no change: not due.
+    assert not liveness_diag_due([], {}, False, 100.0, 60.0)
+    # First tick of a noteworthy backend: due (no prior record).
+    assert liveness_diag_due(["a"], {}, False, 100.0, 60.0)
+    # Sustained episode within the interval: suppressed.
+    last = {"a": 100.0}
+    assert not liveness_diag_due(["a"], last, False, 159.9, 60.0)
+    # Due again once the interval elapses.
+    assert liveness_diag_due(["a"], last, False, 160.0, 60.0)
+    # A second backend's first episode is independent of the first's.
+    assert liveness_diag_due(["b"], last, False, 110.0, 60.0)
+    print("PASS: test_liveness_diag_due")
+
+
 # ── hashing tests (unchanged) ────────────────────────────────────────
 
 def test_reconcile_meta_removes_orphans():
@@ -3072,6 +3092,10 @@ if __name__ == "__main__":
     test_metrics_collector_per_backend()
     test_metrics_collector_two_phase_recording()
     test_dashboard_endpoint()
+
+    # ── Liveness event rate limiting tests ─────────────────────────────
+
+    test_liveness_diag_due()
 
     print("\nAll smoke tests passed.")
 

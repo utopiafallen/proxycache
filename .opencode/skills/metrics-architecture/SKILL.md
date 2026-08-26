@@ -18,7 +18,9 @@ Requests flow through multiple recording phases, all updating the same ring buff
 
 **Liveness events**: The backend manager's `_liveness_loop()` records two event types:
 - `event="liveness_change"` — when backend state changes (up/down) or models are missing from discovery. Uses synthetic `request_id` (`liveness:<timestamp_ms>`), includes `state_changes` and `discovered_models`.
-- `event="liveness_diag"` — on every noteworthy liveness iteration (state change, health errors, retries, discover/refresh errors). Includes per-backend health timing, error names, retry status, discovery timing.
+- `event="liveness_diag"` — on noteworthy liveness iterations (state change, health errors, retries, discover/refresh errors), **rate-limited per backend**: a sustained noteworthy state records at most once per `LIVENESS_DIAG_RECORD_INTERVAL` seconds (default 60) per backend; state transitions always record. Includes per-backend health timing, error names, retry status, discovery timing.
+
+Both event types are rate-limited for a reason: liveness events share the metrics ring buffer with request records. A busy llama.cpp backend intermittently times out its health endpoint (HTTP is blocked during long prefill/generation), so the "fail then retry-succeed" tick would fire every 5s and evict the entire request history (~17 min at retention 200), making the dashboard's request history appear to "periodically empty." The missing-models discovery re-trigger is similarly gated per backend to `MISSING_MODELS_RETRY_INTERVAL` seconds (default 30).
 
 **Key behavior:**
 - `_by_id: Dict[str, int]` maps request_id → index in ring buffer, rebuilt after every append (deque auto-evicts without notification, leaving stale indices)
@@ -103,7 +105,7 @@ Single `deque(maxlen=retention)` (default 200) holds both request records and di
 
 ## Liveness Diagnostics (`liveness_diag` events)
 
-Recorded when a liveness iteration has state changes, health errors, retries, or discover/refresh errors. Structure:
+Recorded when a liveness iteration has state changes, health errors, retries, or discover/refresh errors, gated by `liveness_diag_due()`: state transitions always record; otherwise a record is due only if a noteworthy backend has not been recorded within `LIVENESS_DIAG_RECORD_INTERVAL` seconds. Structure:
 
 ```python
 {
@@ -187,4 +189,5 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 - **Prompt preview extraction**: `extract_prompt_preview()` in `metrics.py` — looks for the most recent message with role "user" or "assistant", iterating messages in reverse order, skipping empty content. Called from `record()`, streaming `_cleanup()`, arrival recording, and non-streaming completion.
 - **`cached_tokens=0` on pending slot hit**: Indicates `_slot_kv_state` was stale — the proxy's block tracking didn't match llama.cpp's actual KV cache. The slot may have been evicted or served a different conversation.
 - **`routing_diagnostics.scan` may skip backends**: If a backend goes down during the cache scan, it appears with `status="unreachable"` and no ratio data. Cross-reference with liveness events to determine if the backend was dropped from the model registry.
+- **Liveness events and requests share one ring buffer**: because of this, liveness events are rate-limited per backend (`liveness_diag_due()` / `MISSING_MODELS_RETRY_INTERVAL` gating). If you relax the gating, sustained health-check flapping (common while the backend is busy) will evict all request records and the dashboard history will appear to empty periodically.
 - **Pending slot exclusion fix**: `candidate_backends` excludes `restore_backend` only when `restore_key` is truthy. When a pending slot hit overrides a cache hit, `restore_key` becomes None, so the pending-hit backend stays in the candidate list (prevents the "backend excluded but not prioritized" bug).
