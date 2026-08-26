@@ -21,7 +21,7 @@ Querying and parsing proxycache request history from the metrics dashboard.
 | `GET /metrics/diagnostics?liveness=true` | Recent backend liveness change events |
 | `GET /metrics/diagnostics?timeline=true` | Unified timeline (requests + events) for post-mortem |
 
-Default port is from `config.py` (`DASHBOARD_PORT`, defaults to 1235).
+The port is the `PORT` env var (`config.go`, default 8081); all metrics endpoints are served on the same port as the proxy. The examples below use port 1235 (the common dev instance).
 
 ## Request Record Fields
 
@@ -64,7 +64,7 @@ The `routing_diagnostics` dict is set during the routing phase and contains the 
 | `best_ratio` | float | Highest LCP ratio found across all backends |
 | `restore_key` | str or None | Cache file key (first 16 chars), or None for pending slot hits |
 | `restore_backend` | str or None | Backend with the winning match |
-| `restore_info_backend` | str or None | Backend that would get priority in `acquire_for_request` |
+| `restore_info_backend` | str or None | Backend that would get priority in `acquireSlotForRequest` |
 | `candidate_backends` | list[str] | Fallback backends (excludes restore backend when `restore_key` is set) |
 | `scan` | list[dict] | Per-backend scan results (see below) |
 
@@ -83,11 +83,11 @@ The `routing_diagnostics` dict is set during the routing phase and contains the 
 
 **Skip-restore diagnostics** (`routing_diagnostics.skip_restore`):
 
-Populated only when `should_skip_restore` returns `True` (restore was skipped):
+Populated only when `ShouldSkipRestore()` returns `true` (restore was skipped):
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `skipped` | bool | Always `True` |
+| `skipped` | bool | Always `true` |
 | `backend` | str | Backend key where skip occurred |
 | `slot_id` | int | Slot that was reused |
 | `old_kv_blocks` | int | Block count in slot's previous KV state |
@@ -189,9 +189,10 @@ for r in data.get('requests', []):
 
 ## Query Script
 
-`query_metrics.py` (in this skill directory) provides a CLI for common queries:
+`query_metrics.py` (in this skill directory) provides a CLI for common queries. It defaults to `http://localhost:1235`; override with `PROXYCACHE_URL`:
 
 ```bash
+PROXYCACHE_URL=http://localhost:1236 python .opencode/skills/metrics-query/query_metrics.py
 python .opencode/skills/metrics-query/query_metrics.py                          # summary + recent requests
 python .opencode/skills/metrics-query/query_metrics.py --reason pending_slot_hit  # filter by routing reason
 python .opencode/skills/metrics-query/query_metrics.py --reason cache_backend_unavailable
@@ -206,7 +207,7 @@ python .opencode/skills/metrics-query/query_metrics.py --limit 200              
 - **Incomplete records**: Arrival records have `status="incomplete"`, `backend="unknown"`, `slot_id=-1`. Filter them out with `r.get('status') == 'complete'`.
 - **`request_json` is large**: Use `requests_summary` from `/metrics/dashboard` for bulk queries, or omit `request_json` when printing.
 - **`cache_hit` vs `restored`**: `cache_hit=True` means a cache match was found. `restored=True` means the KV cache was actually loaded from disk. They can differ: pending slot hits have `cache_hit=True` but `restored=False` (slot already has content).
-- **`cached_tokens=0` on pending slot hit**: Means `_slot_kv_state` was wrong — the proxy thought the slot had matching blocks, but llama.cpp's actual KV cache didn't match. Common when the slot was evicted or served a different conversation.
-- **Ring buffer size**: Single ring buffer for requests + events (`METRICS_RETENTION`, default 200). `get_requests()` filters out events automatically. Use `?timeline=true` to see all entries.
+- **`cached_tokens=0` on pending slot hit**: Means `slotKVState` was wrong — the proxy thought the slot had matching blocks, but llama.cpp's actual KV cache didn't match. Common when the slot was evicted or served a different conversation.
+- **Ring buffer size**: Single ring buffer for requests + events (`METRICS_RETENTION`, default 200). `GetRequests()` filters out events automatically. Use `?timeline=true` to see all entries.
 - **`routing_reason` not in `request_json`**: It's a top-level field in the metrics record, not inside `request_json`.
 - **`routing_diagnostics.scan` may be missing backends**: If a backend went down during the scan, it appears with `status="unreachable"` and no ratio data. Check liveness events to see if the backend was dropped.

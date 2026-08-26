@@ -8,16 +8,19 @@ Usage:
     python query_metrics.py --suspicious     # restored=True but cache_hit=False
     python query_metrics.py --top 20         # show more requests
     python query_metrics.py --json           # raw JSON output
+
+The base URL defaults to http://localhost:1235; override with PROXYCACHE_URL.
 """
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
 from collections import Counter
 from datetime import datetime
 
-BASE_URL = "http://localhost:1235"
+BASE_URL = os.environ.get("PROXYCACHE_URL", "http://localhost:1235")
 
 
 def fetch_requests(limit=100, offset=0):

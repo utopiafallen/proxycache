@@ -2,6 +2,8 @@
 
 OpenAI-compatible proxy for `llama.cpp` that manages KV cache slots with disk save/restore, automatic model discovery, and cache-aware multi-backend routing.
 
+Written in Go. The original Python implementation is preserved under `archive/python/` as a behavior reference only.
+
 ## Architecture
 
 ```
@@ -38,7 +40,7 @@ The proxy supports both streaming (SSE) and non-streaming responses.
 
 ## Configuration
 
-All config via environment variables (defaults in `config.py`). No `.env` file support.
+All config via environment variables (defaults in `config.go`). No `.env` file support. The binary ignores command-line flags — set the `PORT` env var to change the listen port.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -53,7 +55,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `CACHE_SAVE_CTX_THRESHOLD` | `0.7` | Skip cache save if request tokens >= this fraction of backend's max context (avoids saving cache that will be invalidated by compaction) |
 | `SLOT_TIMEOUT` | `30` | Timeout for slot save/restore operations (seconds) |
 | `REQUEST_TIMEOUT` | `600` | HTTP timeout to backend (seconds) |
-| `CLIENT_RECREATE_INTERVAL` | `50` | Recreate the httpx client after this many requests per backend to avoid stale connections |
+| `CLIENT_RECREATE_INTERVAL` | `50` | Recreate the HTTP client after this many requests per backend to avoid stale connections |
 | `MODEL_ID` | `llama.cpp` | Default model ID when client omits it |
 | `CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT` | `30` | Initial EMA timeout for cache-hit wait queue (seconds) |
 | `CACHE_HIT_WAIT_EMA_MIN_TIMEOUT` | `10` | Minimum wait queue timeout (seconds) |
@@ -61,7 +63,7 @@ All config via environment variables (defaults in `config.py`). No `.env` file s
 | `CACHE_HIT_WAIT_EMA_ALPHA` | `0.2` | EMA smoothing factor (0–1) |
 | `CACHE_HIT_WAIT_MAX_PENDING_REQS` | `3` | Max concurrent waiters per backend |
 | `DEFAULT_N_CTX` | `16384` | Fallback context length when backend doesn't report `n_ctx` |
-| `LOG_LEVEL` | `INFO` | Python logging level |
+| `LOG_LEVEL` | `INFO` | Log level (`DEBUG`, `INFO`, `WARN`, `ERROR`) |
 | `METRICS_RETENTION` | `200` | Single ring buffer size for requests + diagnostic events |
 | `DASHBOARD_ENABLED` | `true` | Enable the monitoring dashboard (`false`, `no`, `0` to disable) |
 
@@ -95,7 +97,7 @@ Each request record includes:
 - **Per-model and per-backend breakdowns**
 - **Routing diagnostics**: per-backend cache scan results (cache file ratio, pending slot ratios, unreachable status), best match ratio, selected backend, and candidate fallback list
 
-Metrics are recorded in three phases: arrival (status=`incomplete`), routing decision (backend, slot, routing reason), and completion (latency, cache hit/miss, save status). Streaming requests record metrics in `StreamReader._cleanup()` after the full response lifecycle.
+Metrics are recorded in three phases: arrival (status=`incomplete`), routing decision (backend, slot, routing reason), and completion (latency, cache hit/miss, save status). Streaming requests record metrics in `streamState.cleanup()` after the full response lifecycle.
 
 Diagnostic events are recorded when backends change liveness state (up/down), capturing `state_changes` and `discovered_models` snapshots. The unified timeline (`GET /metrics/diagnostics?timeline=true`) preserves the chronological sequence of requests and events for post-mortem analysis.
 
@@ -195,12 +197,13 @@ llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 
 
 **Note:** For the most effective cache management, run llama.cpp with a single slot (`-np 1`) or with unified KV cache disabled (`-no-kvu`). Unified KV cache can cause slot-level cache restores to fail across requests due to fragmentation or contention inside the unified KV cache. Refer to your llama.cpp version's documentation for the appropriate flags.
 
-### 2. Run the proxy
+### 2. Build and run the proxy
 
 ```bash
-uv sync
-uv run python proxycache.py
-# or: uvicorn app:app --host 0.0.0.0 --port 8081
+./build-proxycache.sh     # or: go build
+./proxycache.exe
 ```
+
+The build script locates the Windows Go toolchain automatically (on WSL2 it uses `/mnt/c/Program Files/Go/bin/go.exe`) and emits `proxycache.exe` at the repo root. The binary binds `0.0.0.0:$PORT` — all configuration comes from environment variables; command-line flags are ignored.
 
 Point clients at the proxy's `/v1/chat/completions` endpoint.
