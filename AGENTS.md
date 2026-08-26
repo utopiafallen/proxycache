@@ -4,7 +4,7 @@ OpenAI-compatible proxy for `llama.cpp` KV cache slot management with disk save/
 
 ## Environment
 
-**WSL2** — builds target Windows using the Windows Go toolchain: `/mnt/c/Program Files/Go/bin/go.exe` (the build scripts locate it automatically; plain `go build` works too). Do NOT use a Linux Go toolchain — the binaries must run on Windows.
+**WSL2** — builds target Windows using the Windows Go toolchain: `/mnt/c/Program Files/Go/bin/go.exe` (the build scripts locate it automatically; plain `go build -o proxycache.exe ./cmd/proxycache` works too). Do NOT use a Linux Go toolchain — the binaries must run on Windows.
 
 The archived Python app (only if you're working on `archive/python/`) uses `uv` from Windows. Do NOT install Python packages via pip/apt inside WSL2.
 
@@ -13,7 +13,7 @@ The archived Python app (only if you're working on `archive/python/`) uses `uv` 
 ```bash
 ./build-proxycache.sh                        # builds proxycache.exe at repo root
 ./build-cache-agent.sh                       # builds cache-agent.exe at repo root
-go build                                     # same as build-proxycache.sh
+go build -o proxycache.exe ./cmd/proxycache  # same as build-proxycache.sh
 go vet ./...                                 # no linter configured; vet is the check
 go test -count=1 ./...                       # full test suite (stdlib `testing`, no framework)
 ./proxycache.exe                             # run (all config via env vars, see config.go)
@@ -25,8 +25,10 @@ go test -count=1 ./...                       # full test suite (stdlib `testing`
 
 | File | Role |
 |------|------|
-| `main.go` | Entry point: slot init from disk, meta reconciliation, liveness start, HTTP mux, graceful shutdown |
-| `app.go` | HTTP routes, request handling, streaming pipeline (`serveStream` → `streamState`) |
+| `entry.go` | Library entry point (`Main()`): slot init from disk, meta reconciliation, liveness start, HTTP mux, graceful shutdown |
+| `cmd/proxycache/main.go` | Thin `package main` wrapper that calls `proxycache.Main()`; the only `package main` in the root module |
+| `tests/` | External test package (`package tests`) importing `proxycache`; all test files live here |
+| `app.go` | HTTP routes, request handling, streaming pipeline (`serveStream` → `StreamState`) |
 | `backendmanager.go` | `BackendManager`: backend registry, LlamaClient/CacheAgentClient instances, model-to-backend mapping, liveness checker |
 | `config.go` | All config via env vars (no .env file), save heuristics, request classification |
 | `hashing.go` | Hashing primitives: block hashes from tokens, LCP matching, cache key generation, backend key sanitization |
@@ -45,14 +47,14 @@ go test -count=1 ./...                       # full test suite (stdlib `testing`
 
 - **llama.cpp prerequisite**: MUST start with `--slot-save-path <dir>`. Cache save/restore fails silently without it.
 - **Config**: all env vars only — `config.go` has defaults. No `.env` file support.
-- **Binary ignores CLI args**: `main.go` binds `0.0.0.0:$PORT` from the environment; `--host`/`--port` flags on the command line are silently ignored. Set the `PORT` env var instead.
+- **Binary ignores CLI args**: `entry.go` binds `0.0.0.0:$PORT` from the environment; `--host`/`--port` flags on the command line are silently ignored. Set the `PORT` env var instead.
 - **Cache key**: `sha256(canonical_name + '\n' + token_ids)` (`MetaKey()` in `hashing.go`) — based on token IDs, not raw text.
 - **Backend keys**: sanitized `host-port` strings (only colons replaced with dashes, e.g. `"10.0.0.1:8000"` → `"10.0.0.1-8000"`), NOT raw `host:port`. `SanitizeBackendDir()` in `hashing.go`. Used as directory names under `META_DIR/`.
 - **BACKEND_MODE**: env var, default `"llama-cpp"`. Set to `"llama-swap"` to route slot save/restore through `/upstream/{model}/slots/{id}` instead of `/slots/{id}`.
 - **Slot pinning** is duplicated 3 ways in every request body (`withSlotID()` in `llamaclient.go`): root (`slot_id`, `id_slot`, `_slot_id`), `options` dict, and query params.
-- **Save happens after response** completes (both stream and non-stream), never before (`streamState.save()`).
-- **Streaming**: `serveStream` runs a `streamState` whose `readLoop` pumps body reads; a heartbeat goroutine checks client disconnection every 0.5s. `cleanup()` saves the slot only if the stream completed normally (not cancelled mid-stream), then releases it.
-- **No timeout on the stream body read**: CANNOT add a read deadline to `readLoop` — if it fires, the connection is closed prematurely while the backend is still processing (e.g., slow prompt prefill on large context). The only safe disconnection paths are: backend sends data/error, backend closes the connection, or the upstream client disconnects (heartbeat).
+- **Save happens after response** completes (both stream and non-stream), never before (`StreamState.save()`).
+- **Streaming**: `serveStream` runs a `StreamState` whose `ReadLoop` pumps body reads; a heartbeat goroutine checks client disconnection every 0.5s. `cleanup()` saves the slot only if the stream completed normally (not cancelled mid-stream), then releases it.
+- **No timeout on the stream body read**: CANNOT add a read deadline to `ReadLoop` — if it fires, the connection is closed prematurely while the backend is still processing (e.g., slow prompt prefill on large context). The only safe disconnection paths are: backend sends data/error, backend closes the connection, or the upstream client disconnects (heartbeat).
 - **Don't cancel the request context while the body is streaming**: cancelling an in-flight response read leaves the pooled connection in a broken state and subsequent requests on it can hang. Timeouts on cleanup operations (closing the body after the stream completes, waiting on an already-cancelled task) are safe since no in-flight read exists.
 - **Slot acquire retry**: retries forever until a slot frees (growing backoff 5s, 10s, ...). No 503 on slot exhaustion — a request only aborts on client disconnect / context cancellation.
 - **Slot timeout**: `SLOT_TIMEOUT` (default 30s) wraps `/slots/{id}?action=save|restore`. Separate from `REQUEST_TIMEOUT` (600s).
@@ -61,9 +63,9 @@ go test -count=1 ./...                       # full test suite (stdlib `testing`
 - **KV cache skip**: `ShouldSkipRestore()` in `slotmanager.go` checks the slot's tracked KV state before restoring. If the LCP ratio >= `KV_CACHE_SKIP_THRESHOLD` (default 0.9) — and the block-count difference is within `KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT` (default 0.1) — restore is skipped; llama.cpp appends to the existing cache. Only safe on single-slot backends.
 - **Cache save skip**: `ShouldSaveCache()` in `config.go` skips save when the restore candidate ratio > `CACHE_SAVE_RATIO_THRESHOLD` (default 0.8) and no recompute happened — avoids saving redundant cache entries. `ShouldSkipSaveHeuristic()` additionally skips near-max-context and classified-summarization requests.
 - **Recompute detection**: `isRecompute()` in `app.go` with `recomputeThresholdRatio = 0.7` (the archived Python used 0.92 — Go is canonical). If `cached_tokens < expected * 0.7`, the restore was partial/useless. Increments `recompute_penalty` on the meta file (`IncrementRecomputePenalty()` in `kvmeta.go`), which degrades its candidate score.
-- **Ring buffer eviction**: `evictIfNeeded()` in `slotmanager.go` evicts expired entries (age-first) then LRU when total bytes exceed `cache_max_size_gb` (per-backend, default 25 GB). Only triggers on saves.
+- **Ring buffer eviction**: `EvictIfNeeded()` in `slotmanager.go` evicts expired entries (age-first) then LRU when total bytes exceed `cache_max_size_gb` (per-backend, default 25 GB). Only triggers on saves.
 - **Slot refresh**: no cooldown throttle — every request triggers a refresh. On-demand discovery via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode). Falls back to 1 slot if discovery fails.
-- **Meta reconciliation**: on startup, orphaned/corrupted `.meta.json` files are deleted via `kvMeta.Reconcile()` in `main.go`.
+- **Meta reconciliation**: on startup, orphaned/corrupted `.meta.json` files are deleted via `GetKVMeta().Reconcile()` in `entry.go`.
 - **Backend config validation**: `initBackends()` in `backendmanager.go` — each backend MUST specify exactly one of `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). Mutually exclusive. Violations panic at startup.
 - **BACKENDS default**: when empty, defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`.
 - **Liveness checker**: `livenessLoop()` in `backendmanager.go` pings backends every 5s, triggers model discovery and slot refresh on state change. Liveness *events* are rate-limited per backend — `liveness_diag` records at most once per `LIVENESS_DIAG_RECORD_INTERVAL` (default 60s) per backend unless state changed (gate: `livenessDiagDue()`), and missing-models discovery re-triggers at most once per `MISSING_MODELS_RETRY_INTERVAL` (default 30s) per backend. Rationale: liveness events share the metrics ring buffer with request records, and unthrottled events (a busy backend flapping its health check) evict all request history.

@@ -1,7 +1,7 @@
 // config.go — all configuration from environment variables (no .env file),
 // plus the request classifier (summarization vs conversation) and save heuristics.
 
-package main
+package proxycache
 
 import (
 	"encoding/json"
@@ -38,29 +38,29 @@ func initBackends() {
 // --- Numeric / general config ---
 
 var (
-	WordsPerBlock              = envInt("WORDS_PER_BLOCK", 100)
-	LCPTh                      = envFloat("LCP_TH", 0.2)
-	MetaDir                    = filepath.Join(mustGetwd(), envStr("META_DIR", "kv_meta"))
-	RequestTimeout             = envFloat("REQUEST_TIMEOUT", 600)
-	ModelID                    = envStr("MODEL_ID", "llama.cpp")
-	BackendMode                = envStr("BACKEND_MODE", "llama-cpp")
-	Port                       = envInt("PORT", 8081)
-	DefaultNCtx                = envInt("DEFAULT_N_CTX", 16384)
-	KVCacheSkipThreshold       = envFloat("KV_CACHE_SKIP_THRESHOLD", 0.9)
-	KVCacheSkipMaxBlockDiff    = envFloat("KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT", 0.1)
-	CacheSaveRatioThreshold    = envFloat("CACHE_SAVE_RATIO_THRESHOLD", 0.8)
-	CacheSaveCtxThreshold      = envFloat("CACHE_SAVE_CTX_THRESHOLD", 0.7)
-	SlotTimeout                = envFloat("SLOT_TIMEOUT", 30)
-	ClientRecreateInterval     = envInt("CLIENT_RECREATE_INTERVAL", 50)
-	CacheHitWaitEMAMinT        = envFloat("CACHE_HIT_WAIT_EMA_MIN_TIMEOUT", 10)
-	CacheHitWaitMaxPending     = envInt("CACHE_HIT_WAIT_MAX_PENDING_REQS", 3)
-	CacheHitWaitEMAAlpha       = envFloat("CACHE_HIT_WAIT_EMA_ALPHA", 0.2)
-	CacheHitWaitEMAInitialT    = envFloat("CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT", 30)
-	CacheHitWaitEMAMaxT        = envFloat("CACHE_HIT_WAIT_EMA_MAX_TIMEOUT", 300)
-	MetricsRetention           = envInt("METRICS_RETENTION", 200)
-	LivenessDiagRecordInterval = envFloat("LIVENESS_DIAG_RECORD_INTERVAL", 60)
-	MissingModelsRetryInterval = envFloat("MISSING_MODELS_RETRY_INTERVAL", 30)
-	DashboardEnabled           = envBool("DASHBOARD_ENABLED", true)
+	WordsPerBlock              = EnvInt("WORDS_PER_BLOCK", 100)
+	LCPTh                      = EnvFloat("LCP_TH", 0.2)
+	MetaDir                    = filepath.Join(mustGetwd(), EnvStr("META_DIR", "kv_meta"))
+	RequestTimeout             = EnvFloat("REQUEST_TIMEOUT", 600)
+	ModelID                    = EnvStr("MODEL_ID", "llama.cpp")
+	BackendMode                = EnvStr("BACKEND_MODE", "llama-cpp")
+	Port                       = EnvInt("PORT", 8081)
+	DefaultNCtx                = EnvInt("DEFAULT_N_CTX", 16384)
+	KVCacheSkipThreshold       = EnvFloat("KV_CACHE_SKIP_THRESHOLD", 0.9)
+	KVCacheSkipMaxBlockDiff    = EnvFloat("KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT", 0.1)
+	CacheSaveRatioThreshold    = EnvFloat("CACHE_SAVE_RATIO_THRESHOLD", 0.8)
+	CacheSaveCtxThreshold      = EnvFloat("CACHE_SAVE_CTX_THRESHOLD", 0.7)
+	SlotTimeout                = EnvFloat("SLOT_TIMEOUT", 30)
+	ClientRecreateInterval     = EnvInt("CLIENT_RECREATE_INTERVAL", 50)
+	CacheHitWaitEMAMinT        = EnvFloat("CACHE_HIT_WAIT_EMA_MIN_TIMEOUT", 10)
+	CacheHitWaitMaxPending     = EnvInt("CACHE_HIT_WAIT_MAX_PENDING_REQS", 3)
+	CacheHitWaitEMAAlpha       = EnvFloat("CACHE_HIT_WAIT_EMA_ALPHA", 0.2)
+	CacheHitWaitEMAInitialT    = EnvFloat("CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT", 30)
+	CacheHitWaitEMAMaxT        = EnvFloat("CACHE_HIT_WAIT_EMA_MAX_TIMEOUT", 300)
+	MetricsRetention           = EnvInt("METRICS_RETENTION", 200)
+	LivenessDiagRecordInterval = EnvFloat("LIVENESS_DIAG_RECORD_INTERVAL", 60)
+	MissingModelsRetryInterval = EnvFloat("MISSING_MODELS_RETRY_INTERVAL", 30)
+	DashboardEnabled           = EnvBool("DASHBOARD_ENABLED", true)
 	LogLevel                   = os.Getenv("LOG_LEVEL")
 )
 
@@ -77,7 +77,7 @@ func mustGetwd() string {
 	return wd
 }
 
-func envInt(key string, def int) int {
+func EnvInt(key string, def int) int {
 	if s := os.Getenv(key); s != "" {
 		var v int
 		if _, err := fmt.Sscanf(s, "%d", &v); err == nil {
@@ -87,7 +87,7 @@ func envInt(key string, def int) int {
 	return def
 }
 
-func envFloat(key string, def float64) float64 {
+func EnvFloat(key string, def float64) float64 {
 	if s := os.Getenv(key); s != "" {
 		var v float64
 		if _, err := fmt.Sscanf(s, "%f", &v); err == nil {
@@ -97,14 +97,14 @@ func envFloat(key string, def float64) float64 {
 	return def
 }
 
-func envStr(key, def string) string {
+func EnvStr(key, def string) string {
 	if s := os.Getenv(key); s != "" {
 		return s
 	}
 	return def
 }
 
-func envBool(key string, def bool) bool {
+func EnvBool(key string, def bool) bool {
 	s := os.Getenv(key)
 	if s == "" {
 		return def
@@ -189,11 +189,11 @@ var (
 		"the following", "consider the following",
 	}
 
-	reStripDelimited   = regexp.MustCompile(`(?s)<[^>]*>.*?</[^>]*>`)
-	reColonNewline     = regexp.MustCompile(`:\s*\n`)
+	reStripDelimited = regexp.MustCompile(`(?s)<[^>]*>.*?</[^>]*>`)
+	reColonNewline   = regexp.MustCompile(`:\s*\n`)
 )
 
-func getMsgText(msg map[string]any) string {
+func GetMsgText(msg map[string]any) string {
 	c, ok := msg["content"]
 	if !ok {
 		return ""
@@ -218,11 +218,11 @@ func getMsgText(msg map[string]any) string {
 	return ""
 }
 
-func stripDelimited(text string) string {
+func StripDelimited(text string) string {
 	return reStripDelimited.ReplaceAllString(text, " ")
 }
 
-func extractInstruction(text string) string {
+func ExtractInstruction(text string) string {
 	if idx := reColonNewline.FindIndex([]byte(text)); idx != nil {
 		text = text[:idx[0]]
 	}
@@ -272,8 +272,8 @@ func ClassifyRequest(messages []map[string]any, requestJSON map[string]any) Requ
 		}
 	}
 	if lastUser != nil {
-		text := getMsgText(lastUser)
-		instruction := extractInstruction(stripDelimited(text))
+		text := GetMsgText(lastUser)
+		instruction := ExtractInstruction(StripDelimited(text))
 		for _, p := range summarizationPatterns {
 			if p.re.MatchString(instruction) {
 				score += p.weight
@@ -289,7 +289,7 @@ func ClassifyRequest(messages []map[string]any, requestJSON map[string]any) Requ
 		totalLength = 0
 		maxLen := 0
 		for _, m := range messages {
-			l := utf8.RuneCountInString(getMsgText(m))
+			l := utf8.RuneCountInString(GetMsgText(m))
 			totalLength += l
 			if l > maxLen {
 				maxLen = l
@@ -307,7 +307,7 @@ func ClassifyRequest(messages []map[string]any, requestJSON map[string]any) Requ
 	// 4. Prompt text > 8192 chars (0.10)
 	if totalLength == 0 {
 		for _, m := range messages {
-			totalLength += utf8.RuneCountInString(getMsgText(m))
+			totalLength += utf8.RuneCountInString(GetMsgText(m))
 		}
 	}
 	if totalLength > 8192 {
@@ -318,7 +318,7 @@ func ClassifyRequest(messages []map[string]any, requestJSON map[string]any) Requ
 	// 5. Structural delimiters / paste markers in last user message (0.05)
 	lastUserText := ""
 	if lastUser != nil {
-		lastUserText = getMsgText(lastUser)
+		lastUserText = GetMsgText(lastUser)
 	}
 	for _, pat := range pastePatterns {
 		if strings.Contains(lastUserText, pat) {
@@ -329,7 +329,7 @@ func ClassifyRequest(messages []map[string]any, requestJSON map[string]any) Requ
 	}
 
 	// 6. Content introduction phrases in last user instruction (0.05)
-	lastUserInstruction := stripDelimited(lastUserText)
+	lastUserInstruction := StripDelimited(lastUserText)
 	if len(lastUserInstruction) > 500 {
 		lastUserInstruction = lastUserInstruction[:500]
 	}
@@ -348,12 +348,12 @@ func ClassifyRequest(messages []map[string]any, requestJSON map[string]any) Requ
 	}
 
 	return RequestClass{
-		Score:   roundTo3(clamp01(score)),
+		Score:   RoundTo3(Clamp01(score)),
 		Signals: signals,
 	}
 }
 
-func clamp01(v float64) float64 {
+func Clamp01(v float64) float64 {
 	if v < 0.0 {
 		return 0.0
 	}
@@ -363,6 +363,6 @@ func clamp01(v float64) float64 {
 	return v
 }
 
-func roundTo3(v float64) float64 {
+func RoundTo3(v float64) float64 {
 	return math.Round(v*1000) / 1000
 }

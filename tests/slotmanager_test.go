@@ -1,10 +1,11 @@
-package main
+package tests
 
 import (
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"proxycache"
 	"reflect"
 	"strings"
 	"testing"
@@ -21,30 +22,30 @@ func blk(prefix string, n int) []string {
 
 func withTempMetaDir(t *testing.T) string {
 	t.Helper()
-	old := MetaDir
-	MetaDir = t.TempDir()
-	t.Cleanup(func() { MetaDir = old })
-	return MetaDir
+	old := proxycache.MetaDir
+	proxycache.MetaDir = t.TempDir()
+	t.Cleanup(func() { proxycache.MetaDir = old })
+	return proxycache.MetaDir
 }
 
-func withTestBackend(t *testing.T, cfg []map[string]any) *BackendManager {
+func withTestBackend(t *testing.T, cfg []map[string]any) *proxycache.BackendManager {
 	t.Helper()
-	old := backendManager
-	bm := NewBackendManager(cfg)
-	backendManager = bm
+	old := proxycache.GetBackendManager()
+	bm := proxycache.NewBackendManager(cfg)
+	proxycache.SetBackendManager(bm)
 	t.Cleanup(func() {
 		bm.Close()
-		backendManager = old
+		proxycache.SetBackendManager(old)
 	})
 	return bm
 }
 
 func withEMACfg(t *testing.T, alpha, minT, initial, maxT float64) {
 	t.Helper()
-	oldA, oldMin, oldI, oldMax := CacheHitWaitEMAAlpha, CacheHitWaitEMAMinT, CacheHitWaitEMAInitialT, CacheHitWaitEMAMaxT
-	CacheHitWaitEMAAlpha, CacheHitWaitEMAMinT, CacheHitWaitEMAInitialT, CacheHitWaitEMAMaxT = alpha, minT, initial, maxT
+	oldA, oldMin, oldI, oldMax := proxycache.CacheHitWaitEMAAlpha, proxycache.CacheHitWaitEMAMinT, proxycache.CacheHitWaitEMAInitialT, proxycache.CacheHitWaitEMAMaxT
+	proxycache.CacheHitWaitEMAAlpha, proxycache.CacheHitWaitEMAMinT, proxycache.CacheHitWaitEMAInitialT, proxycache.CacheHitWaitEMAMaxT = alpha, minT, initial, maxT
 	t.Cleanup(func() {
-		CacheHitWaitEMAAlpha, CacheHitWaitEMAMinT, CacheHitWaitEMAInitialT, CacheHitWaitEMAMaxT = oldA, oldMin, oldI, oldMax
+		proxycache.CacheHitWaitEMAAlpha, proxycache.CacheHitWaitEMAMinT, proxycache.CacheHitWaitEMAInitialT, proxycache.CacheHitWaitEMAMaxT = oldA, oldMin, oldI, oldMax
 	})
 }
 
@@ -53,11 +54,11 @@ func backendKeyFromURL(u string) string {
 	if i := strings.LastIndex(raw, "://"); i >= 0 {
 		raw = raw[i+3:]
 	}
-	return SanitizeBackendDir(raw)
+	return proxycache.SanitizeBackendDir(raw)
 }
 
 func TestSlotManagerPerModelPools(t *testing.T) {
-	bsm := NewBackendSlotManager("127.0.0.1-8000")
+	bsm := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	if pool := bsm.GetPool("Unknown"); pool != nil {
 		t.Errorf("GetPool(Unknown) = %v, want nil", pool)
 	}
@@ -75,7 +76,7 @@ func TestSlotManagerPerModelPools(t *testing.T) {
 }
 
 func TestSlotManagerMultipleBackends(t *testing.T) {
-	sm := NewSlotManager()
+	sm := proxycache.NewSlotManager()
 	if sm.HasBackend("B1") {
 		t.Error("HasBackend(B1) before Get = true, want false")
 	}
@@ -99,8 +100,8 @@ func TestSlotManagerMultipleBackends(t *testing.T) {
 	}
 	b1.SetKVState(0, blk("a", 3))
 	states = sm.AllKVStates()
-	if !reflect.DeepEqual(states[backendSlotKey{"B1", 0}], blk("a", 3)) {
-		t.Errorf("AllKVStates()[{B1 0}] = %v, want 3 blocks", states[backendSlotKey{"B1", 0}])
+	if !reflect.DeepEqual(states[proxycache.BackendSlotKey{BackendID: "B1", SlotID: 0}], blk("a", 3)) {
+		t.Errorf("AllKVStates()[{B1 0}] = %v, want 3 blocks", states[proxycache.BackendSlotKey{BackendID: "B1", SlotID: 0}])
 	}
 	if len(states) != 1 {
 		t.Errorf("AllKVStates() has %d entries, want 1", len(states))
@@ -108,7 +109,7 @@ func TestSlotManagerMultipleBackends(t *testing.T) {
 }
 
 func TestTryAcquireAndRelease(t *testing.T) {
-	bsm := NewBackendSlotManager("127.0.0.1-8000")
+	bsm := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	bsm.EnsurePool("M", 2)
 	if got := bsm.TryAcquire("M"); got != 0 {
 		t.Errorf("first TryAcquire = %d, want 0", got)
@@ -141,7 +142,7 @@ func TestTryAcquireAndRelease(t *testing.T) {
 }
 
 func TestPoolResize(t *testing.T) {
-	bsm := NewBackendSlotManager("127.0.0.1-8000")
+	bsm := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	bsm.EnsurePool("M", 1)
 	bsm.EnsurePool("M", 3)
 	if got := bsm.GetPool("M"); !reflect.DeepEqual(got, []int{0, 1, 2}) {
@@ -157,10 +158,10 @@ func TestPoolResize(t *testing.T) {
 		t.Errorf("TryAcquire = %d, want 2", got)
 	}
 
-	bsm2 := NewBackendSlotManager("127.0.0.1-8000")
+	bsm2 := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	bsm2.EnsurePool("M", 3)
 	bsm2.SetKVState(2, blk("a", 3))
-	bsm2.MarkSaveSkipped(2, &saveSkipEntry{Key: "k"})
+	bsm2.MarkSaveSkipped(2, &proxycache.SaveSkipEntry{Key: "k"})
 	bsm2.EnsurePool("M", 1)
 	if got := bsm2.GetPool("M"); !reflect.DeepEqual(got, []int{0}) {
 		t.Errorf("pool after resize down = %v, want [0]", got)
@@ -172,7 +173,7 @@ func TestPoolResize(t *testing.T) {
 		t.Errorf("skipped save of freed slot 2 = %v, want nil", got)
 	}
 
-	bsm3 := NewBackendSlotManager("127.0.0.1-8000")
+	bsm3 := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	bsm3.EnsurePool("M", 3)
 	bsm3.SetKVState(2, blk("a", 3))
 	for i := 0; i < 3; i++ {
@@ -190,40 +191,40 @@ func TestPoolResize(t *testing.T) {
 }
 
 func TestGSlotAndCacheHitTypes(t *testing.T) {
-	g := GSlot{ModelName: "M", BackendID: "127.0.0.1-8000", SlotID: 2}
+	g := proxycache.GSlot{ModelName: "M", BackendID: "127.0.0.1-8000", SlotID: 2}
 	if g.ModelName != "M" || g.BackendID != "127.0.0.1-8000" || g.SlotID != 2 {
 		t.Errorf("GSlot fields = %+v", g)
 	}
-	if string(CacheHitDiskRestore) != "disk_restore" || string(CacheHitSkip) != "skip" {
-		t.Errorf("CacheHitType constants = %q/%q", CacheHitDiskRestore, CacheHitSkip)
+	if string(proxycache.CacheHitDiskRestore) != "disk_restore" || string(proxycache.CacheHitSkip) != "skip" {
+		t.Errorf("CacheHitType constants = %q/%q", proxycache.CacheHitDiskRestore, proxycache.CacheHitSkip)
 	}
 }
 
 func TestShouldSkipRestore(t *testing.T) {
-	oldTh, oldDiff := KVCacheSkipThreshold, KVCacheSkipMaxBlockDiff
-	KVCacheSkipThreshold, KVCacheSkipMaxBlockDiff = 0.9, 0.1
+	oldTh, oldDiff := proxycache.KVCacheSkipThreshold, proxycache.KVCacheSkipMaxBlockDiff
+	proxycache.KVCacheSkipThreshold, proxycache.KVCacheSkipMaxBlockDiff = 0.9, 0.1
 	t.Cleanup(func() {
-		KVCacheSkipThreshold, KVCacheSkipMaxBlockDiff = oldTh, oldDiff
+		proxycache.KVCacheSkipThreshold, proxycache.KVCacheSkipMaxBlockDiff = oldTh, oldDiff
 	})
 
 	cases := []struct {
 		name       string
-		setup      func(b *BackendSlotManager)
+		setup      func(b *proxycache.BackendSlotManager)
 		req        []string
 		prev       []string
 		prevPassed bool
 		want       bool
 	}{
 		{
-			name:   "no_tracked_state",
-			setup:  func(b *BackendSlotManager) { b.EnsurePool("M", 1) },
-			req:    blk("a", 5),
-			prev:   nil,
-			want:   false,
+			name:  "no_tracked_state",
+			setup: func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1) },
+			req:   blk("a", 5),
+			prev:  nil,
+			want:  false,
 		},
 		{
 			name:       "fresh_explicit_nil",
-			setup:      func(b *BackendSlotManager) { b.EnsurePool("M", 1) },
+			setup:      func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1) },
 			req:        blk("a", 5),
 			prev:       nil,
 			prevPassed: true,
@@ -231,7 +232,7 @@ func TestShouldSkipRestore(t *testing.T) {
 		},
 		{
 			name:       "perfect_match",
-			setup:      func(b *BackendSlotManager) { b.EnsurePool("M", 1) },
+			setup:      func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1) },
 			req:        blk("a", 5),
 			prev:       blk("a", 5),
 			prevPassed: true,
@@ -239,7 +240,7 @@ func TestShouldSkipRestore(t *testing.T) {
 		},
 		{
 			name:       "req_longer_high_overlap",
-			setup:      func(b *BackendSlotManager) { b.EnsurePool("M", 1) },
+			setup:      func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1) },
 			req:        append(blk("a", 10), "new"),
 			prev:       blk("a", 10),
 			prevPassed: true,
@@ -247,7 +248,7 @@ func TestShouldSkipRestore(t *testing.T) {
 		},
 		{
 			name:       "low_overlap",
-			setup:      func(b *BackendSlotManager) { b.EnsurePool("M", 1) },
+			setup:      func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1) },
 			req:        append(blk("a", 8), "x", "y", "z"),
 			prev:       blk("a", 10),
 			prevPassed: true,
@@ -255,7 +256,7 @@ func TestShouldSkipRestore(t *testing.T) {
 		},
 		{
 			name:       "zero_lcp",
-			setup:      func(b *BackendSlotManager) { b.EnsurePool("M", 1) },
+			setup:      func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1) },
 			req:        blk("w", 4),
 			prev:       blk("a", 4),
 			prevPassed: true,
@@ -263,7 +264,7 @@ func TestShouldSkipRestore(t *testing.T) {
 		},
 		{
 			name:       "req_shorter_than_prev",
-			setup:      func(b *BackendSlotManager) { b.EnsurePool("M", 1) },
+			setup:      func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1) },
 			req:        blk("a", 4),
 			prev:       blk("a", 5),
 			prevPassed: true,
@@ -271,7 +272,7 @@ func TestShouldSkipRestore(t *testing.T) {
 		},
 		{
 			name:       "diff_too_large",
-			setup:      func(b *BackendSlotManager) { b.EnsurePool("M", 1) },
+			setup:      func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1) },
 			req:        append(blk("a", 10), "x", "y", "z"),
 			prev:       blk("a", 10),
 			prevPassed: true,
@@ -279,7 +280,7 @@ func TestShouldSkipRestore(t *testing.T) {
 		},
 		{
 			name:       "multi_slot_pool",
-			setup:      func(b *BackendSlotManager) { b.EnsurePool("M", 2) },
+			setup:      func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 2) },
 			req:        blk("a", 5),
 			prev:       blk("a", 5),
 			prevPassed: true,
@@ -287,7 +288,7 @@ func TestShouldSkipRestore(t *testing.T) {
 		},
 		{
 			name:  "kv_state_fallback",
-			setup: func(b *BackendSlotManager) { b.EnsurePool("M", 1); b.SetKVState(0, blk("a", 5)) },
+			setup: func(b *proxycache.BackendSlotManager) { b.EnsurePool("M", 1); b.SetKVState(0, blk("a", 5)) },
 			req:   blk("a", 5),
 			prev:  nil,
 			want:  true,
@@ -295,7 +296,7 @@ func TestShouldSkipRestore(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			bsm := NewBackendSlotManager("127.0.0.1-8000")
+			bsm := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 			tc.setup(bsm)
 			got := bsm.ShouldSkipRestore(0, tc.req, tc.prev, tc.prevPassed)
 			if got != tc.want {
@@ -307,7 +308,7 @@ func TestShouldSkipRestore(t *testing.T) {
 
 func TestSlotDurationEMA(t *testing.T) {
 	withEMACfg(t, 0.2, 10, 30, 300)
-	bsm := NewBackendSlotManager("127.0.0.1-8000")
+	bsm := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	bsm.EnsurePool("M", 1)
 	if got := bsm.GetSlotDurationEMA(); got != 30 {
 		t.Errorf("initial EMA = %v, want 30", got)
@@ -316,9 +317,9 @@ func TestSlotDurationEMA(t *testing.T) {
 	if s := bsm.TryAcquire("M"); s != 0 {
 		t.Fatalf("TryAcquire = %d, want 0", s)
 	}
-	bsm.poolMu.Lock()
-	bsm.slotAcquiredAt[0] = nowFloat() - 5
-	bsm.poolMu.Unlock()
+	bsm.PoolMu.Lock()
+	bsm.SlotAcquiredAt[0] = proxycache.NowFloat() - 5
+	bsm.PoolMu.Unlock()
 	dur, ok := bsm.Release(0)
 	if !ok {
 		t.Fatal("Release(0) = false, want true")
@@ -333,15 +334,15 @@ func TestSlotDurationEMA(t *testing.T) {
 	if s := bsm.TryAcquire("M"); s != 0 {
 		t.Fatalf("TryAcquire = %d, want 0", s)
 	}
-	bsm.poolMu.Lock()
-	bsm.slotAcquiredAt[0] = nowFloat() - 5000
-	bsm.poolMu.Unlock()
+	bsm.PoolMu.Lock()
+	bsm.SlotAcquiredAt[0] = proxycache.NowFloat() - 5000
+	bsm.PoolMu.Unlock()
 	bsm.Release(0)
 	if got := bsm.GetSlotDurationEMA(); got != 300 {
 		t.Errorf("EMA after 5000s release = %v, want 300 (max clamp)", got)
 	}
 
-	bsm2 := NewBackendSlotManager("127.0.0.1-8001")
+	bsm2 := proxycache.NewBackendSlotManager("127.0.0.1-8001")
 	bsm2.EnsurePool("M", 1)
 	withEMACfg(t, 0.9, 10, 30, 300)
 	if s := bsm2.TryAcquire("M"); s != 0 {
@@ -361,7 +362,7 @@ func mathAbs(v float64) float64 {
 }
 
 func TestKVStateAndInvalidate(t *testing.T) {
-	bsm := NewBackendSlotManager("127.0.0.1-8000")
+	bsm := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	if got := bsm.GetKVState(0); got != nil {
 		t.Errorf("GetKVState(0) before set = %v, want nil", got)
 	}
@@ -386,11 +387,11 @@ func TestKVStateAndInvalidate(t *testing.T) {
 }
 
 func TestSaveSkippedMarkFlush(t *testing.T) {
-	bsm := NewBackendSlotManager("127.0.0.1-8000")
+	bsm := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	if got := bsm.FlushSaveSkipped(0); got != nil {
 		t.Errorf("FlushSaveSkipped before mark = %v, want nil", got)
 	}
-	entry := &saveSkipEntry{Key: "k", NTokens: 42, Recompute: true}
+	entry := &proxycache.SaveSkipEntry{Key: "k", NTokens: 42, Recompute: true}
 	bsm.MarkSaveSkipped(0, entry)
 	if got := bsm.FlushSaveSkipped(0); got != entry {
 		t.Errorf("FlushSaveSkipped = %v, want the marked entry", got)
@@ -401,7 +402,7 @@ func TestSaveSkippedMarkFlush(t *testing.T) {
 }
 
 func TestCacheWaitPending(t *testing.T) {
-	sm := NewSlotManager()
+	sm := proxycache.NewSlotManager()
 	if got := sm.GetCacheWaitPending("B1"); got != 0 {
 		t.Errorf("GetCacheWaitPending(new) = %d, want 0", got)
 	}
@@ -450,7 +451,7 @@ func TestSaveAfterSuccess(t *testing.T) {
 	key := backendKeyFromURL(srv.URL)
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir()}})
 
-	bsm := NewBackendSlotManager(key)
+	bsm := proxycache.NewBackendSlotManager(key)
 	blocks := blk("a", 4)
 	ok, size := bsm.SaveAfter("M", 0, "k1", blocks, 100)
 	if !ok || size != 123 {
@@ -470,15 +471,15 @@ func TestSaveAfterSuccess(t *testing.T) {
 		t.Errorf("RingOldestNewestKeys = (%q, %q, %v), want (k1, k1, true)", oldest, newest, okRing)
 	}
 
-	meta := kvMeta.ReadMeta("k1", key)
+	meta := proxycache.GetKVMeta().ReadMeta("k1", key)
 	if meta == nil {
 		t.Fatal("ReadMeta(k1) = nil, want meta file")
 	}
 	if meta["n_tokens"] != float64(100) {
 		t.Errorf("meta n_tokens = %v, want 100", meta["n_tokens"])
 	}
-	if meta["wpb"] != float64(WordsPerBlock) {
-		t.Errorf("meta wpb = %v, want %d", meta["wpb"], WordsPerBlock)
+	if meta["wpb"] != float64(proxycache.WordsPerBlock) {
+		t.Errorf("meta wpb = %v, want %d", meta["wpb"], proxycache.WordsPerBlock)
 	}
 	if meta["model_id"] != "M" || meta["backend"] != key {
 		t.Errorf("meta model_id/backend = %v/%v, want M/%v", meta["model_id"], meta["backend"], key)
@@ -499,7 +500,7 @@ func TestSaveAfterSuccess(t *testing.T) {
 	if !reflect.DeepEqual(gotBlocks, blocks) {
 		t.Errorf("meta blocks = %v, want %v", gotBlocks, blocks)
 	}
-	path := filepath.Join(MetaDir, SanitizeBackendDir(key), "k1"+MetaSuffix)
+	path := filepath.Join(proxycache.MetaDir, proxycache.SanitizeBackendDir(key), "k1"+proxycache.MetaSuffix)
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("meta file missing at %s: %v", path, err)
 	}
@@ -509,7 +510,7 @@ func TestSaveAfterNetworkFailure(t *testing.T) {
 	withTempMetaDir(t)
 	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:1", "cache_dir": t.TempDir()}})
 	key := "127.0.0.1-1"
-	bsm := NewBackendSlotManager(key)
+	bsm := proxycache.NewBackendSlotManager(key)
 	blocks := blk("a", 4)
 	ok, size := bsm.SaveAfter("M", 0, "k1", blocks, 100)
 	if ok || size != 0 {
@@ -530,7 +531,7 @@ func TestSaveAfterDisabled(t *testing.T) {
 	withTempMetaDir(t)
 	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:1", "cache_max_size_gb": 0}})
 	key := "127.0.0.1-1"
-	bsm := NewBackendSlotManager(key)
+	bsm := proxycache.NewBackendSlotManager(key)
 	ok, size := bsm.SaveAfter("M", 0, "k1", blk("a", 4), 100)
 	if ok || size != 0 {
 		t.Errorf("SaveAfter with cache disabled = (%v, %d), want (false, 0)", ok, size)
@@ -555,21 +556,21 @@ func TestRestore(t *testing.T) {
 	key := backendKeyFromURL(srv.URL)
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir()}})
 
-	bsm := NewBackendSlotManager(key)
+	bsm := proxycache.NewBackendSlotManager(key)
 	if ok, _ := bsm.SaveAfter("M", 0, "k1", blk("a", 2), 20); !ok || bsm.GetRingSize() != 1 {
 		t.Fatal("setup: SaveAfter failed or ring empty")
 	}
-	bsm.ringMu.Lock()
-	oldTS := bsm.cacheRing[0].TS
-	bsm.ringMu.Unlock()
+	bsm.RingMu.Lock()
+	oldTS := bsm.CacheRing[0].TS
+	bsm.RingMu.Unlock()
 	time.Sleep(20 * time.Millisecond)
 
 	if !bsm.Restore(0, "k1", "M", true) {
 		t.Error("Restore with touchRing = false, want true")
 	}
-	bsm.ringMu.Lock()
-	newTS := bsm.cacheRing[0].TS
-	bsm.ringMu.Unlock()
+	bsm.RingMu.Lock()
+	newTS := bsm.CacheRing[0].TS
+	bsm.RingMu.Unlock()
 	if newTS <= oldTS {
 		t.Errorf("ring TS not advanced by touch: old=%v new=%v", oldTS, newTS)
 	}
@@ -577,9 +578,9 @@ func TestRestore(t *testing.T) {
 	if !bsm.Restore(0, "k1", "M", false) {
 		t.Error("Restore with touchRing=false failed, want true")
 	}
-	bsm.ringMu.Lock()
-	untouchedTS := bsm.cacheRing[0].TS
-	bsm.ringMu.Unlock()
+	bsm.RingMu.Lock()
+	untouchedTS := bsm.CacheRing[0].TS
+	bsm.RingMu.Unlock()
 	if untouchedTS != newTS {
 		t.Errorf("ring TS changed with touchRing=false: %v -> %v", newTS, untouchedTS)
 	}
@@ -608,11 +609,11 @@ func TestRestoreTimeout(t *testing.T) {
 	key := backendKeyFromURL(srv.URL)
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir()}})
 
-	old := SlotTimeout
-	SlotTimeout = 0.3
-	t.Cleanup(func() { SlotTimeout = old })
+	old := proxycache.SlotTimeout
+	proxycache.SlotTimeout = 0.3
+	t.Cleanup(func() { proxycache.SlotTimeout = old })
 
-	bsm := NewBackendSlotManager(key)
+	bsm := proxycache.NewBackendSlotManager(key)
 	if bsm.Restore(0, "k1", "M", true) {
 		t.Error("Restore on slow backend = true, want false (SLOT_TIMEOUT)")
 	}
@@ -625,7 +626,7 @@ func TestRingNoEvictionUnderLimit(t *testing.T) {
 	key := backendKeyFromURL(srv.URL)
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir(), "cache_max_size_gb": 25}})
 
-	bsm := NewBackendSlotManager(key)
+	bsm := proxycache.NewBackendSlotManager(key)
 	for _, k := range []string{"kA", "kB", "kC"} {
 		if ok, size := bsm.SaveAfter("M", 0, k, blk("a", 8), 800); !ok || size != 400 {
 			t.Fatalf("SaveAfter(%s) = (%v, %d)", k, ok, size)
@@ -639,10 +640,10 @@ func TestRingNoEvictionUnderLimit(t *testing.T) {
 	}
 }
 
-func saveThreeEntries(t *testing.T, srvURL string, key string) *BackendSlotManager {
+func saveThreeEntries(t *testing.T, srvURL string, key string) *proxycache.BackendSlotManager {
 	t.Helper()
 	withTestBackend(t, []map[string]any{{"url": srvURL, "cache_dir": t.TempDir(), "cache_max_size_gb": 25}})
-	bsm := NewBackendSlotManager(key)
+	bsm := proxycache.NewBackendSlotManager(key)
 	for _, tc := range []struct {
 		key    string
 		blocks []string
@@ -668,17 +669,17 @@ func TestRingScoredEviction(t *testing.T) {
 	key := backendKeyFromURL(srv.URL)
 	bsm := saveThreeEntries(t, srv.URL, key)
 
-	now := nowFloat()
-	bsm.ringMu.Lock()
-	bsm.cacheRing[0].TS = now - 100
-	bsm.cacheRing[1].TS = now - 50
-	bsm.cacheRing[2].TS = now - 10
-	bsm.ringMu.Unlock()
+	now := proxycache.NowFloat()
+	bsm.RingMu.Lock()
+	bsm.CacheRing[0].TS = now - 100
+	bsm.CacheRing[1].TS = now - 50
+	bsm.CacheRing[2].TS = now - 10
+	bsm.RingMu.Unlock()
 
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir(), "cache_max_size_gb": 0.000001}})
-	bsm.ringMu.Lock()
-	bsm.evictIfNeeded()
-	bsm.ringMu.Unlock()
+	bsm.RingMu.Lock()
+	bsm.EvictIfNeeded()
+	bsm.RingMu.Unlock()
 
 	if got := bsm.GetRingSize(); got != 2 {
 		t.Fatalf("GetRingSize after eviction = %d, want 2", got)
@@ -690,10 +691,10 @@ func TestRingScoredEviction(t *testing.T) {
 	if got := bsm.GetTotalBytes(); got != 800 {
 		t.Errorf("GetTotalBytes = %d, want 800", got)
 	}
-	if _, err := os.Stat(filepath.Join(MetaDir, SanitizeBackendDir(key), "kA"+MetaSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(proxycache.MetaDir, proxycache.SanitizeBackendDir(key), "kA"+proxycache.MetaSuffix)); !os.IsNotExist(err) {
 		t.Error("kA meta file still present after eviction")
 	}
-	if _, err := os.Stat(filepath.Join(MetaDir, SanitizeBackendDir(key), "kB"+MetaSuffix)); err != nil {
+	if _, err := os.Stat(filepath.Join(proxycache.MetaDir, proxycache.SanitizeBackendDir(key), "kB"+proxycache.MetaSuffix)); err != nil {
 		t.Errorf("kB meta file missing: %v", err)
 	}
 }
@@ -705,17 +706,17 @@ func TestRingStaleUniqueEvicted(t *testing.T) {
 	key := backendKeyFromURL(srv.URL)
 	bsm := saveThreeEntries(t, srv.URL, key)
 
-	now := nowFloat()
-	bsm.ringMu.Lock()
-	bsm.cacheRing[0].TS = now - 10
-	bsm.cacheRing[1].TS = now - 10
-	bsm.cacheRing[2].TS = now - 100
-	bsm.ringMu.Unlock()
+	now := proxycache.NowFloat()
+	bsm.RingMu.Lock()
+	bsm.CacheRing[0].TS = now - 10
+	bsm.CacheRing[1].TS = now - 10
+	bsm.CacheRing[2].TS = now - 100
+	bsm.RingMu.Unlock()
 
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir(), "cache_max_size_gb": 0.000001}})
-	bsm.ringMu.Lock()
-	bsm.evictIfNeeded()
-	bsm.ringMu.Unlock()
+	bsm.RingMu.Lock()
+	bsm.EvictIfNeeded()
+	bsm.RingMu.Unlock()
 
 	if got := bsm.GetRingSize(); got != 2 {
 		t.Fatalf("GetRingSize after eviction = %d, want 2", got)
@@ -733,14 +734,14 @@ func TestRingOrphanEviction(t *testing.T) {
 	key := backendKeyFromURL(srv.URL)
 	bsm := saveThreeEntries(t, srv.URL, key)
 
-	if err := os.Remove(kvMeta.MetaFilePath("kA", key)); err != nil {
+	if err := os.Remove(proxycache.GetKVMeta().MetaFilePath("kA", key)); err != nil {
 		t.Fatalf("failed to remove kA meta: %v", err)
 	}
 
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir(), "cache_max_size_gb": 0.000001}})
-	bsm.ringMu.Lock()
-	bsm.evictIfNeeded()
-	bsm.ringMu.Unlock()
+	bsm.RingMu.Lock()
+	bsm.EvictIfNeeded()
+	bsm.RingMu.Unlock()
 
 	if got := bsm.GetRingSize(); got != 2 {
 		t.Fatalf("GetRingSize after orphan eviction = %d, want 2", got)
@@ -759,10 +760,10 @@ func TestInitFromDisk(t *testing.T) {
 	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:1", "cache_dir": t.TempDir()}})
 	key := "127.0.0.1-1"
 
-	kvMeta.WriteMeta("k1", 50, blk("z", 4), 100, "M", key, 777)
-	kvMeta.WriteMeta("k2", 50, blk("y", 4), 100, "M", key, 0)
+	proxycache.GetKVMeta().WriteMeta("k1", 50, blk("z", 4), 100, "M", key, 777)
+	proxycache.GetKVMeta().WriteMeta("k2", 50, blk("y", 4), 100, "M", key, 0)
 
-	sm := NewSlotManager()
+	sm := proxycache.NewSlotManager()
 	sm.InitFromDisk()
 	bsm := sm.Get(key)
 	if got := bsm.GetRingSize(); got != 1 {
@@ -781,13 +782,13 @@ func TestInitFromDisk(t *testing.T) {
 }
 
 func TestSlotStatus(t *testing.T) {
-	bsm := NewBackendSlotManager("127.0.0.1-8000")
+	bsm := proxycache.NewBackendSlotManager("127.0.0.1-8000")
 	bsm.EnsurePool("M", 1)
 	if s := bsm.TryAcquire("M"); s != 0 {
 		t.Fatalf("TryAcquire = %d, want 0", s)
 	}
 	bsm.SetKVState(0, blk("a", 3))
-	bsm.MarkSaveSkipped(0, &saveSkipEntry{Key: "some-cache-key-12345678"})
+	bsm.MarkSaveSkipped(0, &proxycache.SaveSkipEntry{Key: "some-cache-key-12345678"})
 
 	st := bsm.SlotStatus()
 	models, _ := st["models"].(map[string]any)
@@ -816,7 +817,7 @@ func TestRingOldestNewestOrder(t *testing.T) {
 	key := backendKeyFromURL(srv.URL)
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir(), "cache_max_size_gb": 25}})
 
-	bsm := NewBackendSlotManager(key)
+	bsm := proxycache.NewBackendSlotManager(key)
 	if _, _, ok := bsm.RingOldestNewest(); ok {
 		t.Error("RingOldestNewest on empty ring = ok, want false")
 	}
@@ -837,9 +838,9 @@ func TestRingOldestNewestOrder(t *testing.T) {
 	}
 	time.Sleep(20 * time.Millisecond)
 	bsm.TouchRing("k1")
-	bsm.ringMu.Lock()
-	touched := bsm.cacheRing[0].TS
-	bsm.ringMu.Unlock()
+	bsm.RingMu.Lock()
+	touched := bsm.CacheRing[0].TS
+	bsm.RingMu.Unlock()
 	if touched <= tsOldest {
 		t.Errorf("TouchRing did not advance TS: %v -> %v", tsOldest, touched)
 	}

@@ -1,4 +1,4 @@
-package main
+package proxycache
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func main() {
+func Main() {
 	slotManager.InitFromDisk()
 
 	backendURLs := make([]string, 0, len(Backends))
@@ -52,8 +52,8 @@ func main() {
 	backendManager.StartLivenessChecker()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", modelsHandler)
-	mux.HandleFunc("/v1/chat/completions", chatHandler)
+	mux.HandleFunc("/v1/models", ModelsHandler)
+	mux.HandleFunc("/v1/chat/completions", ChatHandler)
 	mux.HandleFunc("/metrics/dashboard", metricsDashboardHandler)
 	mux.HandleFunc("/metrics/health", metricsHealthHandler)
 	mux.HandleFunc("/metrics/slots", metricsSlotsHandler)
@@ -62,7 +62,7 @@ func main() {
 	mux.HandleFunc("/metrics/requests", metricsRequestsHandler)
 	mux.HandleFunc("/metrics/request/", metricsRequestByIDHandler)
 	mux.HandleFunc("/metrics/performance", metricsPerformanceHandler)
-	mux.HandleFunc("/dashboard", dashboardHandler)
+	mux.HandleFunc("/dashboard", DashboardHandler)
 
 	srv := &http.Server{Addr: fmt.Sprintf("0.0.0.0:%d", Port), Handler: mux}
 	sigCh := make(chan os.Signal, 1)

@@ -1,10 +1,11 @@
-package main
+package tests
 
 import (
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"proxycache"
 	"strings"
 	"sync"
 	"testing"
@@ -35,27 +36,27 @@ func newMockLlama(t *testing.T, model string, nCtx int, tokens []int, nSlots int
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"object": "models"})
+		proxycache.WriteJSON(w, http.StatusOK, map[string]any{"object": "models"})
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
+		proxycache.WriteJSON(w, http.StatusOK, map[string]any{
 			"data": []map[string]any{
 				{"id": m.model, "meta": map[string]any{"n_ctx": m.nCtx}},
 			},
 		})
 	})
 	mux.HandleFunc("/apply-template", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"prompt": "mock"})
+		proxycache.WriteJSON(w, http.StatusOK, map[string]any{"prompt": "mock"})
 	})
 	mux.HandleFunc("/tokenize", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"tokens": m.tokens})
+		proxycache.WriteJSON(w, http.StatusOK, map[string]any{"tokens": m.tokens})
 	})
 	mux.HandleFunc("/slots", func(w http.ResponseWriter, r *http.Request) {
 		slots := make([]map[string]any, 0, m.nSlots)
 		for i := 0; i < m.nSlots; i++ {
 			slots = append(slots, map[string]any{"id": i, "state": 2})
 		}
-		writeJSON(w, http.StatusOK, slots)
+		proxycache.WriteJSON(w, http.StatusOK, slots)
 	})
 	mux.HandleFunc("/slots/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/slots/")
@@ -67,19 +68,19 @@ func newMockLlama(t *testing.T, model string, nCtx int, tokens []int, nSlots int
 			m.restores = append(m.restores, id)
 		}
 		m.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"success": true, "n_written": 4096})
+		proxycache.WriteJSON(w, http.StatusOK, map[string]any{"success": true, "n_written": 4096})
 	})
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad json"})
+			proxycache.WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "bad json"})
 			return
 		}
 		m.mu.Lock()
 		m.chatBodies = append(m.chatBodies, body)
 		resp := m.chatResp
 		m.mu.Unlock()
-		writeJSON(w, http.StatusOK, resp)
+		proxycache.WriteJSON(w, http.StatusOK, resp)
 	})
 	m.srv = httptest.NewServer(mux)
 	t.Cleanup(m.srv.Close)
@@ -117,7 +118,7 @@ func postChat(t *testing.T, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	chatHandler(w, req)
+	proxycache.ChatHandler(w, req)
 	return w
 }
 
@@ -129,22 +130,22 @@ func doGet(t *testing.T, h http.HandlerFunc, path string) *httptest.ResponseReco
 	return w
 }
 
-func markBackendsUp(bm *BackendManager) {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-	for _, k := range bm.keyOrder {
-		bm.backendState[k] = true
+func markBackendsUp(bm *proxycache.BackendManager) {
+	bm.Mu.Lock()
+	defer bm.Mu.Unlock()
+	for _, k := range bm.KeyOrder {
+		bm.BackendState[k] = true
 	}
 }
 
-func injectModels(bm *BackendManager, models ...*DiscoveredModel) {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
+func injectModels(bm *proxycache.BackendManager, models ...*proxycache.DiscoveredModel) {
+	bm.Mu.Lock()
+	defer bm.Mu.Unlock()
 	for _, m := range models {
-		if _, ok := bm.discoveredModels[m.Name]; !ok {
-			bm.modelOrder = append(bm.modelOrder, m.Name)
+		if _, ok := bm.DiscoveredModels[m.Name]; !ok {
+			bm.ModelOrder = append(bm.ModelOrder, m.Name)
 		}
-		bm.discoveredModels[m.Name] = m
+		bm.DiscoveredModels[m.Name] = m
 	}
 }
 
@@ -168,7 +169,7 @@ func TestChatModelNotFound(t *testing.T) {
 	withTempMetaDir(t)
 	m := newMockLlama(t, "model-a", 32768, seq(10), 1)
 	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
-	markBackendsUp(backendManager)
+	markBackendsUp(proxycache.GetBackendManager())
 	w := postChat(t, `{"model": "unknown-model", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", w.Code)
@@ -185,7 +186,7 @@ func TestChatPromptTooLong(t *testing.T) {
 	withTempMetaDir(t)
 	m := newMockLlama(t, "model-a", 4096, seq(4097), 1)
 	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
-	markBackendsUp(backendManager)
+	markBackendsUp(proxycache.GetBackendManager())
 	w := postChat(t, `{"model": "model-a", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", w.Code)
@@ -199,7 +200,7 @@ func TestChatSubstringModelResolution(t *testing.T) {
 	withTempMetaDir(t)
 	m := newMockLlama(t, "qwen3.6-32b-instruct", 32768, seq(10), 1)
 	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
-	markBackendsUp(backendManager)
+	markBackendsUp(proxycache.GetBackendManager())
 	w := postChat(t, `{"model": "qwen3.6", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -220,7 +221,7 @@ func TestChatAnyModelRouting(t *testing.T) {
 	withTempMetaDir(t)
 	m := newMockLlama(t, "model-x", 32768, seq(10), 1)
 	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
-	markBackendsUp(backendManager)
+	markBackendsUp(proxycache.GetBackendManager())
 	w := postChat(t, `{"model": "any", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -239,17 +240,17 @@ func TestChatAnyWithCacheHit(t *testing.T) {
 		{"url": mA.srv.URL, "cache_dir": t.TempDir()},
 		{"url": mB.srv.URL, "cache_dir": t.TempDir()},
 	})
-	markBackendsUp(backendManager)
-	oldWpb := WordsPerBlock
-	WordsPerBlock = 3
-	defer func() { WordsPerBlock = oldWpb }()
+	markBackendsUp(proxycache.GetBackendManager())
+	oldWpb := proxycache.WordsPerBlock
+	proxycache.WordsPerBlock = 3
+	defer func() { proxycache.WordsPerBlock = oldWpb }()
 	beA := backendKeyFromURL(mA.srv.URL)
 	beB := backendKeyFromURL(mB.srv.URL)
-	injectModels(backendManager, dm("model-a", 32768, beA), dm("model-b", 16384, beB))
-	reqBlocks := BlockHashesFromTokens(tokens, WordsPerBlock)
+	injectModels(proxycache.GetBackendManager(), dm("model-a", 32768, beA), dm("model-b", 16384, beB))
+	reqBlocks := proxycache.BlockHashesFromTokens(tokens, proxycache.WordsPerBlock)
 	blocksB := append(append([]string{}, reqBlocks[:2]...), "uniq_b_3", "uniq_b_4")
-	kvMeta.WriteMeta(MetaKey("model-a", tokens), 10, reqBlocks, WordsPerBlock, "model-a", beA, 1024)
-	kvMeta.WriteMeta(MetaKey("model-b", tokens), 10, blocksB, WordsPerBlock, "model-b", beB, 1024)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("model-a", tokens), 10, reqBlocks, proxycache.WordsPerBlock, "model-a", beA, 1024)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("model-b", tokens), 10, blocksB, proxycache.WordsPerBlock, "model-b", beB, 1024)
 	w := postChat(t, `{"model": "any", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -272,9 +273,9 @@ func TestModelsEndpointIncludesAny(t *testing.T) {
 	withTempMetaDir(t)
 	m := newMockLlama(t, "model-a", 32768, seq(10), 1)
 	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
-	markBackendsUp(backendManager)
-	injectModels(backendManager, dm("model-a", 32768, "be-1"), dm("model-b", 16384, "be-2"))
-	w := doGet(t, modelsHandler, "/v1/models")
+	markBackendsUp(proxycache.GetBackendManager())
+	injectModels(proxycache.GetBackendManager(), dm("model-a", 32768, "be-1"), dm("model-b", 16384, "be-2"))
+	w := doGet(t, proxycache.ModelsHandler, "/v1/models")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
@@ -300,9 +301,9 @@ func TestModelsEndpointOpenAIFormat(t *testing.T) {
 	withTempMetaDir(t)
 	m := newMockLlama(t, "model-a", 32768, seq(10), 1)
 	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
-	markBackendsUp(backendManager)
-	injectModels(backendManager, dm("model-a", 32768, "be-1"))
-	w := doGet(t, modelsHandler, "/v1/models")
+	markBackendsUp(proxycache.GetBackendManager())
+	injectModels(proxycache.GetBackendManager(), dm("model-a", 32768, "be-1"))
+	w := doGet(t, proxycache.ModelsHandler, "/v1/models")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
@@ -329,18 +330,18 @@ func TestModelsEndpointOpenAIFormat(t *testing.T) {
 }
 
 func TestDashboardEndpoint(t *testing.T) {
-	old := DashboardEnabled
-	DashboardEnabled = true
-	defer func() { DashboardEnabled = old }()
-	w := doGet(t, dashboardHandler, "/dashboard")
+	old := proxycache.DashboardEnabled
+	proxycache.DashboardEnabled = true
+	defer func() { proxycache.DashboardEnabled = old }()
+	w := doGet(t, proxycache.DashboardHandler, "/dashboard")
 	if w.Code != http.StatusOK {
 		t.Fatalf("enabled status = %d, want 200", w.Code)
 	}
 	if w.Body.Len() == 0 {
 		t.Error("enabled body empty, want embedded html")
 	}
-	DashboardEnabled = false
-	w = doGet(t, dashboardHandler, "/dashboard")
+	proxycache.DashboardEnabled = false
+	w = doGet(t, proxycache.DashboardHandler, "/dashboard")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("disabled status = %d, want 404", w.Code)
 	}
@@ -389,11 +390,11 @@ func setupBusyRestoreBackend(t *testing.T, m1, m2 *mockLlama, model string) (str
 		{"url": m1.srv.URL, "cache_dir": t.TempDir()},
 		{"url": m2.srv.URL, "cache_dir": t.TempDir()},
 	})
-	markBackendsUp(backendManager)
+	markBackendsUp(proxycache.GetBackendManager())
 	reqTokens := seq(800)
-	reqBlocks := BlockHashesFromTokens(reqTokens, WordsPerBlock)
-	kvMeta.WriteMeta(MetaKey(model, reqTokens), 800, reqBlocks, WordsPerBlock, model, be1, 2048)
-	beSm1 := slotManager.Get(be1)
+	reqBlocks := proxycache.BlockHashesFromTokens(reqTokens, proxycache.WordsPerBlock)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey(model, reqTokens), 800, reqBlocks, proxycache.WordsPerBlock, model, be1, 2048)
+	beSm1 := proxycache.GetSlotManager().Get(be1)
 	beSm1.EnsurePool(model, 1)
 	if s := beSm1.TryAcquire(model); s != 0 {
 		t.Fatalf("pre-acquire = %d, want 0", s)
@@ -417,10 +418,10 @@ func TestCacheBackendBusyFallback(t *testing.T) {
 	if m1.chatCount() != 0 {
 		t.Errorf("busy backend chat count = %d, want 0", m1.chatCount())
 	}
-	if got := slotManager.GetCacheWaitPending(be1); got != 0 {
+	if got := proxycache.GetSlotManager().GetCacheWaitPending(be1); got != 0 {
 		t.Errorf("pending after fallback = %d, want 0", got)
 	}
-	if got := slotManager.GetCacheWaitPending(be2); got != 0 {
+	if got := proxycache.GetSlotManager().GetCacheWaitPending(be2); got != 0 {
 		t.Errorf("pending on fallback backend = %d, want 0", got)
 	}
 }
@@ -430,7 +431,7 @@ func TestCacheHitWaitPhase0Success(t *testing.T) {
 	m1 := newMockLlama(t, "test-model", 32768, seq(800), 1)
 	m2 := newMockLlama(t, "test-model", 32768, seq(800), 1)
 	be1, _ := setupBusyRestoreBackend(t, m1, m2, "test-model")
-	beSm1 := slotManager.Get(be1)
+	beSm1 := proxycache.GetSlotManager().Get(be1)
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		beSm1.Release(0)
@@ -446,7 +447,7 @@ func TestCacheHitWaitPhase0Success(t *testing.T) {
 	if m2.chatCount() != 0 {
 		t.Errorf("fallback backend chat count = %d, want 0", m2.chatCount())
 	}
-	if got := slotManager.GetCacheWaitPending(be1); got != 0 {
+	if got := proxycache.GetSlotManager().GetCacheWaitPending(be1); got != 0 {
 		t.Errorf("pending after acquire = %d, want 0", got)
 	}
 }
@@ -456,7 +457,7 @@ func TestCacheHitWaitPendingCountBlocks(t *testing.T) {
 	m1 := newMockLlama(t, "test-model", 32768, seq(800), 1)
 	m2 := newMockLlama(t, "test-model", 32768, seq(800), 1)
 	be1, _ := setupBusyRestoreBackend(t, m1, m2, "test-model")
-	slotManager.SetCacheWaitPending(be1, CacheHitWaitMaxPending)
+	proxycache.GetSlotManager().SetCacheWaitPending(be1, proxycache.CacheHitWaitMaxPending)
 	w := postChat(t, `{"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -467,8 +468,8 @@ func TestCacheHitWaitPendingCountBlocks(t *testing.T) {
 	if m1.chatCount() != 0 {
 		t.Errorf("busy backend chat count = %d, want 0", m1.chatCount())
 	}
-	if got := slotManager.GetCacheWaitPending(be1); got != CacheHitWaitMaxPending {
-		t.Errorf("pending = %d, want %d (wait skipped)", got, CacheHitWaitMaxPending)
+	if got := proxycache.GetSlotManager().GetCacheWaitPending(be1); got != proxycache.CacheHitWaitMaxPending {
+		t.Errorf("pending = %d, want %d (wait skipped)", got, proxycache.CacheHitWaitMaxPending)
 	}
 }
 
@@ -486,11 +487,11 @@ func TestChatSaveSkippedWhenRatioAboveThreshold(t *testing.T) {
 	}
 	be := backendKeyFromURL(m.srv.URL)
 	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
-	markBackendsUp(backendManager)
-	reqBlocks := BlockHashesFromTokens(reqTokens, WordsPerBlock)
+	markBackendsUp(proxycache.GetBackendManager())
+	reqBlocks := proxycache.BlockHashesFromTokens(reqTokens, proxycache.WordsPerBlock)
 	candBlocks := append(append([]string{}, reqBlocks[:7]...), "different_block")
 	candTokens := append(append([]int{}, seq(700)...), offsetSeq(100, 10000)...)
-	kvMeta.WriteMeta(MetaKey("test-model", candTokens), 800, candBlocks, WordsPerBlock, "test-model", be, 2048)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("test-model", candTokens), 800, candBlocks, proxycache.WordsPerBlock, "test-model", be, 2048)
 	w := postChat(t, `{"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -498,7 +499,7 @@ func TestChatSaveSkippedWhenRatioAboveThreshold(t *testing.T) {
 	if len(m.saves) != 0 {
 		t.Errorf("save calls = %d, want 0 (ratio 0.875 > 0.8)", len(m.saves))
 	}
-	if meta := kvMeta.ReadMeta(MetaKey("test-model", reqTokens), be); meta != nil {
+	if meta := proxycache.GetKVMeta().ReadMeta(proxycache.MetaKey("test-model", reqTokens), be); meta != nil {
 		t.Errorf("new meta written for full request key, want none")
 	}
 }
@@ -517,11 +518,11 @@ func TestChatSavePerformedWhenRatioBelowThreshold(t *testing.T) {
 	}
 	be := backendKeyFromURL(m.srv.URL)
 	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
-	markBackendsUp(backendManager)
-	reqBlocks := BlockHashesFromTokens(reqTokens, WordsPerBlock)
+	markBackendsUp(proxycache.GetBackendManager())
+	reqBlocks := proxycache.BlockHashesFromTokens(reqTokens, proxycache.WordsPerBlock)
 	candBlocks := append(append([]string{}, reqBlocks[:4]...), blk("cand9", 4)...)
 	candTokens := append(append([]int{}, seq(400)...), offsetSeq(400, 10000)...)
-	kvMeta.WriteMeta(MetaKey("test-model", candTokens), 800, candBlocks, WordsPerBlock, "test-model", be, 2048)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("test-model", candTokens), 800, candBlocks, proxycache.WordsPerBlock, "test-model", be, 2048)
 	w := postChat(t, `{"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -529,7 +530,7 @@ func TestChatSavePerformedWhenRatioBelowThreshold(t *testing.T) {
 	if len(m.saves) != 1 {
 		t.Fatalf("save calls = %d, want 1 (ratio 0.5 <= 0.8)", len(m.saves))
 	}
-	if meta := kvMeta.ReadMeta(MetaKey("test-model", reqTokens), be); meta == nil {
+	if meta := proxycache.GetKVMeta().ReadMeta(proxycache.MetaKey("test-model", reqTokens), be); meta == nil {
 		t.Error("no meta written for full request key, want one after save")
 	}
 }
@@ -566,19 +567,19 @@ func TestReadLoopForwardsDoneChunk(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ss := &streamState{
-				resp:   &http.Response{Body: &splitReader{parts: tc.parts}},
-				chunks: make(chan []byte, 8),
-				done:   make(chan struct{}),
+			ss := &proxycache.StreamState{
+				Resp:   &http.Response{Body: &splitReader{parts: tc.parts}},
+				Chunks: make(chan []byte, 8),
+				Done:   make(chan struct{}),
 			}
-			go ss.readLoop()
-			<-ss.done
-			// readLoop enqueues the [DONE] chunk before closing done, so the
+			go ss.ReadLoop()
+			<-ss.Done
+			// ReadLoop enqueues the [DONE] chunk before closing done, so the
 			// channel is fully populated here.
 			var all []byte
 			for {
 				select {
-				case c := <-ss.chunks:
+				case c := <-ss.Chunks:
 					all = append(all, c...)
 				default:
 					goto drained
@@ -591,8 +592,8 @@ func TestReadLoopForwardsDoneChunk(t *testing.T) {
 			if !strings.Contains(string(all), "hi") {
 				t.Errorf("client stream missing content: %q", all)
 			}
-			if !ss.streamComplete {
-				t.Error("streamComplete = false, want true")
+			if !ss.StreamComplete {
+				t.Error("StreamComplete = false, want true")
 			}
 		})
 	}

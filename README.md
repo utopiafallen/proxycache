@@ -97,7 +97,7 @@ Each request record includes:
 - **Per-model and per-backend breakdowns**
 - **Routing diagnostics**: per-backend cache scan results (cache file ratio, pending slot ratios, unreachable status), best match ratio, selected backend, and candidate fallback list
 
-Metrics are recorded in three phases: arrival (status=`incomplete`), routing decision (backend, slot, routing reason), and completion (latency, cache hit/miss, save status). Streaming requests record metrics in `streamState.cleanup()` after the full response lifecycle.
+Metrics are recorded in three phases: arrival (status=`incomplete`), routing decision (backend, slot, routing reason), and completion (latency, cache hit/miss, save status). Streaming requests record metrics in `StreamState.cleanup()` after the full response lifecycle.
 
 Diagnostic events are recorded when backends change liveness state (up/down), capturing `state_changes` and `discovered_models` snapshots. The unified timeline (`GET /metrics/diagnostics?timeline=true`) preserves the chronological sequence of requests and events for post-mortem analysis.
 
@@ -200,7 +200,7 @@ llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 
 ### 2. Build and run the proxy
 
 ```bash
-./build-proxycache.sh     # or: go build
+./build-proxycache.sh     # or: go build -o proxycache.exe ./cmd/proxycache
 ./proxycache.exe
 ```
 

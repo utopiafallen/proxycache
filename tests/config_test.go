@@ -1,7 +1,8 @@
-package main
+package tests
 
 import (
 	"os"
+	"proxycache"
 	"strings"
 	"testing"
 )
@@ -20,8 +21,8 @@ func TestEnvInt(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Setenv("TEST_INT", c.env)
-		if got := envInt("TEST_INT", c.def); got != c.want {
-			t.Errorf("envInt with env=%q def=%d = %d, want %d", c.env, c.def, got, c.want)
+		if got := proxycache.EnvInt("TEST_INT", c.def); got != c.want {
+			t.Errorf("EnvInt with env=%q def=%d = %d, want %d", c.env, c.def, got, c.want)
 		}
 	}
 }
@@ -39,8 +40,8 @@ func TestEnvFloat(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Setenv("TEST_FLOAT", c.env)
-		if got := envFloat("TEST_FLOAT", c.def); got != c.want {
-			t.Errorf("envFloat with env=%q def=%v = %v, want %v", c.env, c.def, got, c.want)
+		if got := proxycache.EnvFloat("TEST_FLOAT", c.def); got != c.want {
+			t.Errorf("EnvFloat with env=%q def=%v = %v, want %v", c.env, c.def, got, c.want)
 		}
 	}
 }
@@ -56,8 +57,8 @@ func TestEnvStr(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Setenv("TEST_STR", c.env)
-		if got := envStr("TEST_STR", c.def); got != c.want {
-			t.Errorf("envStr with env=%q def=%q = %q, want %q", c.env, c.def, got, c.want)
+		if got := proxycache.EnvStr("TEST_STR", c.def); got != c.want {
+			t.Errorf("EnvStr with env=%q def=%q = %q, want %q", c.env, c.def, got, c.want)
 		}
 	}
 }
@@ -81,8 +82,8 @@ func TestEnvBool(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Setenv("TEST_BOOL", c.env)
-		if got := envBool("TEST_BOOL", c.def); got != c.want {
-			t.Errorf("envBool with env=%q def=%v = %v, want %v", c.env, c.def, got, c.want)
+		if got := proxycache.EnvBool("TEST_BOOL", c.def); got != c.want {
+			t.Errorf("EnvBool with env=%q def=%v = %v, want %v", c.env, c.def, got, c.want)
 		}
 	}
 }
@@ -91,15 +92,15 @@ func TestSlotTimeoutDefault(t *testing.T) {
 	if os.Getenv("SLOT_TIMEOUT") != "" {
 		t.Skip("SLOT_TIMEOUT set in environment")
 	}
-	if SlotTimeout != 30.0 {
-		t.Errorf("SlotTimeout default = %v, want 30", SlotTimeout)
+	if proxycache.SlotTimeout != 30.0 {
+		t.Errorf("SlotTimeout default = %v, want 30", proxycache.SlotTimeout)
 	}
 }
 
 func TestShouldSaveCache(t *testing.T) {
-	old := CacheSaveRatioThreshold
-	CacheSaveRatioThreshold = 0.8
-	defer func() { CacheSaveRatioThreshold = old }()
+	old := proxycache.CacheSaveRatioThreshold
+	proxycache.CacheSaveRatioThreshold = 0.8
+	defer func() { proxycache.CacheSaveRatioThreshold = old }()
 
 	cases := []struct {
 		ratio     float64
@@ -114,16 +115,16 @@ func TestShouldSaveCache(t *testing.T) {
 		{1.0, true, true},
 	}
 	for _, c := range cases {
-		if got := ShouldSaveCache(c.ratio, c.recompute); got != c.want {
+		if got := proxycache.ShouldSaveCache(c.ratio, c.recompute); got != c.want {
 			t.Errorf("ShouldSaveCache(ratio=%v, recompute=%v) = %v, want %v", c.ratio, c.recompute, got, c.want)
 		}
 	}
 }
 
 func TestShouldSkipSaveHeuristic(t *testing.T) {
-	old := CacheSaveCtxThreshold
-	CacheSaveCtxThreshold = 0.7
-	defer func() { CacheSaveCtxThreshold = old }()
+	old := proxycache.CacheSaveCtxThreshold
+	proxycache.CacheSaveCtxThreshold = 0.7
+	defer func() { proxycache.CacheSaveCtxThreshold = old }()
 
 	summarize := []map[string]any{{"role": "user", "content": "Please summarize this document"}}
 	hello := []map[string]any{{"role": "user", "content": "Hello there"}}
@@ -141,7 +142,7 @@ func TestShouldSkipSaveHeuristic(t *testing.T) {
 		{10, 1000, hello, false},
 	}
 	for _, c := range cases {
-		got := ShouldSkipSaveHeuristic(c.tokens, c.nCtx, c.msgs, nil)
+		got := proxycache.ShouldSkipSaveHeuristic(c.tokens, c.nCtx, c.msgs, nil)
 		if got != c.want {
 			t.Errorf("ShouldSkipSaveHeuristic(tokens=%d, nCtx=%d, msgs=%v) = %v, want %v",
 				c.tokens, c.nCtx, c.msgs, got, c.want)
@@ -174,7 +175,7 @@ func TestClassifyRequest(t *testing.T) {
 		}}, 0.4, nil},
 	}
 	for _, c := range cases {
-		got := ClassifyRequest(c.msgs, nil)
+		got := proxycache.ClassifyRequest(c.msgs, nil)
 		if got.Score != c.want {
 			t.Errorf("%s: ClassifyRequest score = %v, want %v (signals %v)", c.name, got.Score, c.want, got.Signals)
 		}
@@ -209,8 +210,8 @@ func TestGetMsgText(t *testing.T) {
 		{map[string]any{"content": []any{"not-a-map"}}, ""},
 	}
 	for _, c := range cases {
-		if got := getMsgText(c.msg); got != c.want {
-			t.Errorf("getMsgText(%v) = %q, want %q", c.msg, got, c.want)
+		if got := proxycache.GetMsgText(c.msg); got != c.want {
+			t.Errorf("GetMsgText(%v) = %q, want %q", c.msg, got, c.want)
 		}
 	}
 }
@@ -225,22 +226,22 @@ func TestStripDelimited(t *testing.T) {
 		{"<a>x</a> and <b>y</b>", "  and  "},
 	}
 	for _, c := range cases {
-		if got := stripDelimited(c.in); got != c.want {
-			t.Errorf("stripDelimited(%q) = %q, want %q", c.in, got, c.want)
+		if got := proxycache.StripDelimited(c.in); got != c.want {
+			t.Errorf("StripDelimited(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
 
 func TestExtractInstruction(t *testing.T) {
-	if got := extractInstruction("intro:\nrest"); got != "intro" {
-		t.Errorf("extractInstruction colon+newline = %q, want %q", got, "intro")
+	if got := proxycache.ExtractInstruction("intro:\nrest"); got != "intro" {
+		t.Errorf("ExtractInstruction colon+newline = %q, want %q", got, "intro")
 	}
-	if got := extractInstruction("short"); got != "short" {
-		t.Errorf("extractInstruction short = %q, want %q", got, "short")
+	if got := proxycache.ExtractInstruction("short"); got != "short" {
+		t.Errorf("ExtractInstruction short = %q, want %q", got, "short")
 	}
 	long := strings.Repeat("a", 150)
-	if got := extractInstruction(long); got != long[:100] {
-		t.Errorf("extractInstruction long = len %d, want 100", len(got))
+	if got := proxycache.ExtractInstruction(long); got != long[:100] {
+		t.Errorf("ExtractInstruction long = len %d, want 100", len(got))
 	}
 }
 
@@ -256,8 +257,8 @@ func TestClamp01(t *testing.T) {
 		{2, 1},
 	}
 	for _, c := range cases {
-		if got := clamp01(c.in); got != c.want {
-			t.Errorf("clamp01(%v) = %v, want %v", c.in, got, c.want)
+		if got := proxycache.Clamp01(c.in); got != c.want {
+			t.Errorf("Clamp01(%v) = %v, want %v", c.in, got, c.want)
 		}
 	}
 }
@@ -273,8 +274,8 @@ func TestRoundTo3(t *testing.T) {
 		{1, 1},
 	}
 	for _, c := range cases {
-		if got := roundTo3(c.in); got != c.want {
-			t.Errorf("roundTo3(%v) = %v, want %v", c.in, got, c.want)
+		if got := proxycache.RoundTo3(c.in); got != c.want {
+			t.Errorf("RoundTo3(%v) = %v, want %v", c.in, got, c.want)
 		}
 	}
 }

@@ -6,7 +6,7 @@
 // SLOT_TIMEOUT, and streaming requests use the caller's context only (never a
 // deadline — a slow prompt prefill must not be killed mid-stream).
 
-package main
+package proxycache
 
 import (
 	"bytes"
@@ -42,7 +42,7 @@ func (e *HTTPStatusError) Error() string {
 }
 
 type LlamaClient struct {
-	mu               sync.Mutex
+	Mu               sync.Mutex
 	baseURL          string
 	httpClient       *http.Client
 	requestCount     int
@@ -72,14 +72,14 @@ func (c *LlamaClient) createClient() {
 // reclaimed by the GC). The old pool is deliberately not awaited/closed:
 // closing it can hang on half-open connections.
 func (c *LlamaClient) Recreate() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
 	c.createClient()
 }
 
 func (c *LlamaClient) maybeRecreate() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
 	c.requestCount++
 	if c.requestCount >= ClientRecreateInterval {
 		logInfo("llama_client", "Recreating HTTP client for %s after %d requests, %d connection errors (interval=%d)",
@@ -91,15 +91,15 @@ func (c *LlamaClient) maybeRecreate() {
 }
 
 func (c *LlamaClient) client() *http.Client {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
 	return c.httpClient
 }
 
 // Close releases idle pooled connections.
 func (c *LlamaClient) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
 	c.httpClient.CloseIdleConnections()
 }
 
@@ -129,9 +129,9 @@ func (c *LlamaClient) doRequest(ctx context.Context, method, path string, query 
 	if err != nil {
 		err = classifyHTTPErr(err)
 		if errors.Is(err, ErrConn) {
-			c.mu.Lock()
+			c.Mu.Lock()
 			c.connectionErrors++
-			c.mu.Unlock()
+			c.Mu.Unlock()
 		}
 		return nil, err
 	}

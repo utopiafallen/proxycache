@@ -12,9 +12,9 @@ Requests flow through multiple recording phases, all updating the same ring buff
 1. **Arrival**: `chatHandler()` generates `requestID` (`newRequestID()`, UUID) and calls `Metrics.Record()` with `status="incomplete"`, `prompt_preview`, `request_json`, and the request classification fields. The entry is appended to the ring buffer.
 2. **Routing**: After slot acquisition, `Metrics.Record()` updates the entry with resolved `model` (canonical name), `backend`, `slot_id`, `routing_reason`, `cache_hit`, `restored`, and `routing_diagnostics`. Status remains `"incomplete"`.
 3. **Terminal**: The request reaches a final status:
-   - **`"complete"`** — normal finish (streaming `streamState.cleanup()` with `streamComplete=true`, or non-streaming success). Includes latency, tokens, save status, recompute.
+   - **`"complete"`** — normal finish (streaming `StreamState.cleanup()` with `streamComplete=true`, or non-streaming success). Includes latency, tokens, save status, recompute.
    - **`"cancelled"`** — streaming request where client disconnected (`cancelled=true`, `streamComplete=false`).
-   - **`"backend_error"`** — backend timeout, connection error, streaming response non-200, or generic error. Recorded by error handlers (`recordEarlyError`/`recordChatError`) and streaming `streamState.cleanup()` (backend disconnect case).
+   - **`"backend_error"`** — backend timeout, connection error, streaming response non-200, or generic error. Recorded by error handlers (`recordEarlyError`/`recordChatError`) and streaming `StreamState.cleanup()` (backend disconnect case).
 
 **Liveness events**: The backend manager's `livenessLoop()` records two event types:
 - `event="liveness_change"` — when backend state changes (up/down) or models are missing from discovery. Uses synthetic `request_id` (`liveness:<timestamp_ms>`), includes `state_changes` and `discovered_models`.
@@ -174,7 +174,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 | `MetricsCollector.GetPerformance()` | `metrics.go` | Compute metrics from complete requests only |
 | `MetricsCollector.GetTotalCount()` | `metrics.go` | Return actual ring buffer size for pagination |
 | `MetricsCollector.GetSummary()` | `metrics.go` | Full summary including incomplete_count |
-| `streamState.cleanup()` | `app.go` | Stream lifecycle: save, invalidate, release slot, record metrics with terminal status |
+| `StreamState.cleanup()` | `app.go` | Stream lifecycle: save, invalidate, release slot, record metrics with terminal status |
 | `livenessLoop()` | `backendmanager.go` | Ping backends every 5s, record liveness_change + liveness_diag events |
 | `livenessDiagDue()` | `backendmanager.go` | Pure gate: should a liveness_diag event record this tick |
 | `errName()` | `backendmanager.go` | Map Go errors to Python-flavored exception type names for metrics |
@@ -188,7 +188,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 - **`pending_slot_hit` flag**: must be reset to `false` when a disk cache hit supersedes it in the per-backend loop
 - **Pagination total**: use `GetTotalCount()`, not `len(requests)` (which is the length of the returned slice)
 - **Arrival timestamp preserved**: when updating an existing record, the original timestamp is kept so requests show when they arrived, not when they completed
-- **Prompt preview extraction**: `ExtractPromptPreview()` in `metrics.go` — looks for the most recent message with role "user" or "assistant", iterating messages in reverse order, skipping empty content. Called at arrival, in `streamState.cleanup()`, and on non-streaming completion.
+- **Prompt preview extraction**: `ExtractPromptPreview()` in `metrics.go` — looks for the most recent message with role "user" or "assistant", iterating messages in reverse order, skipping empty content. Called at arrival, in `StreamState.cleanup()`, and on non-streaming completion.
 - **`cached_tokens=0` on pending slot hit**: Indicates `slotKVState` was stale — the proxy's block tracking didn't match llama.cpp's actual KV cache. The slot may have been evicted or served a different conversation.
 - **`routing_diagnostics.scan` may skip backends**: If a backend goes down during the cache scan, it appears with `status="unreachable"` and no ratio data. Cross-reference with liveness events to determine if the backend was dropped from the model registry.
 - **Liveness events and requests share one ring buffer**: because of this, liveness events are rate-limited per backend (`livenessDiagDue()` / `MissingModelsRetryInterval` gating). If you relax the gating, sustained health-check flapping (common while the backend is busy) will evict all request records and the dashboard history will appear to empty periodically.

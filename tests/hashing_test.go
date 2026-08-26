@@ -1,6 +1,7 @@
-package main
+package tests
 
 import (
+	"proxycache"
 	"reflect"
 	"testing"
 )
@@ -17,7 +18,7 @@ func TestSanitizeBackendDir(t *testing.T) {
 		{"", ""},
 	}
 	for _, c := range cases {
-		if got := SanitizeBackendDir(c.in); got != c.want {
+		if got := proxycache.SanitizeBackendDir(c.in); got != c.want {
 			t.Errorf("SanitizeBackendDir(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
@@ -43,7 +44,7 @@ func TestBlockHashesFromTokens(t *testing.T) {
 		{nil, 100, []string{}},
 	}
 	for _, c := range cases {
-		got := BlockHashesFromTokens(c.tokens, c.wpb)
+		got := proxycache.BlockHashesFromTokens(c.tokens, c.wpb)
 		if !reflect.DeepEqual(got, c.want) {
 			t.Errorf("BlockHashesFromTokens(%v, %d) = %v, want %v", c.tokens, c.wpb, got, c.want)
 		}
@@ -51,12 +52,12 @@ func TestBlockHashesFromTokens(t *testing.T) {
 }
 
 func TestBlockHashesFromTokensDefault(t *testing.T) {
-	if WordsPerBlock != 100 {
-		t.Skipf("WORDS_PER_BLOCK=%d, expected default 100", WordsPerBlock)
+	if proxycache.WordsPerBlock != 100 {
+		t.Skipf("WORDS_PER_BLOCK=%d, expected default 100", proxycache.WordsPerBlock)
 	}
 	tokens := []int{7, 8, 9}
-	want := BlockHashesFromTokens(tokens, 100)
-	if got := BlockHashesFromTokensDefault(tokens); !reflect.DeepEqual(got, want) {
+	want := proxycache.BlockHashesFromTokens(tokens, 100)
+	if got := proxycache.BlockHashesFromTokensDefault(tokens); !reflect.DeepEqual(got, want) {
 		t.Errorf("BlockHashesFromTokensDefault(%v) = %v, want %v", tokens, got, want)
 	}
 }
@@ -77,14 +78,14 @@ func TestLCPBlocks(t *testing.T) {
 		{nil, nil, 0},
 	}
 	for _, c := range cases {
-		if got := LCPBlocks(c.b1, c.b2); got != c.want {
+		if got := proxycache.LCPBlocks(c.b1, c.b2); got != c.want {
 			t.Errorf("LCPBlocks(%v, %v) = %d, want %d", c.b1, c.b2, got, c.want)
 		}
 	}
 }
 
 func TestPrefixKeySha256(t *testing.T) {
-	if got := PrefixKeySha256("hello"); got != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
+	if got := proxycache.PrefixKeySha256("hello"); got != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
 		t.Errorf("PrefixKeySha256(\"hello\") = %s", got)
 	}
 }
@@ -99,7 +100,7 @@ func TestMetaKey(t *testing.T) {
 		{"ModelB", []int{7, 8}, "1cc62576f41245b06f21c4143e5cecf790d82aa317be298f59b89ac75579ff98"},
 	}
 	for _, c := range cases {
-		if got := MetaKey(c.name, c.tokens); got != c.want {
+		if got := proxycache.MetaKey(c.name, c.tokens); got != c.want {
 			t.Errorf("MetaKey(%q, %v) = %s, want %s", c.name, c.tokens, got, c.want)
 		}
 	}

@@ -5,7 +5,7 @@
 // queries. Two-phase recording: arrival (status="incomplete") then completion
 // (status="complete") updates the same entry in-place via request_id.
 
-package main
+package proxycache
 
 import (
 	"math"
@@ -18,12 +18,12 @@ import (
 
 const extractPreviewMaxLen = 200
 
-func extractFromContent(content any) string {
+func ExtractFromContent(content any) string {
 	switch c := content.(type) {
 	case string:
 		stripped := strings.TrimSpace(c)
 		if stripped != "" {
-			return truncateRune(stripped, extractPreviewMaxLen)
+			return TruncateRune(stripped, extractPreviewMaxLen)
 		}
 	case []any:
 		for _, p := range c {
@@ -33,7 +33,7 @@ func extractFromContent(content any) string {
 			}
 			if pm["type"] == "text" {
 				if t, ok := pm["text"].(string); ok && strings.TrimSpace(t) != "" {
-					return truncateRune(t, extractPreviewMaxLen)
+					return TruncateRune(t, extractPreviewMaxLen)
 				}
 			}
 		}
@@ -41,7 +41,7 @@ func extractFromContent(content any) string {
 	return ""
 }
 
-func truncateRune(s string, n int) string {
+func TruncateRune(s string, n int) string {
 	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
@@ -64,10 +64,10 @@ func ExtractPromptPreview(requestJSON map[string]any) string {
 		if role != "user" && role != "assistant" {
 			continue
 		}
-		if p := extractFromContent(msg["content"]); p != "" {
+		if p := ExtractFromContent(msg["content"]); p != "" {
 			return p
 		}
-		if p := extractFromContent(msg["reasoning_content"]); p != "" {
+		if p := ExtractFromContent(msg["reasoning_content"]); p != "" {
 			return p
 		}
 	}
@@ -93,10 +93,10 @@ func getOrNil(r map[string]any, key string) any {
 }
 
 type MetricsCollector struct {
-	mu        sync.Mutex
+	Mu        sync.Mutex
 	retention int
 	buffer    []map[string]any
-	byID      map[string]int
+	ByID      map[string]int
 
 	totalRequests    int
 	cacheHits        int
@@ -115,7 +115,7 @@ type MetricsCollector struct {
 func NewMetricsCollector(retention int) *MetricsCollector {
 	return &MetricsCollector{
 		retention:       retention,
-		byID:            map[string]int{},
+		ByID:            map[string]int{},
 		modelCounters:   map[string]map[string]int{},
 		backendCounters: map[string]map[string]int{},
 		startTime:       time.Now(),
@@ -133,11 +133,11 @@ func (m *MetricsCollector) Record(ctx map[string]any) {
 		for k, v := range ctx {
 			entry[k] = v
 		}
-		m.mu.Lock()
+		m.Mu.Lock()
 		m.buffer = append(m.buffer, entry)
 		m.trimBuffer()
 		m.rebuildByID()
-		m.mu.Unlock()
+		m.Mu.Unlock()
 		return
 	}
 
@@ -190,10 +190,10 @@ func (m *MetricsCollector) Record(ctx map[string]any) {
 	}
 	record["prompt_preview"] = promptPreview
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
 
-	if idx, ok := m.byID[requestID]; ok {
+	if idx, ok := m.ByID[requestID]; ok {
 		old := m.buffer[idx]
 		oldPromptPreview, _ := old["prompt_preview"].(string)
 		oldTimestamp := old["timestamp"]
@@ -241,13 +241,13 @@ func (m *MetricsCollector) trimBuffer() {
 	}
 }
 
-// rebuildByID must be called while holding m.mu.
+// rebuildByID must be called while holding m.Mu.
 func (m *MetricsCollector) rebuildByID() {
-	m.byID = map[string]int{}
+	m.ByID = map[string]int{}
 	for i, r := range m.buffer {
 		rid, _ := r["request_id"].(string)
 		if rid != "" && !isEvent(r) {
-			m.byID[rid] = i
+			m.ByID[rid] = i
 		}
 	}
 }
@@ -327,9 +327,9 @@ func (m *MetricsCollector) incrementCounters(model, backend string, cacheHit, re
 
 // GetRequestByID returns a copy of a single request record.
 func (m *MetricsCollector) GetRequestByID(requestID string) map[string]any {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	idx, ok := m.byID[requestID]
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
+	idx, ok := m.ByID[requestID]
 	if !ok {
 		return nil
 	}
@@ -365,9 +365,9 @@ func copyRecord(r map[string]any) map[string]any {
 
 // GetRequests returns recent request records (events excluded), newest first.
 func (m *MetricsCollector) GetRequests(limit, offset int) []map[string]any {
-	m.mu.Lock()
+	m.Mu.Lock()
 	requests := m.reversedNonEvents()
-	m.mu.Unlock()
+	m.Mu.Unlock()
 	if offset < 0 {
 		offset = 0
 	}
@@ -383,8 +383,8 @@ func (m *MetricsCollector) GetRequests(limit, offset int) []map[string]any {
 
 // GetTotalCount returns the number of request entries (events excluded).
 func (m *MetricsCollector) GetTotalCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
 	n := 0
 	for _, r := range m.buffer {
 		if !isEvent(r) {
@@ -396,9 +396,9 @@ func (m *MetricsCollector) GetTotalCount() int {
 
 // GetRequestsSummary returns recent requests without the full JSON payload.
 func (m *MetricsCollector) GetRequestsSummary(limit, offset int) []map[string]any {
-	m.mu.Lock()
+	m.Mu.Lock()
 	requests := m.reversedNonEvents()
-	m.mu.Unlock()
+	m.Mu.Unlock()
 	if offset < 0 {
 		offset = 0
 	}
@@ -444,12 +444,12 @@ func (m *MetricsCollector) GetRequestsSummary(limit, offset int) []map[string]an
 
 // GetEvents returns events (newest first), optionally filtered by type.
 func (m *MetricsCollector) GetEvents(eventType string, limit int) []map[string]any {
-	m.mu.Lock()
+	m.Mu.Lock()
 	entries := make([]map[string]any, 0, len(m.buffer))
 	for i := len(m.buffer) - 1; i >= 0; i-- {
 		entries = append(entries, copyRecord(m.buffer[i]))
 	}
-	m.mu.Unlock()
+	m.Mu.Unlock()
 	events := make([]map[string]any, 0)
 	for _, e := range entries {
 		if !isEvent(e) {
@@ -470,12 +470,12 @@ func (m *MetricsCollector) GetEvents(eventType string, limit int) []map[string]a
 
 // GetTimeline returns the unified timeline (requests + events), newest first.
 func (m *MetricsCollector) GetTimeline(limit int) []map[string]any {
-	m.mu.Lock()
+	m.Mu.Lock()
 	entries := make([]map[string]any, 0, len(m.buffer))
 	for i := len(m.buffer) - 1; i >= 0; i-- {
 		entries = append(entries, copyRecord(m.buffer[i]))
 	}
-	m.mu.Unlock()
+	m.Mu.Unlock()
 	if limit > 0 && len(entries) > limit {
 		entries = entries[:limit]
 	}
@@ -490,7 +490,7 @@ func (m *MetricsCollector) GetPerformance(model, backend, reqType string) map[st
 	var requests []map[string]any
 	var counters map[string]int
 
-	m.mu.Lock()
+	m.Mu.Lock()
 	if model != "" || backend != "" {
 		for _, r := range m.buffer {
 			if isEvent(r) {
@@ -532,7 +532,7 @@ func (m *MetricsCollector) GetPerformance(model, backend, reqType string) map[st
 			"recomputes": m.cacheRecomputes, "saved": m.cacheSaved, "save_skipped": m.cacheSaveSkipped,
 		}
 	}
-	m.mu.Unlock()
+	m.Mu.Unlock()
 
 	// Filter by request type
 	if reqType == "summarization" {
@@ -624,19 +624,19 @@ func (m *MetricsCollector) GetPerformance(model, backend, reqType string) map[st
 	sort.Float64s(latencies)
 
 	return map[string]any{
-		"total_requests":       total,
-		"cache_hits":           hits,
-		"cache_misses":         misses,
-		"cache_recomputes":     recomputes,
-		"cache_saved":          saved,
-		"cache_save_skipped":   saveSkipped,
-		"cache_hit_rate":       roundTo(hitRate, 4),
+		"total_requests":        total,
+		"cache_hits":            hits,
+		"cache_misses":          misses,
+		"cache_recomputes":      recomputes,
+		"cache_saved":           saved,
+		"cache_save_skipped":    saveSkipped,
+		"cache_hit_rate":        roundTo(hitRate, 4),
 		"cache_mispredict_rate": roundTo(mispredictRate, 4),
-		"cache_utility_rate":   roundTo(utilityRate, 4),
-		"save_rate":            roundTo(saveRate, 4),
-		"save_skip_rate":       roundTo(saveSkipRate, 4),
-		"restore_success_rate": roundTo(restoreRate, 4),
-		"latency":              computePercentiles(latencies),
+		"cache_utility_rate":    roundTo(utilityRate, 4),
+		"save_rate":             roundTo(saveRate, 4),
+		"save_skip_rate":        roundTo(saveSkipRate, 4),
+		"restore_success_rate":  roundTo(restoreRate, 4),
+		"latency":               computePercentiles(latencies),
 	}
 }
 
@@ -672,7 +672,7 @@ func (m *MetricsCollector) GetSummary() map[string]any {
 	requestsFull := m.GetRequests(m.retention, 0)
 	requestsSummary := m.GetRequestsSummary(m.retention, 0)
 
-	m.mu.Lock()
+	m.Mu.Lock()
 	incompleteCount := 0
 	var complete []map[string]any
 	for _, r := range m.buffer {
@@ -704,16 +704,16 @@ func (m *MetricsCollector) GetSummary() map[string]any {
 			convLatencies = append(convLatencies, l)
 		}
 	}
-	m.mu.Unlock()
+	m.Mu.Unlock()
 	sort.Float64s(sumLatencies)
 	sort.Float64s(convLatencies)
 
 	return map[string]any{
-		"uptime_seconds":    roundTo(time.Since(m.startTime).Seconds(), 1),
-		"performance":       perf,
-		"requests":          requestsFull,
-		"requests_summary":  requestsSummary,
-		"incomplete_count":  incompleteCount,
+		"uptime_seconds":   roundTo(time.Since(m.startTime).Seconds(), 1),
+		"performance":      perf,
+		"requests":         requestsFull,
+		"requests_summary": requestsSummary,
+		"incomplete_count": incompleteCount,
 		"summarization": map[string]any{
 			"total":                len(sumRequests),
 			"conversation_total":   len(convRequests),

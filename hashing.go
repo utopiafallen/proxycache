@@ -1,7 +1,7 @@
 // hashing.go — cache key hashing: SHA256 of model name + token IDs,
 // with word-block LCP matching over full SHA256 block hashes.
 
-package main
+package proxycache
 
 import (
 	"crypto/sha256"

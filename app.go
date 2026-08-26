@@ -1,9 +1,9 @@
-package main
+package proxycache
 
 import (
+	"context"
 	cr "crypto/rand"
 	_ "embed"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -177,7 +177,7 @@ func clampF(v, min, max float64) float64 {
 }
 
 func latencyMS(t0 float64) float64 {
-	return (nowFloat() - t0) * 1000
+	return (NowFloat() - t0) * 1000
 }
 
 func ctxSleep(ctx context.Context, seconds float64) error {
@@ -234,13 +234,13 @@ func recordEarlyError(requestID, model string, t0 float64) {
 
 func recordChatError(requestID, model, backend string, slotID int, t0 float64, routingReason string) {
 	Metrics.Record(map[string]any{
-		"request_id":   requestID,
-		"model":        model,
-		"backend":      backend,
-		"slot_id":      slotID,
-		"latency_ms":   latencyMS(t0),
+		"request_id":     requestID,
+		"model":          model,
+		"backend":        backend,
+		"slot_id":        slotID,
+		"latency_ms":     latencyMS(t0),
 		"routing_reason": routingReason,
-		"status":       "backend_error",
+		"status":         "backend_error",
 	})
 }
 
@@ -251,9 +251,9 @@ func restorePrevKV(beSm *BackendSlotManager, slotID int, prevKV []string, modelN
 	}
 }
 
-func modelsHandler(w http.ResponseWriter, r *http.Request) {
+func ModelsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
 	models := backendManager.SnapshotModels()
@@ -290,7 +290,7 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 		"owned_by": "proxycache",
 		"n_ctx":    minCtx,
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"data": data})
+	WriteJSON(w, http.StatusOK, map[string]any{"data": data})
 }
 
 func handleTokenizeError(w http.ResponseWriter, requestID, model string, t0 float64, err error) {
@@ -301,16 +301,16 @@ func handleTokenizeError(w http.ResponseWriter, requestID, model string, t0 floa
 			detail = statusErr.Error()
 		}
 		recordEarlyError(requestID, model, t0)
-		writeJSON(w, statusErr.StatusCode, map[string]any{"error": detail})
+		WriteJSON(w, statusErr.StatusCode, map[string]any{"error": detail})
 		return
 	}
 	if errors.Is(err, ErrConn) {
 		recordEarlyError(requestID, model, t0)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend unreachable"})
+		WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend unreachable"})
 		return
 	}
 	recordEarlyError(requestID, model, t0)
-	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 }
 
 func acquireSlotForRequest(
@@ -469,26 +469,26 @@ func acquireSlotForRequest(
 	}
 }
 
-func chatHandler(w http.ResponseWriter, r *http.Request) {
+func ChatHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	t0 := nowFloat()
+	t0 := NowFloat()
 	ip := clientIP(r)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to read request body"})
+		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to read request body"})
 		return
 	}
 	var parsed any
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "invalid JSON body"})
+		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": "invalid JSON body"})
 		return
 	}
 	requestJSON, ok := parsed.(map[string]any)
 	if !ok {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "invalid JSON body"})
+		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": "invalid JSON body"})
 		return
 	}
 
@@ -520,14 +520,14 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(options) == 0 {
 		recordEarlyError(requestID, clientModel, t0)
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("model '%s' not found", clientModel)})
+		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("model '%s' not found", clientModel)})
 		return
 	}
 
 	firstOpt := options[0]
 	if len(firstOpt.Backends) == 0 {
 		recordEarlyError(requestID, clientModel, t0)
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "backend unavailable"})
+		WriteJSON(w, http.StatusBadGateway, map[string]any{"error": "backend unavailable"})
 		return
 	}
 	firstBeID := firstOpt.Backends[0]
@@ -552,7 +552,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if promptTokens >= minCtx {
 		recordEarlyError(requestID, clientModel, t0)
-		writeJSON(w, http.StatusBadRequest, map[string]any{
+		WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"error": fmt.Sprintf("prompt too long (tokens=%d, n_ctx=%d)", promptTokens, minCtx),
 		})
 		return
@@ -589,7 +589,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				logError("app", "Backend %s scan error for model '%s' from client %s: %v", beID, opt.Name, ip, tErr)
 				recordEarlyError(requestID, clientModel, t0)
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": tErr.Error()})
+				WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": tErr.Error()})
 				return
 			}
 			optBlocks := BlockHashesFromTokens(optTokenIDs, WordsPerBlock)
@@ -720,7 +720,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	if acqErr != nil {
 		logError("app", "Could not acquire slot from client %s for model '%s': %v", ip, clientModel, acqErr)
 		recordEarlyError(requestID, clientModel, t0)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "all slots busy, please retry later"})
+		WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "all slots busy, please retry later"})
 		return
 	}
 
@@ -760,14 +760,14 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 		candidateIDs = append(candidateIDs, cb.BackendID)
 	}
 	Metrics.Record(map[string]any{
-		"request_id":  requestID,
-		"model":       modelName,
-		"backend":     beID,
-		"slot_id":     slotID,
+		"request_id":     requestID,
+		"model":          modelName,
+		"backend":        beID,
+		"slot_id":        slotID,
 		"routing_reason": routingReason,
-		"cache_hit":  hitType != nil,
-		"restored":   restored,
-		"status":     "incomplete",
+		"cache_hit":      hitType != nil,
+		"restored":       restored,
+		"status":         "incomplete",
 		"routing_diagnostics": map[string]any{
 			"best_ratio":           round4(bestRatio),
 			"restore_key":          key16OrNil(restoreKey),
@@ -821,7 +821,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 			logError("app", "Chat timeout for client %s, model '%s' on backend '%s' slot %d (key %s): %v",
 				ip, modelName, beID, slotID, key16(key), err)
 			recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-			writeJSON(w, http.StatusGatewayTimeout, map[string]any{"error": err.Error()})
+			WriteJSON(w, http.StatusGatewayTimeout, map[string]any{"error": err.Error()})
 			return
 		}
 		if errors.Is(err, ErrConn) {
@@ -831,20 +831,20 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 			beSm.Release(slotID)
 			released = true
 			recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend connection failed"})
+			WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend connection failed"})
 			return
 		}
 		logError("app", "Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %v",
 			ip, modelName, beID, slotID, key16(key), err)
 		restorePrevKV(beSm, slotID, prevKV, modelName, beID)
 		recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	if out == nil {
 		restorePrevKV(beSm, slotID, prevKV, modelName, beID)
 		recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "provider non-JSON body"})
+		WriteJSON(w, http.StatusBadGateway, map[string]any{"error": "provider non-JSON body"})
 		return
 	}
 
@@ -882,7 +882,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	servingBeRatio := backendCacheRatios[beID]
-	skipEntry := &saveSkipEntry{
+	skipEntry := &SaveSkipEntry{
 		Key:          key,
 		Blocks:       blocks,
 		NTokens:      promptTokens,
@@ -926,7 +926,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	})
 	backendManager.UpdateBackendLatency(beID, latency)
 	backendManager.UpdateBackendModelLatency(beID, modelName, latency, reqType)
-	writeJSON(w, http.StatusOK, out)
+	WriteJSON(w, http.StatusOK, out)
 }
 
 func metricsDashboardHandler(w http.ResponseWriter, r *http.Request) {
@@ -935,19 +935,19 @@ func metricsDashboardHandler(w http.ResponseWriter, r *http.Request) {
 	summary["slots"] = getSlotStatus()
 	summary["cache"] = getCacheStats()
 	summary["backend_model_performance"] = backendManager.GetAllLatencyEMA()
-	writeJSON(w, http.StatusOK, summary)
+	WriteJSON(w, http.StatusOK, summary)
 }
 
 func metricsHealthHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, getBackendHealth())
+	WriteJSON(w, http.StatusOK, getBackendHealth())
 }
 
 func metricsSlotsHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, getSlotStatus())
+	WriteJSON(w, http.StatusOK, getSlotStatus())
 }
 
 func metricsCacheHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, getCacheStats())
+	WriteJSON(w, http.StatusOK, getCacheStats())
 }
 
 func metricsDiagnosticsHandler(w http.ResponseWriter, r *http.Request) {
@@ -958,19 +958,19 @@ func metricsDiagnosticsHandler(w http.ResponseWriter, r *http.Request) {
 	liveness := queryTruthy(q.Get("liveness"))
 	switch {
 	case timeline:
-		writeJSON(w, http.StatusOK, map[string]any{"timeline": Metrics.GetTimeline(200)})
+		WriteJSON(w, http.StatusOK, map[string]any{"timeline": Metrics.GetTimeline(200)})
 	case livenessDiag:
-		writeJSON(w, http.StatusOK, map[string]any{"liveness_diagnostics": Metrics.GetEvents("liveness_diag", 50)})
+		WriteJSON(w, http.StatusOK, map[string]any{"liveness_diagnostics": Metrics.GetEvents("liveness_diag", 50)})
 	case liveness:
-		writeJSON(w, http.StatusOK, map[string]any{"liveness_events": Metrics.GetEvents("liveness_change", 50)})
+		WriteJSON(w, http.StatusOK, map[string]any{"liveness_events": Metrics.GetEvents("liveness_change", 50)})
 	case requestID != "":
 		req := Metrics.GetRequestByID(requestID)
 		if req == nil {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "Request not found"})
+			WriteJSON(w, http.StatusNotFound, map[string]any{"error": "Request not found"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"request_id":         requestID,
+		WriteJSON(w, http.StatusOK, map[string]any{
+			"request_id":          requestID,
 			"routing_diagnostics": req["routing_diagnostics"],
 		})
 	default:
@@ -979,19 +979,19 @@ func metricsDiagnosticsHandler(w http.ResponseWriter, r *http.Request) {
 		for _, rec := range reqs {
 			if hasRoutingDiagnostics(rec["routing_diagnostics"]) {
 				diags = append(diags, map[string]any{
-					"request_id":         rec["request_id"],
+					"request_id":          rec["request_id"],
 					"routing_diagnostics": rec["routing_diagnostics"],
 				})
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"diagnostics": diags})
+		WriteJSON(w, http.StatusOK, map[string]any{"diagnostics": diags})
 	}
 }
 
 func metricsRequestsHandler(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 100)
 	offset := queryInt(r, "offset", 0)
-	writeJSON(w, http.StatusOK, map[string]any{
+	WriteJSON(w, http.StatusOK, map[string]any{
 		"requests": Metrics.GetRequests(limit, offset),
 		"total":    Metrics.GetTotalCount(),
 	})
@@ -1000,25 +1000,25 @@ func metricsRequestsHandler(w http.ResponseWriter, r *http.Request) {
 func metricsRequestByIDHandler(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/metrics/request/")
 	if id == "" {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Request not found"})
+		WriteJSON(w, http.StatusNotFound, map[string]any{"error": "Request not found"})
 		return
 	}
 	req := Metrics.GetRequestByID(id)
 	if req == nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Request not found"})
+		WriteJSON(w, http.StatusNotFound, map[string]any{"error": "Request not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, req)
+	WriteJSON(w, http.StatusOK, req)
 }
 
 func metricsPerformanceHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	writeJSON(w, http.StatusOK, Metrics.GetPerformance(q.Get("model"), q.Get("backend"), ""))
+	WriteJSON(w, http.StatusOK, Metrics.GetPerformance(q.Get("model"), q.Get("backend"), ""))
 }
 
-func dashboardHandler(w http.ResponseWriter, r *http.Request) {
+func DashboardHandler(w http.ResponseWriter, r *http.Request) {
 	if !DashboardEnabled {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Dashboard disabled"})
+		WriteJSON(w, http.StatusNotFound, map[string]any{"error": "Dashboard disabled"})
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1052,11 +1052,11 @@ func getBackendHealth() map[string]any {
 			}
 		}
 		result[key] = map[string]any{
-			"url":         info.URL,
-			"up":          backendManager.GetBackendState(key),
-			"cache_dir":   info.CacheDir,
-			"has_agent":   info.HasAgent,
-			"models":      modelsMap,
+			"url":       info.URL,
+			"up":        backendManager.GetBackendState(key),
+			"cache_dir": info.CacheDir,
+			"has_agent": info.HasAgent,
+			"models":    modelsMap,
 		}
 	}
 	return result
@@ -1104,8 +1104,8 @@ func getCacheStats() map[string]any {
 	return result
 }
 
-type streamState struct {
-	resp               *http.Response
+type StreamState struct {
+	Resp               *http.Response
 	w                  http.ResponseWriter
 	flusher            http.Flusher
 	r                  *http.Request
@@ -1132,30 +1132,30 @@ type streamState struct {
 	promptPreview      string
 	clientIP           string
 
-	chunks     chan []byte
-	done       chan struct{}
-	doneOnce   sync.Once
-	bodyOnce   sync.Once
-	cleanupOnce sync.Once
-	cancelled  bool
-	streamComplete bool
+	Chunks          chan []byte
+	Done            chan struct{}
+	doneOnce        sync.Once
+	bodyOnce        sync.Once
+	cleanupOnce     sync.Once
+	cancelled       bool
+	StreamComplete  bool
 	ssePromptTokens int
 	sseCachedTokens int
-	lineBuf    string
+	lineBuf         string
 }
 
-func (ss *streamState) finish() {
-	ss.doneOnce.Do(func() { close(ss.done) })
+func (ss *StreamState) finish() {
+	ss.doneOnce.Do(func() { close(ss.Done) })
 }
 
-func (ss *streamState) closeBody() {
-	if ss.resp == nil || ss.resp.Body == nil {
+func (ss *StreamState) closeBody() {
+	if ss.Resp == nil || ss.Resp.Body == nil {
 		return
 	}
 	ss.bodyOnce.Do(func() {
 		done := make(chan struct{})
 		go func() {
-			ss.resp.Body.Close()
+			ss.Resp.Body.Close()
 			close(done)
 		}()
 		select {
@@ -1166,12 +1166,12 @@ func (ss *streamState) closeBody() {
 	})
 }
 
-func (ss *streamState) readLoop() {
+func (ss *StreamState) ReadLoop() {
 	buf := make([]byte, 32*1024)
 	chunksReceived := 0
 	totalBytes := 0
 	for {
-		n, readErr := ss.resp.Body.Read(buf)
+		n, readErr := ss.Resp.Body.Read(buf)
 		if n > 0 {
 			totalBytes += n
 			chunk := make([]byte, n)
@@ -1211,12 +1211,12 @@ func (ss *streamState) readLoop() {
 			}
 			if sseDone {
 				logInfo("app", "SSE [DONE] received for model '%s' on backend '%s' slot %d (key %s)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
-				ss.streamComplete = true
+				ss.StreamComplete = true
 				// Forward the [DONE] chunk itself: clients treat a stream that
 				// ends without data: [DONE] as truncated even when all content
 				// arrived.
 				select {
-				case ss.chunks <- chunk:
+				case ss.Chunks <- chunk:
 					chunksReceived++
 				default:
 					logWarn("app", "Stream queue full while flushing SSE [DONE] for model '%s' on backend '%s' slot %d (key %s)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
@@ -1225,7 +1225,7 @@ func (ss *streamState) readLoop() {
 				return
 			}
 			select {
-			case ss.chunks <- chunk:
+			case ss.Chunks <- chunk:
 				chunksReceived++
 			default:
 				logWarn("app", "Stream queue full for model '%s' on backend '%s' slot %d (key %s)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
@@ -1236,7 +1236,7 @@ func (ss *streamState) readLoop() {
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
-				ss.streamComplete = true
+				ss.StreamComplete = true
 				logInfo("app", "Stream complete from client %s for model '%s' on backend '%s' slot %d (key %s): %d chunks, %d bytes", ss.clientIP, ss.modelName, ss.backendID, ss.slotID, ss.keyShort, chunksReceived, totalBytes)
 			} else {
 				logWarn("app", "Backend disconnected for model '%s' on backend '%s' slot %d (key %s): incomplete body (%d chunks, %d bytes), error=%v", ss.modelName, ss.backendID, ss.slotID, ss.keyShort, chunksReceived, totalBytes, readErr)
@@ -1247,12 +1247,12 @@ func (ss *streamState) readLoop() {
 	}
 }
 
-func (ss *streamState) run() {
+func (ss *StreamState) run() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case chunk := <-ss.chunks:
+		case chunk := <-ss.Chunks:
 			if _, werr := ss.w.Write(chunk); werr != nil {
 				logWarn("app", "Stream write error for model '%s' on backend '%s' slot %d (key %s): %v", ss.modelName, ss.backendID, ss.slotID, ss.keyShort, werr)
 				ss.cancelled = true
@@ -1263,12 +1263,12 @@ func (ss *streamState) run() {
 			if ss.flusher != nil {
 				ss.flusher.Flush()
 			}
-		case <-ss.done:
+		case <-ss.Done:
 			if !ss.cancelled {
 			drain:
 				for {
 					select {
-					case chunk := <-ss.chunks:
+					case chunk := <-ss.Chunks:
 						if _, werr := ss.w.Write(chunk); werr != nil {
 							ss.cancelled = true
 							break drain
@@ -1300,7 +1300,7 @@ func (ss *streamState) run() {
 	}
 }
 
-func (ss *streamState) save() (bool, int) {
+func (ss *StreamState) save() (bool, int) {
 	recomputeHappened := false
 	if ss.hitType != nil && ss.restoreBackend != "" {
 		cachedTokens := ss.sseCachedTokens
@@ -1326,7 +1326,7 @@ func (ss *streamState) save() (bool, int) {
 	servingBeRatio := ss.backendCacheRatios[ss.backendID]
 	if ShouldSkipSaveHeuristic(ss.nTokens, backendManager.GetBackendNCtx(ss.modelName, ss.backendID), ss.messages, ss.requestJSON) {
 		logInfo("app", "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): heuristic skip", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
-		ss.beSm.MarkSaveSkipped(ss.slotID, &saveSkipEntry{
+		ss.beSm.MarkSaveSkipped(ss.slotID, &SaveSkipEntry{
 			Key:          ss.key,
 			Blocks:       ss.blocks,
 			NTokens:      ss.nTokens,
@@ -1339,7 +1339,7 @@ func (ss *streamState) save() (bool, int) {
 	}
 	if !ShouldSaveCache(servingBeRatio, recomputeHappened) {
 		logInfo("app", "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): restore ratio %.3f >= threshold (no recompute, cache was useful)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort, servingBeRatio)
-		ss.beSm.MarkSaveSkipped(ss.slotID, &saveSkipEntry{
+		ss.beSm.MarkSaveSkipped(ss.slotID, &SaveSkipEntry{
 			Key:          ss.key,
 			Blocks:       ss.blocks,
 			NTokens:      ss.nTokens,
@@ -1355,21 +1355,21 @@ func (ss *streamState) save() (bool, int) {
 	return ok, cacheSize
 }
 
-func (ss *streamState) cleanup() {
+func (ss *StreamState) cleanup() {
 	ss.cleanupOnce.Do(func() {
 		if ss.cancel != nil {
 			ss.cancel()
 		}
-		logInfo("app", "Starting cleanup for model '%s' on backend '%s' slot %d (key %s): cancelled=%v, stream_complete=%v", ss.modelName, ss.backendID, ss.slotID, ss.keyShort, ss.cancelled, ss.streamComplete)
+		logInfo("app", "Starting cleanup for model '%s' on backend '%s' slot %d (key %s): cancelled=%v, stream_complete=%v", ss.modelName, ss.backendID, ss.slotID, ss.keyShort, ss.cancelled, ss.StreamComplete)
 		ss.closeBody()
 		select {
-		case <-ss.done:
+		case <-ss.Done:
 		case <-time.After(5 * time.Second):
 			logWarn("app", "Reader task did not finish after cancel for model '%s' on backend '%s' slot %d (key %s)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
 		}
 		ok := false
 		cacheSize := 0
-		if ss.streamComplete {
+		if ss.StreamComplete {
 			logInfo("app", "Saving cache for model '%s' on backend '%s' slot %d (key %s)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
 			ok, cacheSize = ss.save()
 			logInfo("app", "Cache save completed for model '%s' on backend '%s' slot %d (key %s): %v, %d bytes", ss.modelName, ss.backendID, ss.slotID, ss.keyShort, ok, cacheSize)
@@ -1403,7 +1403,7 @@ func (ss *streamState) cleanup() {
 				}
 			}
 			status := "backend_error"
-			if ss.streamComplete {
+			if ss.StreamComplete {
 				status = "complete"
 			} else if ss.cancelled {
 				status = "cancelled"
@@ -1429,24 +1429,24 @@ func (ss *streamState) cleanup() {
 				nTokens = ss.ssePromptTokens
 			}
 			Metrics.Record(map[string]any{
-				"request_id":         ss.requestID,
-				"t0":                 ss.t0,
-				"request_json":       ss.requestJSON,
-				"model":              ss.modelName,
-				"backend":            ss.backendID,
-				"slot_id":            ss.slotID,
-				"cache_hit":          ss.hitType != nil,
-				"restored":           restored,
-				"recompute":          recomputeHappened,
-				"saved":              ok,
-				"latency_ms":         latency,
-				"n_tokens":           nTokens,
-				"cached_tokens":      ss.sseCachedTokens,
-				"stream":             true,
-				"cache_size_bytes":   cacheSize,
-				"prompt_preview":     ss.promptPreview,
-				"routing_reason":     ss.routingReason,
-				"status":             status,
+				"request_id":       ss.requestID,
+				"t0":               ss.t0,
+				"request_json":     ss.requestJSON,
+				"model":            ss.modelName,
+				"backend":          ss.backendID,
+				"slot_id":          ss.slotID,
+				"cache_hit":        ss.hitType != nil,
+				"restored":         restored,
+				"recompute":        recomputeHappened,
+				"saved":            ok,
+				"latency_ms":       latency,
+				"n_tokens":         nTokens,
+				"cached_tokens":    ss.sseCachedTokens,
+				"stream":           true,
+				"cache_size_bytes": cacheSize,
+				"prompt_preview":   ss.promptPreview,
+				"routing_reason":   ss.routingReason,
+				"status":           status,
 			})
 			backendManager.UpdateBackendLatency(ss.backendID, latency)
 			reqType := "conversation"
@@ -1493,7 +1493,7 @@ func serveStream(
 			logError("app", "Chat timeout for client %s, model '%s' on backend '%s' slot %d (key %s): %v", clientIP(r), modelName, beID, slotID, key16(key), err)
 			recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
 			beSm.Release(slotID)
-			writeJSON(w, http.StatusGatewayTimeout, map[string]any{"error": err.Error()})
+			WriteJSON(w, http.StatusGatewayTimeout, map[string]any{"error": err.Error()})
 			return
 		}
 		if errors.Is(err, ErrConn) {
@@ -1501,14 +1501,14 @@ func serveStream(
 			restorePrevKV(beSm, slotID, oldKV, modelName, beID)
 			beSm.Release(slotID)
 			recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend connection failed"})
+			WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend connection failed"})
 			return
 		}
 		logError("app", "Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %v", clientIP(r), modelName, beID, slotID, key16(key), err)
 		restorePrevKV(beSm, slotID, oldKV, modelName, beID)
 		beSm.Release(slotID)
 		recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 
@@ -1518,7 +1518,7 @@ func serveStream(
 		restorePrevKV(beSm, slotID, oldKV, modelName, beID)
 		recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
 		beSm.Release(slotID)
-		writeJSON(w, resp.StatusCode, map[string]any{"error": string(errBody)})
+		WriteJSON(w, resp.StatusCode, map[string]any{"error": string(errBody)})
 		return
 	}
 
@@ -1533,8 +1533,8 @@ func serveStream(
 		flusher = f
 	}
 
-	ss := &streamState{
-		resp:               resp,
+	ss := &StreamState{
+		Resp:               resp,
 		w:                  w,
 		flusher:            flusher,
 		r:                  r,
@@ -1560,9 +1560,9 @@ func serveStream(
 		messages:           messages,
 		promptPreview:      promptPreview,
 		clientIP:           clientIP(r),
-		chunks:             make(chan []byte, streamQueueSize),
-		done:               make(chan struct{}),
+		Chunks:             make(chan []byte, streamQueueSize),
+		Done:               make(chan struct{}),
 	}
-	go ss.readLoop()
+	go ss.ReadLoop()
 	ss.run()
 }

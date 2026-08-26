@@ -1,7 +1,7 @@
 // slotmanager.go — per-backend slot pools, KV cache state tracking, cache
 // ring buffer with eviction, and the global SlotManager coordinator.
 
-package main
+package proxycache
 
 import (
 	"context"
@@ -40,10 +40,10 @@ type ringEntry struct {
 	TS   float64
 }
 
-// saveSkipEntry records a save that was skipped so it can be flushed when the
+// SaveSkipEntry records a save that was skipped so it can be flushed when the
 // slot is next used. Six fields mirror the Python tuple:
 // (key, blocks, n_tokens, hit_type, serving_be_ratio, recompute_happened).
-type saveSkipEntry struct {
+type SaveSkipEntry struct {
 	Key          string
 	Blocks       []string
 	NTokens      int
@@ -55,24 +55,24 @@ type saveSkipEntry struct {
 
 // BackendSlotManager tracks slot state for one backend.
 //
-// Locking: mu protects all slot state. saveMu protects cacheRing/totalBytes
+// Locking: Mu protects all slot state. saveMu protects CacheRing/totalBytes
 // (held across the meta write + eviction in SaveAfter). HTTP calls are always
 // made with both locks released.
 type BackendSlotManager struct {
 	BackendID string
 
-	poolMu sync.Mutex // protects slotPools, inUse, lastUsed, slotKVState, slotSaveSkipped, slotAcquiredAt, slotDurationEMA
-	ringMu sync.Mutex // protects cacheRing, totalBytes
+	PoolMu sync.Mutex // protects slotPools, inUse, lastUsed, slotKVState, slotSaveSkipped, SlotAcquiredAt, slotDurationEMA
+	RingMu sync.Mutex // protects CacheRing, totalBytes
 
-	slotPools         map[string][]int // model -> sorted ascending slot IDs
-	inUse             map[int]bool
-	lastUsed          map[int]float64
-	slotKVState       map[int][]string
-	slotSaveSkipped   map[int]*saveSkipEntry
-	slotAcquiredAt    map[int]float64
-	slotDurationEMA   float64
+	slotPools       map[string][]int // model -> sorted ascending slot IDs
+	inUse           map[int]bool
+	lastUsed        map[int]float64
+	slotKVState     map[int][]string
+	slotSaveSkipped map[int]*SaveSkipEntry
+	SlotAcquiredAt  map[int]float64
+	slotDurationEMA float64
 
-	cacheRing  []ringEntry // insertion order
+	CacheRing  []ringEntry // insertion order
 	totalBytes int64
 }
 
@@ -83,17 +83,17 @@ func NewBackendSlotManager(backendID string) *BackendSlotManager {
 		inUse:           map[int]bool{},
 		lastUsed:        map[int]float64{},
 		slotKVState:     map[int][]string{},
-		slotSaveSkipped: map[int]*saveSkipEntry{},
-		slotAcquiredAt:  map[int]float64{},
-		cacheRing:       []ringEntry{},
+		slotSaveSkipped: map[int]*SaveSkipEntry{},
+		SlotAcquiredAt:  map[int]float64{},
+		CacheRing:       []ringEntry{},
 		totalBytes:      0,
 	}
 }
 
 // EnsurePool creates or updates the slot pool for a model.
 func (b *BackendSlotManager) EnsurePool(modelName string, nSlots int) {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	oldPool, exists := b.slotPools[modelName]
 	newPool := make([]int, nSlots)
 	for i := 0; i < nSlots; i++ {
@@ -135,8 +135,8 @@ func (b *BackendSlotManager) EnsurePool(modelName string, nSlots int) {
 
 // GetPool returns a copy of the slot pool, or nil if the model is unknown.
 func (b *BackendSlotManager) GetPool(modelName string) []int {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	pool, ok := b.slotPools[modelName]
 	if !ok {
 		return nil
@@ -150,8 +150,8 @@ func (b *BackendSlotManager) GetPool(modelName string) []int {
 // First free slot (ascending, matching CPython set(range(n)) iteration order);
 // if all are in use, the oldest by last_used (ties: smallest ID).
 func (b *BackendSlotManager) TryAcquire(modelName string) int {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	pool, ok := b.slotPools[modelName]
 	if !ok || len(pool) == 0 {
 		return -1
@@ -173,25 +173,25 @@ func (b *BackendSlotManager) TryAcquire(modelName string) int {
 			return -1 // all slots in use
 		}
 	}
-	now := nowFloat()
+	now := NowFloat()
 	b.inUse[slotID] = true
 	b.lastUsed[slotID] = now
-	b.slotAcquiredAt[slotID] = now
+	b.SlotAcquiredAt[slotID] = now
 	return slotID
 }
 
 // Release marks a slot free and updates the slot-occupancy duration EMA.
 // Returns (duration, ok).
 func (b *BackendSlotManager) Release(slotID int) (float64, bool) {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	b.inUse[slotID] = false
-	acquiredAt, ok := b.slotAcquiredAt[slotID]
+	acquiredAt, ok := b.SlotAcquiredAt[slotID]
 	if !ok {
 		return 0, false
 	}
-	delete(b.slotAcquiredAt, slotID)
-	duration := nowFloat() - acquiredAt
+	delete(b.SlotAcquiredAt, slotID)
+	duration := NowFloat() - acquiredAt
 	old := b.slotDurationEMA
 	if old <= 0 {
 		old = CacheHitWaitEMAInitialT
@@ -207,8 +207,8 @@ func (b *BackendSlotManager) Release(slotID int) (float64, bool) {
 
 // Invalidate clears the KV cache state for a slot.
 func (b *BackendSlotManager) Invalidate(slotID int) {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	if _, ok := b.slotKVState[slotID]; ok {
 		delete(b.slotKVState, slotID)
 		logInfo("slot_manager", "Invalidated KV cache tracking for backend '%s' slot %d", b.BackendID, slotID)
@@ -217,22 +217,22 @@ func (b *BackendSlotManager) Invalidate(slotID int) {
 
 // GetKVState returns the tracked block hashes for a slot (nil if absent).
 func (b *BackendSlotManager) GetKVState(slotID int) []string {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	return b.slotKVState[slotID]
 }
 
 // SetKVState sets the tracked block hashes for a slot.
 func (b *BackendSlotManager) SetKVState(slotID int, blocks []string) {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	b.slotKVState[slotID] = blocks
 }
 
 // GetKVStates returns a copy of the slot->blocks map.
 func (b *BackendSlotManager) GetKVStates() map[int][]string {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	out := make(map[int][]string, len(b.slotKVState))
 	for k, v := range b.slotKVState {
 		out[k] = v
@@ -242,8 +242,8 @@ func (b *BackendSlotManager) GetKVStates() map[int][]string {
 
 // GetSlotDurationEMA returns the slot-occupancy EMA (initial timeout if unset).
 func (b *BackendSlotManager) GetSlotDurationEMA() float64 {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	if b.slotDurationEMA > 0 {
 		return b.slotDurationEMA
 	}
@@ -267,14 +267,14 @@ func (b *BackendSlotManager) ShouldSkipRestore(slotID int, reqBlocks []string, p
 	if len(prevBlocks) == 0 {
 		return false
 	}
-	b.poolMu.Lock()
+	b.PoolMu.Lock()
 	for _, pool := range b.slotPools {
 		if len(pool) > 1 {
-			b.poolMu.Unlock()
+			b.PoolMu.Unlock()
 			return false // multi-slot backend — cannot rely on slot KV state
 		}
 	}
-	b.poolMu.Unlock()
+	b.PoolMu.Unlock()
 
 	nPrev := len(prevBlocks)
 	nReq := len(reqBlocks)
@@ -311,16 +311,16 @@ func (b *BackendSlotManager) ShouldSkipRestore(slotID int, reqBlocks []string, p
 }
 
 // MarkSaveSkipped records a skipped save for the slot (6-tuple or legacy 3-tuple).
-func (b *BackendSlotManager) MarkSaveSkipped(slotID int, entry *saveSkipEntry) {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+func (b *BackendSlotManager) MarkSaveSkipped(slotID int, entry *SaveSkipEntry) {
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	b.slotSaveSkipped[slotID] = entry
 }
 
 // FlushSaveSkipped returns and clears the skipped-save entry for the slot.
-func (b *BackendSlotManager) FlushSaveSkipped(slotID int) *saveSkipEntry {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+func (b *BackendSlotManager) FlushSaveSkipped(slotID int) *SaveSkipEntry {
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	entry := b.slotSaveSkipped[slotID]
 	delete(b.slotSaveSkipped, slotID)
 	return entry
@@ -360,32 +360,32 @@ func (b *BackendSlotManager) SaveAfter(modelName string, slotID int, key string,
 	}
 
 	if ok && size > 0 {
-		b.ringMu.Lock()
+		b.RingMu.Lock()
 		kvMeta.WriteMeta(key, nTokens, blocks, WordsPerBlock, modelName, b.BackendID, size)
-		b.cacheRing = append(b.cacheRing, ringEntry{Key: key, Size: int64(size), TS: nowFloat()})
+		b.CacheRing = append(b.CacheRing, ringEntry{Key: key, Size: int64(size), TS: NowFloat()})
 		b.totalBytes += int64(size)
-		b.evictIfNeeded()
-		b.ringMu.Unlock()
+		b.EvictIfNeeded()
+		b.RingMu.Unlock()
 	}
 	return ok, size
 }
 
-// evictIfNeeded enforces the backend's cache_max_size_gb budget.
-// Must be called with ringMu held.
+// EvictIfNeeded enforces the backend's cache_max_size_gb budget.
+// Must be called with RingMu held.
 //
 // Scoring: score = age_seconds * (2 - uniqueness), where uniqueness = 1 -
 // max LCP ratio against all other ring entries. Higher score = evict first.
-func (b *BackendSlotManager) evictIfNeeded() {
+func (b *BackendSlotManager) EvictIfNeeded() {
 	maxBytes := float64(backendManager.GetCacheMaxSizeGB(b.BackendID)) * 1024 * 1024 * 1024
 	if float64(b.totalBytes) <= maxBytes {
 		return
 	}
-	now := nowFloat()
+	now := NowFloat()
 
 	// Pass 1: drop ring entries whose meta/blocks are gone (orphaned).
 	blocksMap := map[string][]string{}
-	validRing := make([]ringEntry, 0, len(b.cacheRing))
-	for _, entry := range b.cacheRing {
+	validRing := make([]ringEntry, 0, len(b.CacheRing))
+	for _, entry := range b.CacheRing {
 		blocks := kvMeta.GetBlocks(entry.Key, b.BackendID)
 		if len(blocks) > 0 {
 			blocksMap[entry.Key] = blocks
@@ -397,9 +397,9 @@ func (b *BackendSlotManager) evictIfNeeded() {
 			b.deleteEntry(entry.Key, "ring_evict_orphan", fmt.Sprintf("(%d bytes)", entry.Size))
 		}
 	}
-	b.cacheRing = validRing
+	b.CacheRing = validRing
 
-	if len(b.cacheRing) == 0 || float64(b.totalBytes) <= maxBytes {
+	if len(b.CacheRing) == 0 || float64(b.totalBytes) <= maxBytes {
 		return
 	}
 
@@ -407,8 +407,8 @@ func (b *BackendSlotManager) evictIfNeeded() {
 		key   string
 		score float64
 	}
-	ringList := make([]ringEntry, len(b.cacheRing))
-	copy(ringList, b.cacheRing)
+	ringList := make([]ringEntry, len(b.CacheRing))
+	copy(ringList, b.CacheRing)
 	scoredList := make([]scored, 0, len(ringList))
 	for i, entry := range ringList {
 		stale := now - entry.TS
@@ -460,8 +460,8 @@ func (b *BackendSlotManager) evictIfNeeded() {
 	}
 
 	evictedAny := false
-	remaining := make([]ringEntry, 0, len(b.cacheRing))
-	for _, entry := range b.cacheRing {
+	remaining := make([]ringEntry, 0, len(b.CacheRing))
+	for _, entry := range b.CacheRing {
 		if keysToEvict[entry.Key] {
 			b.totalBytes -= entry.Size
 			staleHours := (now - entry.TS) / 3600
@@ -480,11 +480,11 @@ func (b *BackendSlotManager) evictIfNeeded() {
 			remaining = append(remaining, entry)
 		}
 	}
-	b.cacheRing = remaining
+	b.CacheRing = remaining
 
 	if evictedAny {
 		logInfo("slot_manager", "Cache ring check for backend '%s': total=%d bytes, max=%d bytes, ring_size=%d",
-			b.BackendID, b.totalBytes, int64(maxBytes), len(b.cacheRing))
+			b.BackendID, b.totalBytes, int64(maxBytes), len(b.CacheRing))
 	}
 }
 
@@ -509,27 +509,27 @@ func (b *BackendSlotManager) InitFromDisk() {
 	if st, err := os.Stat(metaPath); err != nil || !st.IsDir() {
 		return
 	}
-	b.ringMu.Lock()
-	defer b.ringMu.Unlock()
+	b.RingMu.Lock()
+	defer b.RingMu.Unlock()
 	for _, key := range kvMeta.ListKeys(backendDir) {
 		cacheSize := kvMeta.GetCacheSize(backendDir, key)
 		if cacheSize == 0 {
 			continue
 		}
 		lastUsed := kvMeta.GetLastUsedTime(key, backendDir)
-		b.cacheRing = append(b.cacheRing, ringEntry{Key: key, Size: int64(cacheSize), TS: lastUsed})
+		b.CacheRing = append(b.CacheRing, ringEntry{Key: key, Size: int64(cacheSize), TS: lastUsed})
 		b.totalBytes += int64(cacheSize)
 	}
-	b.evictIfNeeded()
+	b.EvictIfNeeded()
 }
 
 // TouchRing updates the timestamp of an existing ring entry.
 func (b *BackendSlotManager) TouchRing(key string) {
-	b.ringMu.Lock()
-	defer b.ringMu.Unlock()
-	for i := range b.cacheRing {
-		if b.cacheRing[i].Key == key {
-			b.cacheRing[i].TS = nowFloat()
+	b.RingMu.Lock()
+	defer b.RingMu.Unlock()
+	for i := range b.CacheRing {
+		if b.CacheRing[i].Key == key {
+			b.CacheRing[i].TS = NowFloat()
 			return
 		}
 	}
@@ -537,22 +537,22 @@ func (b *BackendSlotManager) TouchRing(key string) {
 
 // GetRingSize returns the number of entries in the cache ring.
 func (b *BackendSlotManager) GetRingSize() int {
-	b.ringMu.Lock()
-	defer b.ringMu.Unlock()
-	return len(b.cacheRing)
+	b.RingMu.Lock()
+	defer b.RingMu.Unlock()
+	return len(b.CacheRing)
 }
 
 // GetTotalBytes returns the total bytes tracked in the cache ring.
 func (b *BackendSlotManager) GetTotalBytes() int64 {
-	b.ringMu.Lock()
-	defer b.ringMu.Unlock()
+	b.RingMu.Lock()
+	defer b.RingMu.Unlock()
 	return b.totalBytes
 }
 
 // CountInUse returns the number of in-use slots in a model's pool.
 func (b *BackendSlotManager) CountInUse(modelName string) int {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	pool, ok := b.slotPools[modelName]
 	if !ok {
 		return 0
@@ -570,32 +570,32 @@ func (b *BackendSlotManager) CountInUse(modelName string) int {
 // (insertion order, not min/max — matching the Python cache_ring[0] /
 // cache_ring[-1] reads). ok is false for an empty ring.
 func (b *BackendSlotManager) RingOldestNewest() (float64, float64, bool) {
-	b.ringMu.Lock()
-	defer b.ringMu.Unlock()
-	if len(b.cacheRing) == 0 {
+	b.RingMu.Lock()
+	defer b.RingMu.Unlock()
+	if len(b.CacheRing) == 0 {
 		return 0, 0, false
 	}
-	return b.cacheRing[0].TS, b.cacheRing[len(b.cacheRing)-1].TS, true
+	return b.CacheRing[0].TS, b.CacheRing[len(b.CacheRing)-1].TS, true
 }
 
 // RingOldestNewestKeys returns the oldest and newest ring-entry keys
 // (insertion order, not min/max — matching the Python cache_ring[0] /
 // cache_ring[-1] reads). ok is false for an empty ring.
 func (b *BackendSlotManager) RingOldestNewestKeys() (string, string, bool) {
-	b.ringMu.Lock()
-	defer b.ringMu.Unlock()
-	if len(b.cacheRing) == 0 {
+	b.RingMu.Lock()
+	defer b.RingMu.Unlock()
+	if len(b.CacheRing) == 0 {
 		return "", "", false
 	}
-	return b.cacheRing[0].Key, b.cacheRing[len(b.cacheRing)-1].Key, true
+	return b.CacheRing[0].Key, b.CacheRing[len(b.CacheRing)-1].Key, true
 }
 
 // SlotStatus returns a snapshot of this backend's slot state shaped as
 // {"models": {modelName: {"slots": {slotID: {in_use, last_used, kv_blocks,
 // last_restore}}}}}. Model names are sorted for deterministic output.
 func (b *BackendSlotManager) SlotStatus() map[string]any {
-	b.poolMu.Lock()
-	defer b.poolMu.Unlock()
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
 	names := make([]string, 0, len(b.slotPools))
 	for name := range b.slotPools {
 		names = append(names, name)
@@ -631,16 +631,16 @@ func truncateKey(key string) string {
 	return key[:16]
 }
 
-// backendSlotKey is a comparable (backend_id, slot_id) pair.
-type backendSlotKey struct {
+// BackendSlotKey is a comparable (backend_id, slot_id) pair.
+type BackendSlotKey struct {
 	BackendID string
 	SlotID    int
 }
 
 // SlotManager — global coordinator: per-backend managers + cross-backend state.
 type SlotManager struct {
-	mu sync.Mutex
-	// backends and cacheWaitPending are guarded by mu.
+	Mu sync.Mutex
+	// backends and cacheWaitPending are guarded by Mu.
 	backends         map[string]*BackendSlotManager
 	backendOrder     []string // first-seen insertion order (dict-order parity)
 	cacheWaitPending map[string]int
@@ -656,8 +656,8 @@ func NewSlotManager() *SlotManager {
 
 // Get returns (creating if needed) the BackendSlotManager for a backend.
 func (s *SlotManager) Get(backendID string) *BackendSlotManager {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	if sm, ok := s.backends[backendID]; ok {
 		return sm
 	}
@@ -669,30 +669,30 @@ func (s *SlotManager) Get(backendID string) *BackendSlotManager {
 
 // HasBackend reports whether a per-backend manager exists.
 func (s *SlotManager) HasBackend(backendID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	_, ok := s.backends[backendID]
 	return ok
 }
 
 // Backends returns the backend IDs in first-seen insertion order.
 func (s *SlotManager) Backends() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	out := make([]string, len(s.backendOrder))
 	copy(out, s.backendOrder)
 	return out
 }
 
 // AllKVStates returns {(backend_id, slot_id): blocks} across all backends.
-func (s *SlotManager) AllKVStates() map[backendSlotKey][]string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := map[backendSlotKey][]string{}
+func (s *SlotManager) AllKVStates() map[BackendSlotKey][]string {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	out := map[BackendSlotKey][]string{}
 	for beID, sm := range s.backends {
 		states := sm.GetKVStates()
 		for slotID, blocks := range states {
-			out[backendSlotKey{beID, slotID}] = blocks
+			out[BackendSlotKey{beID, slotID}] = blocks
 		}
 	}
 	return out
@@ -741,17 +741,20 @@ func (s *SlotManager) RefreshSlotCounts() {
 
 // GetCacheWaitPending returns the current pending-waiter count for a backend.
 func (s *SlotManager) GetCacheWaitPending(backendID string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	return s.cacheWaitPending[backendID]
 }
 
 // SetCacheWaitPending sets the pending-waiter count for a backend.
 func (s *SlotManager) SetCacheWaitPending(backendID string, n int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	s.cacheWaitPending[backendID] = n
 }
 
 // slotManager is the global instance (created in app startup).
 var slotManager = NewSlotManager()
+
+// GetSlotManager returns the global slot manager instance.
+func GetSlotManager() *SlotManager { return slotManager }

@@ -1,22 +1,23 @@
-package main
+package tests
 
 import (
+	"proxycache"
 	"reflect"
 	"strings"
 	"testing"
 )
 
 func TestTruncateRune(t *testing.T) {
-	if got := truncateRune("abc", 200); got != "abc" {
+	if got := proxycache.TruncateRune("abc", 200); got != "abc" {
 		t.Errorf("short = %q, want unchanged", got)
 	}
-	if got := truncateRune(strings.Repeat("a", 200), 200); len(got) != 200 {
+	if got := proxycache.TruncateRune(strings.Repeat("a", 200), 200); len(got) != 200 {
 		t.Errorf("exact length = %d, want 200", len(got))
 	}
-	if got := truncateRune(strings.Repeat("a", 250), 200); len(got) != 200 {
+	if got := proxycache.TruncateRune(strings.Repeat("a", 250), 200); len(got) != 200 {
 		t.Errorf("ascii truncated len = %d, want 200", len(got))
 	}
-	if got := truncateRune(strings.Repeat("é", 250), 200); utf8RuneCount(got) != 200 {
+	if got := proxycache.TruncateRune(strings.Repeat("é", 250), 200); utf8RuneCount(got) != 200 {
 		t.Errorf("multibyte truncated runes = %d, want 200", utf8RuneCount(got))
 	}
 }
@@ -31,9 +32,9 @@ func utf8RuneCount(s string) int {
 
 func TestExtractFromContent(t *testing.T) {
 	cases := []struct {
-		name   string
+		name    string
 		content any
-		want   string
+		want    string
 	}{
 		{"string_trimmed", "  hello  ", "hello"},
 		{"string_whitespace", "   \t\n ", ""},
@@ -47,21 +48,21 @@ func TestExtractFromContent(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := extractFromContent(tc.content); got != tc.want {
-				t.Errorf("extractFromContent(%v) = %q, want %q", tc.content, got, tc.want)
+			if got := proxycache.ExtractFromContent(tc.content); got != tc.want {
+				t.Errorf("ExtractFromContent(%v) = %q, want %q", tc.content, got, tc.want)
 			}
 		})
 	}
 }
 
 func TestExtractPromptPreview(t *testing.T) {
-	if got := ExtractPromptPreview(map[string]any{}); got != "" {
+	if got := proxycache.ExtractPromptPreview(map[string]any{}); got != "" {
 		t.Errorf("empty request = %q, want empty", got)
 	}
-	if got := ExtractPromptPreview(nil); got != "" {
+	if got := proxycache.ExtractPromptPreview(nil); got != "" {
 		t.Errorf("nil request = %q, want empty", got)
 	}
-	if got := ExtractPromptPreview(map[string]any{"model": "x"}); got != "" {
+	if got := proxycache.ExtractPromptPreview(map[string]any{"model": "x"}); got != "" {
 		t.Errorf("no messages = %q, want empty", got)
 	}
 
@@ -69,7 +70,7 @@ func TestExtractPromptPreview(t *testing.T) {
 		map[string]any{"role": "system", "content": "sys"},
 		map[string]any{"role": "user", "content": "hello"},
 	}
-	if got := ExtractPromptPreview(map[string]any{"messages": msgs}); got != "hello" {
+	if got := proxycache.ExtractPromptPreview(map[string]any{"messages": msgs}); got != "hello" {
 		t.Errorf("user content = %q, want hello", got)
 	}
 
@@ -77,35 +78,35 @@ func TestExtractPromptPreview(t *testing.T) {
 		map[string]any{"role": "user", "content": "first"},
 		map[string]any{"role": "assistant", "content": "second"},
 	}
-	if got := ExtractPromptPreview(map[string]any{"messages": msgs2}); got != "second" {
+	if got := proxycache.ExtractPromptPreview(map[string]any{"messages": msgs2}); got != "second" {
 		t.Errorf("reverse scan = %q, want second (most recent user/assistant)", got)
 	}
 
 	msgs3 := []any{
 		map[string]any{"role": "system", "content": "sys"},
 	}
-	if got := ExtractPromptPreview(map[string]any{"messages": msgs3}); got != "" {
+	if got := proxycache.ExtractPromptPreview(map[string]any{"messages": msgs3}); got != "" {
 		t.Errorf("system only = %q, want empty", got)
 	}
 
 	msgs4 := []any{
 		map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "fromlist"}}},
 	}
-	if got := ExtractPromptPreview(map[string]any{"messages": msgs4}); got != "fromlist" {
+	if got := proxycache.ExtractPromptPreview(map[string]any{"messages": msgs4}); got != "fromlist" {
 		t.Errorf("content list = %q, want fromlist", got)
 	}
 
 	msgs5 := []any{
 		map[string]any{"role": "user", "content": nil, "reasoning_content": "think"},
 	}
-	if got := ExtractPromptPreview(map[string]any{"messages": msgs5}); got != "think" {
+	if got := proxycache.ExtractPromptPreview(map[string]any{"messages": msgs5}); got != "think" {
 		t.Errorf("reasoning fallback = %q, want think", got)
 	}
 
 	msgs6 := []any{
 		map[string]any{"role": "user", "content": strings.Repeat("a", 250)},
 	}
-	if got := ExtractPromptPreview(map[string]any{"messages": msgs6}); len(got) != 200 {
+	if got := proxycache.ExtractPromptPreview(map[string]any{"messages": msgs6}); len(got) != 200 {
 		t.Errorf("truncated preview len = %d, want 200", len(got))
 	}
 
@@ -113,13 +114,13 @@ func TestExtractPromptPreview(t *testing.T) {
 		map[string]any{"role": "assistant", "content": ""},
 		map[string]any{"role": "user", "content": "earlier"},
 	}
-	if got := ExtractPromptPreview(map[string]any{"messages": msgs7}); got != "earlier" {
+	if got := proxycache.ExtractPromptPreview(map[string]any{"messages": msgs7}); got != "earlier" {
 		t.Errorf("empty content skipped = %q, want earlier", got)
 	}
 }
 
 func TestMetricsTwoPhaseRecording(t *testing.T) {
-	m := NewMetricsCollector(200)
+	m := proxycache.NewMetricsCollector(200)
 	reqJSON := map[string]any{
 		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
 	}
@@ -195,11 +196,11 @@ func TestMetricsTwoPhaseRecording(t *testing.T) {
 		t.Errorf("rates = hit %v / save %v / restore %v, want 1/1/1", perf["cache_hit_rate"], perf["save_rate"], perf["restore_success_rate"])
 	}
 
-	byID := m.GetRequestByID("r1")
-	if byID == nil {
+	ByID := m.GetRequestByID("r1")
+	if ByID == nil {
 		t.Fatal("GetRequestByID(r1) = nil")
 	}
-	byID["model"] = "HACKED"
+	ByID["model"] = "HACKED"
 	again := m.GetRequestByID("r1")
 	if again["model"] != "M" {
 		t.Errorf("GetRequestByID returned a shared reference: model = %v", again["model"])
@@ -210,7 +211,7 @@ func TestMetricsTwoPhaseRecording(t *testing.T) {
 }
 
 func TestMetricsBasicCounters(t *testing.T) {
-	m := NewMetricsCollector(200)
+	m := proxycache.NewMetricsCollector(200)
 	m.Record(map[string]any{"request_id": "r1", "model": "M1", "backend": "B1", "status": "complete", "cache_hit": false, "saved": false, "restored": false})
 	m.Record(map[string]any{"request_id": "r2", "model": "M1", "backend": "B1", "status": "complete", "cache_hit": true, "recompute": true, "saved": true, "restored": false})
 
@@ -268,7 +269,7 @@ func TestMetricsBasicCounters(t *testing.T) {
 }
 
 func TestMetricsRingOverflow(t *testing.T) {
-	m := NewMetricsCollector(5)
+	m := proxycache.NewMetricsCollector(5)
 	for i := 1; i <= 8; i++ {
 		m.Record(map[string]any{
 			"request_id": "r" + itoa(i),
@@ -307,7 +308,7 @@ func TestMetricsRingOverflow(t *testing.T) {
 }
 
 func TestMetricsEvents(t *testing.T) {
-	m := NewMetricsCollector(200)
+	m := proxycache.NewMetricsCollector(200)
 	m.Record(map[string]any{"event": "liveness", "detail": "up"})
 	m.Record(map[string]any{"event": "slot_refresh", "backend": "B1"})
 	m.Record(map[string]any{"request_id": "r1", "model": "M", "backend": "B", "status": "complete", "cache_hit": false, "saved": true, "restored": true})
@@ -351,10 +352,10 @@ func TestMetricsEvents(t *testing.T) {
 }
 
 func TestMetricsPerformanceLatency(t *testing.T) {
-	m := NewMetricsCollector(200)
+	m := proxycache.NewMetricsCollector(200)
 	for i, l := range []float64{300, 100, 400, 200} {
 		m.Record(map[string]any{
-			"request_id": "r" + itoa(i + 1),
+			"request_id": "r" + itoa(i+1),
 			"model":      "M",
 			"backend":    "B",
 			"status":     "complete",
@@ -373,7 +374,7 @@ func TestMetricsPerformanceLatency(t *testing.T) {
 		t.Errorf("latency = %v, want avg 250 / p50 300 / p95 400 / p99 400", lat)
 	}
 
-	m2 := NewMetricsCollector(200)
+	m2 := proxycache.NewMetricsCollector(200)
 	empty := m2.GetPerformance("", "", "")
 	lat2, _ := empty["latency"].(map[string]float64)
 	if lat2["avg_ms"] != 0 || lat2["p95_ms"] != 0 {
@@ -382,7 +383,7 @@ func TestMetricsPerformanceLatency(t *testing.T) {
 }
 
 func TestMetricsPerformanceReqType(t *testing.T) {
-	m := NewMetricsCollector(200)
+	m := proxycache.NewMetricsCollector(200)
 	m.Record(map[string]any{"request_id": "r1", "model": "M", "backend": "B", "status": "complete", "cache_hit": true, "saved": true, "restored": true, "summarization_score": 0.5})
 	m.Record(map[string]any{"request_id": "r2", "model": "M", "backend": "B", "status": "complete", "cache_hit": false, "saved": false, "restored": true, "summarization_score": 0.2})
 	m.Record(map[string]any{"request_id": "r3", "model": "M", "backend": "B", "status": "complete", "cache_hit": true, "recompute": true, "saved": true, "restored": true, "summarization_score": 0.4})
@@ -417,7 +418,7 @@ func TestMetricsPerformanceReqType(t *testing.T) {
 }
 
 func TestGetRequestsSummary(t *testing.T) {
-	m := NewMetricsCollector(200)
+	m := proxycache.NewMetricsCollector(200)
 	m.Record(map[string]any{
 		"request_id": "r1", "model": "M", "backend": "B", "status": "complete",
 		"cache_hit": true, "saved": true, "restored": true, "latency_ms": 50.0,
@@ -459,7 +460,7 @@ func TestGetRequestsSummary(t *testing.T) {
 }
 
 func TestGetSummary(t *testing.T) {
-	m := NewMetricsCollector(200)
+	m := proxycache.NewMetricsCollector(200)
 	m.Record(map[string]any{"request_id": "r1", "model": "M", "backend": "B", "status": "incomplete"})
 	m.Record(map[string]any{"request_id": "r2", "model": "M", "backend": "B", "status": "complete", "cache_hit": true, "saved": true, "restored": true, "latency_ms": 100.0, "summarization_score": 0.5})
 	m.Record(map[string]any{"request_id": "r3", "model": "M", "backend": "B", "status": "complete", "cache_hit": false, "saved": false, "restored": true, "latency_ms": 200.0, "summarization_score": 0.1})

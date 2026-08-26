@@ -1,7 +1,7 @@
 // logger.go — logging with the same format as the Python version:
 // "YYYY-MM-DD HH:MM:SS,ms LEVEL name: message" (Python asctime uses a comma before ms).
 
-package main
+package proxycache
 
 import (
 	"fmt"

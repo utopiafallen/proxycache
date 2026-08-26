@@ -1,10 +1,11 @@
-package main
+package tests
 
 import (
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"proxycache"
 	"testing"
 )
 
@@ -12,7 +13,7 @@ func TestSaveSlotResponseParsing(t *testing.T) {
 	withTempMetaDir(t)
 	t.Run("n_written_extracted", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(w, http.StatusOK, map[string]any{
+			proxycache.WriteJSON(w, http.StatusOK, map[string]any{
 				"id_slot":   0,
 				"filename":  "test_cache",
 				"n_saved":   1745,
@@ -21,7 +22,7 @@ func TestSaveSlotResponseParsing(t *testing.T) {
 			})
 		}))
 		defer srv.Close()
-		client := NewLlamaClient(srv.URL)
+		client := proxycache.NewLlamaClient(srv.URL)
 		ok, n, err := client.SaveSlot(context.Background(), 0, "test_cache", "")
 		if err != nil {
 			t.Fatalf("err = %v, want nil", err)
@@ -35,10 +36,10 @@ func TestSaveSlotResponseParsing(t *testing.T) {
 	})
 	t.Run("missing_n_written_defaults_zero", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(w, http.StatusOK, map[string]any{"id_slot": 0, "filename": "test"})
+			proxycache.WriteJSON(w, http.StatusOK, map[string]any{"id_slot": 0, "filename": "test"})
 		}))
 		defer srv.Close()
-		client := NewLlamaClient(srv.URL)
+		client := proxycache.NewLlamaClient(srv.URL)
 		ok, n, err := client.SaveSlot(context.Background(), 0, "test", "")
 		if err != nil {
 			t.Fatalf("err = %v, want nil", err)
@@ -52,10 +53,10 @@ func TestSaveSlotResponseParsing(t *testing.T) {
 	})
 	t.Run("server_error_returns_false", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "save failed"})
+			proxycache.WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": "save failed"})
 		}))
 		defer srv.Close()
-		client := NewLlamaClient(srv.URL)
+		client := proxycache.NewLlamaClient(srv.URL)
 		ok, n, err := client.SaveSlot(context.Background(), 0, "test", "")
 		if err != nil {
 			t.Fatalf("err = %v, want nil (swallowed 500)", err)
@@ -69,12 +70,12 @@ func TestSaveSlotResponseParsing(t *testing.T) {
 	})
 	t.Run("other_status_returns_error", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "no such slot"})
+			proxycache.WriteJSON(w, http.StatusNotFound, map[string]any{"error": "no such slot"})
 		}))
 		defer srv.Close()
-		client := NewLlamaClient(srv.URL)
+		client := proxycache.NewLlamaClient(srv.URL)
 		_, _, err := client.SaveSlot(context.Background(), 0, "test", "")
-		var statusErr *HTTPStatusError
+		var statusErr *proxycache.HTTPStatusError
 		if !errors.As(err, &statusErr) {
 			t.Fatalf("err = %v, want *HTTPStatusError", err)
 		}

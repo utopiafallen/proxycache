@@ -1,7 +1,7 @@
 // kvmeta.go — KVMetaManager: single interface for all kv-meta file operations
 // (read, write, list, delete, reconcile, restore-candidate search).
 
-package main
+package proxycache
 
 import (
 	"encoding/json"
@@ -41,8 +41,11 @@ func (kv *KVMetaManager) atomicWriteFile(path string, data []byte) error {
 // kvMeta is the singleton instance.
 var kvMeta = &KVMetaManager{}
 
-// nowFloat returns the current Unix time as float64 seconds (time.time() parity).
-func nowFloat() float64 {
+// GetKVMeta returns the global KV meta manager instance.
+func GetKVMeta() *KVMetaManager { return kvMeta }
+
+// NowFloat returns the current Unix time as float64 seconds (time.time() parity).
+func NowFloat() float64 {
 	return float64(time.Now().UnixNano()) / 1e9
 }
 
@@ -178,7 +181,7 @@ func (kv *KVMetaManager) WriteMeta(key string, nTokens int, blocks []string, wpb
 		Blocks:           blocks,
 		CacheSize:        cacheSize,
 		RecomputePenalty: 0,
-		LastWritten:      nowFloat(),
+		LastWritten:      NowFloat(),
 	}
 	d := kv.MetaDirPath(backendID)
 	if err := os.MkdirAll(d, 0o755); err != nil {
@@ -263,9 +266,9 @@ func (kv *KVMetaManager) IncrementRecomputePenalty(key, backendID string) {
 		logWarn("kv_meta", "Failed to increment recompute_penalty for key %s: %s", truncateKey(key), err)
 		return
 	}
-	penalty := metaFloat(meta, "recompute_penalty") + 1
+	penalty := MetaFloat(meta, "recompute_penalty") + 1
 	meta["recompute_penalty"] = penalty
-	meta["last_updated_penalty"] = nowFloat()
+	meta["last_updated_penalty"] = NowFloat()
 	out, err := marshalMetaJSON(meta)
 	if err != nil {
 		logWarn("kv_meta", "Failed to increment recompute_penalty for key %s: %s", truncateKey(key), err)
@@ -291,7 +294,7 @@ func (kv *KVMetaManager) FindRestoreCandidate(key string, wpb int, th float64, r
 		return "", 0, false
 	}
 	candBlocks := metaStringSlice(meta, "blocks")
-	if int(metaFloat(meta, "wpb")) != wpb {
+	if int(MetaFloat(meta, "wpb")) != wpb {
 		return "", 0, false
 	}
 	if len(candBlocks) > len(reqBlocks) {
@@ -321,7 +324,7 @@ func (kv *KVMetaManager) FindBestRestoreCandidate(reqBlocks []string, wpb int, t
 		if metaString(meta, "backend") != backendID {
 			continue
 		}
-		if int(metaFloat(meta, "wpb")) != wpb {
+		if int(MetaFloat(meta, "wpb")) != wpb {
 			continue
 		}
 		candBlocks := metaStringSlice(meta, "blocks")
@@ -330,7 +333,7 @@ func (kv *KVMetaManager) FindBestRestoreCandidate(reqBlocks []string, wpb int, t
 		}
 		lcp := LCPBlocks(reqBlocks, candBlocks)
 		ratio := float64(lcp) / mathMaxFloat(1, float64(len(reqBlocks)))
-		penalty := metaFloat(meta, "recompute_penalty")
+		penalty := MetaFloat(meta, "recompute_penalty")
 		score := ratio * mathMaxFloat(0, 1-0.1*penalty)
 		if ratio >= th && score > bestScore {
 			bestScore = score
@@ -349,7 +352,7 @@ func (kv *KVMetaManager) FindBestRestoreCandidate(reqBlocks []string, wpb int, t
 func (kv *KVMetaManager) GetCacheSize(backendID, key string) int {
 	meta := kv.ReadMeta(key, backendID)
 	if len(meta) > 0 {
-		size := int(metaFloat(meta, "cache_size"))
+		size := int(MetaFloat(meta, "cache_size"))
 		if size != 0 {
 			return size
 		}
@@ -367,7 +370,7 @@ func (kv *KVMetaManager) GetLastUsedTime(key, backendID string) float64 {
 			if json.Unmarshal(data, &meta) == nil {
 				for _, field := range []string{"last_read", "last_written", "timestamp"} {
 					if v, ok := meta[field]; ok {
-						if f, ok := toFloat(v); ok {
+						if f, ok := ToFloat(v); ok {
 							return f
 						}
 					}
@@ -446,9 +449,9 @@ func metaString(meta map[string]any, key string) string {
 	return s
 }
 
-func metaFloat(meta map[string]any, key string) float64 {
+func MetaFloat(meta map[string]any, key string) float64 {
 	if v, ok := meta[key]; ok {
-		if f, ok := toFloat(v); ok {
+		if f, ok := ToFloat(v); ok {
 			return f
 		}
 	}
@@ -467,8 +470,8 @@ func metaStringSlice(meta map[string]any, key string) []string {
 	return out
 }
 
-// toFloat converts a JSON scalar (float64, int, or numeric string) to float64.
-func toFloat(v any) (float64, bool) {
+// ToFloat converts a JSON scalar (float64, int, or numeric string) to float64.
+func ToFloat(v any) (float64, bool) {
 	switch x := v.(type) {
 	case float64:
 		return x, true

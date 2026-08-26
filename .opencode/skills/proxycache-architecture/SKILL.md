@@ -27,13 +27,13 @@ This means the cache key is **known at slot acquisition time**, before the respo
 - Set at slot acquisition time, making the slot's KV state visible to subsequent requests' cache hit scans while the slot is in-flight
 - Updated after a successful restore or save to reflect the slot's current state
 - On backend error (400+), restored to `prevKV` (the state captured before acquisition's `SetKVState()`) since the request was never processed
-- Cleared by `Invalidate()` on cancellation/failure in `streamState.cleanup()` before `Release()`
+- Cleared by `Invalidate()` on cancellation/failure in `StreamState.cleanup()` before `Release()`
 
 ## Cache Hit Scan Flow (in `chatHandler`, `app.go`)
 
 1. **Tokenize on each backend**: Each backend applies its chat template and tokenizes the messages
 2. **Compute block hashes**: `BlockHashesFromTokensDefault(optTokenIDs)` (or explicit `WORDS_PER_BLOCK`)
-3. **Disk scan**: `kvMeta.FindBestRestoreCandidate()` scans disk meta files for best cache hit
+3. **Disk scan**: `GetKVMeta().FindBestRestoreCandidate()` scans disk meta files for best cache hit
 4. **Pending slot scan**: Iterate `slotKVState` for the same model+backend, compute LCP ratio against request blocks. If a pending slot has a better ratio than the disk hit, use it instead. **Clears `restoreKey`** — the slot already has the KV content in its cache, so no restore is needed.
 5. **Select best match**: Use the candidate with the highest LCP ratio
 
@@ -83,7 +83,7 @@ The function compares the slot's **previous** KV state (captured at acquisition,
 When a request completes and starts saving, subsequent requests that arrive during the save window find the cache hit via the pending slot scan (the meta file hasn't been written yet). Once the save completes and the slot is released, the disk scan picks up the new meta file.
 
 **Flow:**
-1. Stream completes → `streamState.cleanup()` calls `save()`
+1. Stream completes → `StreamState.cleanup()` calls `save()`
 2. `save()` calls `SaveAfter()` which writes KV cache to disk and writes meta file
 3. Slot is released via `Release()`
 4. **During steps 1-2:** Pending slot scan finds the in-flight slot's KV state and uses it as a cache hit candidate
@@ -130,8 +130,8 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 
 - **Tokenization is backend-specific**: Each backend applies its own chat template and tokenizer. Different backends may produce different token IDs for the same messages.
 - **Cache key = prompt tokens only**: The key is computed from `optTokenIDs` (prompt), not the full request+response. This is known at acquisition time.
-- **`slotKVState` is keyed by `slotID`** (per `BackendSlotManager` instance, not globally). Access via `slotManager.Get(backendID).GetKVState(slotID)`.
-- **`Invalidate()` clears `slotKVState`**: Called on cancellation/failure in `streamState.cleanup()` before `Release()`.
+- **`slotKVState` is keyed by `slotID`** (per `BackendSlotManager` instance, not globally). Access via `GetSlotManager().Get(backendID).GetKVState(slotID)`.
+- **`Invalidate()` clears `slotKVState`**: Called on cancellation/failure in `StreamState.cleanup()` before `Release()`.
 - **Ring buffer eviction is per-backend**: Uses `cache_max_size_gb` per backend (default 25 GB). Evicts age-first, then LRU.
 - **Pending slot scan uses per-backend blocks**: The scan runs inside the per-backend loop in `chatHandler`, so `blocks` always matches the current backend's tokenizer output.
 - **Pending slot hit clears `restoreKey`**: The cache hit scan iterates backends in a loop — a disk hit on backend A sets `restoreKey`, then a pending slot hit on backend B must clear it. Leaving the stale key causes a failed restore attempt against a cache file that doesn't exist on backend B.
@@ -141,7 +141,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 - **Package-level config vars are read once at init**: `config.go` vars (`WordsPerBlock`, `LCPTh`, ...) are initialized from env vars during package init. Changing them in tests requires assigning the package var directly (e.g., `WordsPerBlock = 3`); re-reading env vars has no effect after startup.
 - **Liveness discovery/refresh runs under a shared 10s context**: `discoverModelsCtx` and `refreshSlotCountsCtx` run as two goroutines under one `context.WithTimeout(10s)`. Errors are captured in closure vars (`discErr`/`slotsErr`) and inspected individually — don't rely on the outer select. On timeout the loop recreates ALL backend clients (a stalled request can poison the whole pool) and records `discover_error`/`slots_error` as `"timeout"`.
 - **Health check retry**: Every failed health check gets a client recreation + retry before flipping state. This prevents a single transient failure from marking an up backend as down, which would trigger discovery (potentially timing out) and start an oscillation cycle.
-- **Don't cancel the request context while streaming the body**: cancelling an in-flight response read leaves the pooled connection broken and subsequent requests on it can hang. `streamState` never cancels for timeouts; the only disconnect paths are backend data/error/close or client disconnect (heartbeat).
+- **Don't cancel the request context while streaming the body**: cancelling an in-flight response read leaves the pooled connection broken and subsequent requests on it can hang. `StreamState` never cancels for timeouts; the only disconnect paths are backend data/error/close or client disconnect (heartbeat).
 
 ## Key Functions
 
@@ -159,9 +159,9 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 | `Invalidate()` | `slotmanager.go` | Clear `slotKVState` for a slot |
 | `GetKVState()` / `SetKVState()` | `slotmanager.go` | Get/set slot KV block tracking |
 | `SaveAfter()` | `slotmanager.go` | Save KV cache to disk, write meta file, update ring buffer, update `slotKVState` |
-| `evictIfNeeded()` | `slotmanager.go` | Age-first then LRU eviction when per-backend bytes exceed limit |
-| `streamState.save()` | `app.go` | Detect recompute, apply save heuristics, call `SaveAfter()`, return ok/cacheSize |
-| `streamState.cleanup()` | `app.go` | Stream lifecycle: save, invalidate, release slot, record metrics |
+| `EvictIfNeeded()` | `slotmanager.go` | Age-first then LRU eviction when per-backend bytes exceed limit |
+| `StreamState.save()` | `app.go` | Detect recompute, apply save heuristics, call `SaveAfter()`, return ok/cacheSize |
+| `StreamState.cleanup()` | `app.go` | Stream lifecycle: save, invalidate, release slot, record metrics |
 | `DiscoverModels()` | `backendmanager.go` | Discover models across all up backends sequentially, store in `discoveredModels` |
 | `RefreshSlotCounts()` | `backendmanager.go` | Query slots for each discovered model+backend pair |
 | `livenessLoop()` | `backendmanager.go` | 5s health check loop, concurrent discovery/refresh on state change, rate-limited liveness events |

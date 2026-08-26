@@ -1,7 +1,7 @@
 // cacheagent.go — HTTP client for the remote cache-agent (deletion + file
 // size lookups for backends whose cache lives on a remote host).
 
-package main
+package proxycache
 
 import (
 	"bytes"
@@ -149,23 +149,23 @@ func (s *AgentServer) Start(ctx context.Context) {
 
 func (s *AgentServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
 		return
 	}
 	key := r.URL.Query().Get("key")
 	if key == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "key parameter is required"})
+		WriteJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "key parameter is required"})
 		return
 	}
 	cachePath := s.CacheDir + "/" + key
 	if err := os.Remove(cachePath); err != nil {
 		if os.IsNotExist(err) {
 			logInfo("cache_agent", "cache delete: file not found: %s", key)
-			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "file not found"})
+			WriteJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "file not found"})
 			return
 		}
 		logInfo("cache_agent", "cache delete: failed to remove %s: %v", key, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		WriteJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	// Delete ckpt sidecar files (<key>.ckpt, <key>.ckpt.0, etc.)
@@ -187,44 +187,44 @@ func (s *AgentServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	logInfo("cache_agent", "cache delete: %s", key)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *AgentServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"exists": false})
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"exists": false})
 		return
 	}
 	basename := strings.TrimPrefix(r.URL.Path, "/cache/files/")
 	if basename == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"exists": false})
+		WriteJSON(w, http.StatusBadRequest, map[string]any{"exists": false})
 		return
 	}
 	cachePath := s.CacheDir + "/" + basename
 	info, err := os.Stat(cachePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			writeJSON(w, http.StatusNotFound, map[string]any{"exists": false})
+			WriteJSON(w, http.StatusNotFound, map[string]any{"exists": false})
 			return
 		}
 		logInfo("cache_agent", "cache file info: failed to stat %s: %v", basename, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"exists": false})
+		WriteJSON(w, http.StatusInternalServerError, map[string]any{"exists": false})
 		return
 	}
 	logInfo("cache_agent", "cache file size: %s size=%d", basename, info.Size())
-	writeJSON(w, http.StatusOK, map[string]any{"size": info.Size(), "exists": true})
+	WriteJSON(w, http.StatusOK, map[string]any{"size": info.Size(), "exists": true})
 }
 
 func (s *AgentServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"results": map[string]map[string]any{}})
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"results": map[string]map[string]any{}})
 		return
 	}
 	var req struct {
 		Keys []string `json:"keys"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"results": map[string]map[string]any{}})
+		WriteJSON(w, http.StatusBadRequest, map[string]any{"results": map[string]map[string]any{}})
 		return
 	}
 	results := map[string]map[string]any{}
@@ -237,11 +237,11 @@ func (s *AgentServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	logInfo("cache_agent", "batch file size: %d keys queried", len(req.Keys))
-	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+	WriteJSON(w, http.StatusOK, map[string]any{"results": results})
 }
 
-// writeJSON writes a JSON response with the given status code.
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// WriteJSON writes a JSON response with the given status code.
+func WriteJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)

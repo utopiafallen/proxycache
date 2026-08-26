@@ -1,8 +1,9 @@
-package main
+package tests
 
 import (
 	"net/http"
 	"net/http/httptest"
+	"proxycache"
 	"testing"
 )
 
@@ -11,10 +12,10 @@ func TestCacheAgentClientDeleteSuccess(t *testing.T) {
 		if r.URL.Path != "/cache/delete" || r.URL.Query().Get("key") != "test_key" {
 			t.Errorf("unexpected request %s %s", r.URL.Path, r.URL.RawQuery)
 		}
-		writeJSON(w, 200, map[string]any{"ok": true})
+		proxycache.WriteJSON(w, 200, map[string]any{"ok": true})
 	}))
 	defer srv.Close()
-	client := NewCacheAgentClient(srv.URL)
+	client := proxycache.NewCacheAgentClient(srv.URL)
 	defer client.Close()
 	if !client.Delete("test_key") {
 		t.Error("Delete should return true on 200")
@@ -23,10 +24,10 @@ func TestCacheAgentClientDeleteSuccess(t *testing.T) {
 
 func TestCacheAgentClientDeleteFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": "boom"})
+		proxycache.WriteJSON(w, 500, map[string]any{"ok": false, "error": "boom"})
 	}))
 	defer srv.Close()
-	client := NewCacheAgentClient(srv.URL)
+	client := proxycache.NewCacheAgentClient(srv.URL)
 	defer client.Close()
 	if client.Delete("test_key") {
 		t.Error("Delete should return false on non-200")
@@ -37,7 +38,7 @@ func TestCacheAgentClientConnectError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	urlStr := srv.URL
 	srv.Close()
-	client := NewCacheAgentClient(urlStr)
+	client := proxycache.NewCacheAgentClient(urlStr)
 	defer client.Close()
 	if client.Delete("test_key") {
 		t.Error("Delete should return false on connection error")
@@ -51,21 +52,21 @@ func TestCacheAgentClientGetFileSize(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/cache/files/exists_key":
-			writeJSON(w, 200, map[string]any{"size": 1234, "exists": true})
+			proxycache.WriteJSON(w, 200, map[string]any{"size": 1234, "exists": true})
 		case "/cache/files/missing_key":
-			writeJSON(w, 404, map[string]any{})
+			proxycache.WriteJSON(w, 404, map[string]any{})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 	}))
 	defer srv.Close()
-	client := NewCacheAgentClient(srv.URL)
+	client := proxycache.NewCacheAgentClient(srv.URL)
 	defer client.Close()
 	got := client.GetFileSize("exists_key")
 	if got == nil || got["exists"] != true {
 		t.Errorf("GetFileSize(exists) = %v", got)
 	}
-	if v, ok := toFloat(got["size"]); !ok || v != 1234 {
+	if v, ok := proxycache.ToFloat(got["size"]); !ok || v != 1234 {
 		t.Errorf("GetFileSize size = %v, want 1234", got["size"])
 	}
 	missing := client.GetFileSize("missing_key")

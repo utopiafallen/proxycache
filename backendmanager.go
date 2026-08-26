@@ -4,7 +4,7 @@
 // Key derivation: strips protocol, keeps host:port, colons -> dashes.
 // e.g. "http://10.0.0.1:8000" -> "10.0.0.1-8000"
 
-package main
+package proxycache
 
 import (
 	"context"
@@ -41,18 +41,18 @@ type BackendInfo struct {
 	CacheMaxSizeGB float64
 }
 
-type backendModelKey struct {
+type BackendModelKey struct {
 	Model   string
 	Backend string
 }
 
-type refreshEntry struct {
-	TS     float64
-	OK     bool
-	Slots  int
+type RefreshEntry struct {
+	TS    float64
+	OK    bool
+	Slots int
 }
 
-type modelEMAKey struct {
+type ModelEMAKey struct {
 	BackendID string
 	ModelName string
 	ReqType   string
@@ -61,18 +61,19 @@ type modelEMAKey struct {
 // BackendManager is the singleton registry. Backends are configured once at
 // startup and never change.
 type BackendManager struct {
-	mu sync.RWMutex
+	Mu sync.RWMutex
 
-	backends               map[string]*BackendInfo
-	keyOrder               []string
+	Backends map[string]*BackendInfo
+
+	KeyOrder               []string
 	firstKey               string
-	refreshState           map[backendModelKey]refreshEntry
-	discoveredModels       map[string]*DiscoveredModel
-	modelOrder             []string // first-seen insertion order (dict-order parity)
-	backendState           map[string]bool
-	backendLastUsed        map[string]float64
-	backendLatencyEMA      map[string]float64
-	backendModelLatencyEMA map[modelEMAKey]float64
+	RefreshState           map[BackendModelKey]RefreshEntry
+	DiscoveredModels       map[string]*DiscoveredModel
+	ModelOrder             []string // first-seen insertion order (dict-order parity)
+	BackendState           map[string]bool
+	BackendLastUsed        map[string]float64
+	BackendLatencyEMA      map[string]float64
+	BackendModelLatencyEMA map[ModelEMAKey]float64
 	lastDiscoverTiming     []map[string]any
 
 	livenessCancel context.CancelFunc
@@ -85,13 +86,13 @@ var lcpSplitRe = regexp.MustCompile(`([-_])`)
 // cache_max_size_gb > 0).
 func NewBackendManager(backendConfig []map[string]any) *BackendManager {
 	bm := &BackendManager{
-		backends:               map[string]*BackendInfo{},
-		refreshState:           map[backendModelKey]refreshEntry{},
-		discoveredModels:       map[string]*DiscoveredModel{},
-		backendState:           map[string]bool{},
-		backendLastUsed:        map[string]float64{},
-		backendLatencyEMA:      map[string]float64{},
-		backendModelLatencyEMA: map[modelEMAKey]float64{},
+		Backends:               map[string]*BackendInfo{},
+		RefreshState:           map[BackendModelKey]RefreshEntry{},
+		DiscoveredModels:       map[string]*DiscoveredModel{},
+		BackendState:           map[string]bool{},
+		BackendLastUsed:        map[string]float64{},
+		BackendLatencyEMA:      map[string]float64{},
+		BackendModelLatencyEMA: map[ModelEMAKey]float64{},
 	}
 	for _, be := range backendConfig {
 		urlStr, _ := be["url"].(string)
@@ -110,7 +111,7 @@ func NewBackendManager(backendConfig []map[string]any) *BackendManager {
 				"Use cache_dir for local cache management or agent_port for remote cache-agent.", urlStr))
 		}
 		cacheMaxSizeGB := 25.0
-		if v, ok := toFloat(be["cache_max_size_gb"]); ok {
+		if v, ok := ToFloat(be["cache_max_size_gb"]); ok {
 			cacheMaxSizeGB = v
 		}
 		if !hasAgentPort && cacheDir == "" && cacheMaxSizeGB > 0 {
@@ -124,18 +125,18 @@ func NewBackendManager(backendConfig []map[string]any) *BackendManager {
 			}
 			agentClient = NewCacheAgentClient(fmt.Sprintf("http://%s:%v", host, be["agent_port"]))
 		}
-		bm.backends[key] = &BackendInfo{
+		bm.Backends[key] = &BackendInfo{
 			Client:         client,
 			AgentClient:    agentClient,
 			CacheDir:       cacheDir,
 			CacheMaxSizeGB: cacheMaxSizeGB,
 		}
-		bm.keyOrder = append(bm.keyOrder, key)
+		bm.KeyOrder = append(bm.KeyOrder, key)
 		if bm.firstKey == "" {
 			bm.firstKey = key
 		}
 	}
-	logInfo("backend_manager", "Backend manager initialized with %d backends: %s", len(bm.backends), bm.keyOrder)
+	logInfo("backend_manager", "Backend manager initialized with %d backends: %s", len(bm.Backends), bm.KeyOrder)
 	bm.LoadLatencyData()
 	return bm
 }
@@ -154,9 +155,9 @@ func init() {
 // GetClient returns the LlamaClient for a backend key (panics if unknown,
 // mirroring the Python KeyError).
 func (bm *BackendManager) GetClient(key string) *LlamaClient {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	be := bm.backends[key]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	be := bm.Backends[key]
 	if be == nil {
 		panic(fmt.Sprintf("Unknown backend key: %s", key))
 	}
@@ -166,9 +167,9 @@ func (bm *BackendManager) GetClient(key string) *LlamaClient {
 // GetAgent returns the CacheAgentClient for a backend (nil for local-cache
 // backends; panics if the backend is unknown).
 func (bm *BackendManager) GetAgent(key string) *CacheAgentClient {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	be := bm.backends[key]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	be := bm.Backends[key]
 	if be == nil {
 		panic(fmt.Sprintf("Unknown backend key: %s", key))
 	}
@@ -177,9 +178,9 @@ func (bm *BackendManager) GetAgent(key string) *CacheAgentClient {
 
 // GetCacheDir returns the local cache dir ("" for agent backends).
 func (bm *BackendManager) GetCacheDir(key string) string {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	be := bm.backends[key]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	be := bm.Backends[key]
 	if be == nil {
 		panic(fmt.Sprintf("Unknown backend key: %s", key))
 	}
@@ -188,9 +189,9 @@ func (bm *BackendManager) GetCacheDir(key string) string {
 
 // HasCacheConfig reports whether the backend has any cache management config.
 func (bm *BackendManager) HasCacheConfig(key string) bool {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	be := bm.backends[key]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	be := bm.Backends[key]
 	if be == nil {
 		panic(fmt.Sprintf("Unknown backend key: %s", key))
 	}
@@ -200,9 +201,9 @@ func (bm *BackendManager) HasCacheConfig(key string) bool {
 // GetCacheMaxSizeGB returns the configured cache budget (25 GB default for
 // unknown backends, mirroring the Python getattr default).
 func (bm *BackendManager) GetCacheMaxSizeGB(key string) float64 {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	be := bm.backends[key]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	be := bm.Backends[key]
 	if be == nil {
 		return 25.0
 	}
@@ -217,33 +218,33 @@ func (bm *BackendManager) CacheEnabled(key string) bool {
 // GetBackendState returns the liveness flag for a backend (false if unknown),
 // mirroring _backend_state.get(key, False).
 func (bm *BackendManager) GetBackendState(key string) bool {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	return bm.backendState[key]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	return bm.BackendState[key]
 }
 
 // GetRefreshTS returns the last slot-refresh timestamp for a (model, backend)
 // pair (0 if never refreshed), mirroring _refresh_state.get((m, k), (0, True, 0))[0].
 func (bm *BackendManager) GetRefreshTS(modelName, backendKey string) float64 {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	return bm.refreshState[backendModelKey{Model: modelName, Backend: backendKey}].TS
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	return bm.RefreshState[BackendModelKey{Model: modelName, Backend: backendKey}].TS
 }
 
 // BackendInfoView is a safe copy of a backend's public config for the health
 // endpoint.
 type BackendInfoView struct {
-	URL        string
-	CacheDir   string
-	HasAgent   bool
-	MaxSizeGB  float64
+	URL       string
+	CacheDir  string
+	HasAgent  bool
+	MaxSizeGB float64
 }
 
 // GetBackendInfo returns a copy of a backend's public config, or nil if unknown.
 func (bm *BackendManager) GetBackendInfo(key string) *BackendInfoView {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	be := bm.backends[key]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	be := bm.Backends[key]
 	if be == nil {
 		return nil
 	}
@@ -259,11 +260,11 @@ func (bm *BackendManager) GetBackendInfo(key string) *BackendInfoView {
 // order, with each row's Backends slice and BackendNCTX map deep-copied so the
 // caller can mutate the result freely.
 func (bm *BackendManager) SnapshotModels() []DiscoveredModel {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	out := make([]DiscoveredModel, 0, len(bm.modelOrder))
-	for _, name := range bm.modelOrder {
-		info := bm.discoveredModels[name]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	out := make([]DiscoveredModel, 0, len(bm.ModelOrder))
+	for _, name := range bm.ModelOrder {
+		info := bm.DiscoveredModels[name]
 		if info == nil {
 			continue
 		}
@@ -288,69 +289,69 @@ func (bm *BackendManager) SnapshotModels() []DiscoveredModel {
 
 // TouchBackend marks a backend as recently used.
 func (bm *BackendManager) TouchBackend(backendID string) {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-	bm.backendLastUsed[backendID] = nowFloat()
+	bm.Mu.Lock()
+	defer bm.Mu.Unlock()
+	bm.BackendLastUsed[backendID] = NowFloat()
 }
 
 // GetBackendLastUsed returns the last-used timestamp (0 if never used).
 func (bm *BackendManager) GetBackendLastUsed(backendID string) float64 {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	return bm.backendLastUsed[backendID]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	return bm.BackendLastUsed[backendID]
 }
 
 // UpdateBackendLatency updates the per-backend latency EMA and persists it.
 func (bm *BackendManager) UpdateBackendLatency(backendID string, latencyMS float64) {
-	bm.mu.Lock()
-	old := bm.backendLatencyEMA[backendID]
+	bm.Mu.Lock()
+	old := bm.BackendLatencyEMA[backendID]
 	if old == 0 {
 		old = latencyMS
 	}
-	bm.backendLatencyEMA[backendID] = CacheHitWaitEMAAlpha*latencyMS + (1-CacheHitWaitEMAAlpha)*old
-	bm.mu.Unlock()
+	bm.BackendLatencyEMA[backendID] = CacheHitWaitEMAAlpha*latencyMS + (1-CacheHitWaitEMAAlpha)*old
+	bm.Mu.Unlock()
 	bm.saveLatencyData(backendID)
 }
 
 // GetBackendLatencyEMA returns the per-backend latency EMA (0 if unset).
 func (bm *BackendManager) GetBackendLatencyEMA(backendID string) float64 {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	return bm.backendLatencyEMA[backendID]
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	return bm.BackendLatencyEMA[backendID]
 }
 
 // UpdateBackendModelLatency updates the per backend/model/type latency EMA.
 func (bm *BackendManager) UpdateBackendModelLatency(backendID, modelName string, latencyMS float64, reqType string) {
-	k := modelEMAKey{backendID, modelName, reqType}
-	bm.mu.Lock()
-	old := bm.backendModelLatencyEMA[k]
+	k := ModelEMAKey{backendID, modelName, reqType}
+	bm.Mu.Lock()
+	old := bm.BackendModelLatencyEMA[k]
 	if old == 0 {
 		old = latencyMS
 	}
-	bm.backendModelLatencyEMA[k] = CacheHitWaitEMAAlpha*latencyMS + (1-CacheHitWaitEMAAlpha)*old
-	bm.mu.Unlock()
+	bm.BackendModelLatencyEMA[k] = CacheHitWaitEMAAlpha*latencyMS + (1-CacheHitWaitEMAAlpha)*old
+	bm.Mu.Unlock()
 	bm.saveLatencyData(backendID)
 }
 
 // GetBackendModelLatencyEMA returns the per backend/model/type latency EMA,
 // falling back to the per-backend EMA, then 0.
 func (bm *BackendManager) GetBackendModelLatencyEMA(backendID, modelName, reqType string) float64 {
-	k := modelEMAKey{backendID, modelName, reqType}
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	if v, ok := bm.backendModelLatencyEMA[k]; ok {
+	k := ModelEMAKey{backendID, modelName, reqType}
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	if v, ok := bm.BackendModelLatencyEMA[k]; ok {
 		return v
 	}
-	return bm.backendLatencyEMA[backendID]
+	return bm.BackendLatencyEMA[backendID]
 }
 
 // GetAllLatencyEMA returns all non-zero per-model EMAs as
 // {backend: {model: {reqType: ema_ms}}}.
 func (bm *BackendManager) GetAllLatencyEMA() map[string]map[string]map[string]float64 {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
 	result := map[string]map[string]map[string]float64{}
-	for k, ema := range bm.backendModelLatencyEMA {
+	for k, ema := range bm.BackendModelLatencyEMA {
 		if ema <= 0 {
 			continue
 		}
@@ -385,26 +386,26 @@ func (bm *BackendManager) LoadLatencyData() {
 			continue
 		}
 		var parsed struct {
-			LatencyEMA       map[string]float64 `json:"latency_ema"`
-			ModelLatencyEMA  map[string]float64 `json:"model_latency_ema"`
+			LatencyEMA      map[string]float64 `json:"latency_ema"`
+			ModelLatencyEMA map[string]float64 `json:"model_latency_ema"`
 		}
 		if err := json.Unmarshal(data, &parsed); err != nil {
 			logWarn("backend_manager", "Failed to load latency data for backend '%s': %s", backendID, err)
 			continue
 		}
-		bm.mu.Lock()
+		bm.Mu.Lock()
 		if v, ok := parsed.LatencyEMA[backendID]; ok {
-			bm.backendLatencyEMA[backendID] = v
+			bm.BackendLatencyEMA[backendID] = v
 		}
 		for keyStr, value := range parsed.ModelLatencyEMA {
 			parts := strings.Split(keyStr, "|")
 			if len(parts) == 3 {
-				bm.backendModelLatencyEMA[modelEMAKey{parts[0], parts[1], parts[2]}] = value
+				bm.BackendModelLatencyEMA[ModelEMAKey{parts[0], parts[1], parts[2]}] = value
 			}
 		}
-		nModelEntries := len(bm.backendModelLatencyEMA)
-		beEMA := bm.backendLatencyEMA[backendID]
-		bm.mu.Unlock()
+		nModelEntries := len(bm.BackendModelLatencyEMA)
+		beEMA := bm.BackendLatencyEMA[backendID]
+		bm.Mu.Unlock()
 		logInfo("backend_manager", "Loaded latency data for backend '%s': ema=%.0fms, %d model-type entries",
 			backendID, beEMA, nModelEntries)
 	}
@@ -417,15 +418,15 @@ func (bm *BackendManager) saveLatencyData(backendID string) {
 		logWarn("backend_manager", "Failed to save latency data for backend '%s': %s", backendID, err)
 		return
 	}
-	bm.mu.RLock()
+	bm.Mu.RLock()
 	modelEMA := map[string]float64{}
-	for k, v := range bm.backendModelLatencyEMA {
+	for k, v := range bm.BackendModelLatencyEMA {
 		if k.BackendID == backendID {
 			modelEMA[k.BackendID+"|"+k.ModelName+"|"+k.ReqType] = v
 		}
 	}
-	beEMA := bm.backendLatencyEMA[backendID]
-	bm.mu.RUnlock()
+	beEMA := bm.BackendLatencyEMA[backendID]
+	bm.Mu.RUnlock()
 	data := map[string]any{
 		"latency_ema":       map[string]float64{backendID: beEMA},
 		"model_latency_ema": modelEMA,
@@ -449,9 +450,9 @@ func (bm *BackendManager) saveLatencyData(backendID string) {
 
 // CacheDelete deletes a cache file (and its .ckpt* sidecars).
 func (bm *BackendManager) CacheDelete(backendID, key string) bool {
-	bm.mu.RLock()
-	be := bm.backends[backendID]
-	bm.mu.RUnlock()
+	bm.Mu.RLock()
+	be := bm.Backends[backendID]
+	bm.Mu.RUnlock()
 	if be == nil {
 		return false
 	}
@@ -474,9 +475,9 @@ func (bm *BackendManager) CacheDelete(backendID, key string) bool {
 
 // CacheGetSize returns the cache file size (0 if missing/unknown backend).
 func (bm *BackendManager) CacheGetSize(backendID, key string) int {
-	bm.mu.RLock()
-	be := bm.backends[backendID]
-	bm.mu.RUnlock()
+	bm.Mu.RLock()
+	be := bm.Backends[backendID]
+	bm.Mu.RUnlock()
 	if be == nil {
 		return 0
 	}
@@ -484,7 +485,7 @@ func (bm *BackendManager) CacheGetSize(backendID, key string) int {
 		result := be.AgentClient.GetFileSize(key)
 		if result != nil {
 			if exists, _ := result["exists"].(bool); exists {
-				if v, ok := toFloat(result["size"]); ok {
+				if v, ok := ToFloat(result["size"]); ok {
 					return int(v)
 				}
 			}
@@ -502,25 +503,25 @@ func (bm *BackendManager) CacheGetSize(backendID, key string) int {
 // CacheGetMtime returns the cache file mtime. Agent backends have no mtime,
 // so they (and missing files) return the current time.
 func (bm *BackendManager) CacheGetMtime(backendID, key string) float64 {
-	bm.mu.RLock()
-	be := bm.backends[backendID]
-	bm.mu.RUnlock()
+	bm.Mu.RLock()
+	be := bm.Backends[backendID]
+	bm.Mu.RUnlock()
 	if be == nil {
-		return nowFloat()
+		return NowFloat()
 	}
 	if be.CacheDir != "" {
 		if st, err := os.Stat(filepath.Join(be.CacheDir, key)); err == nil {
 			return float64(st.ModTime().UnixNano()) / 1e9
 		}
 	}
-	return nowFloat()
+	return NowFloat()
 }
 
 // CacheExists checks for the cache file.
 func (bm *BackendManager) CacheExists(backendID, key string) bool {
-	bm.mu.RLock()
-	be := bm.backends[backendID]
-	bm.mu.RUnlock()
+	bm.Mu.RLock()
+	be := bm.Backends[backendID]
+	bm.Mu.RUnlock()
 	if be == nil {
 		return false
 	}
@@ -548,21 +549,21 @@ func globSidecars(dir, pattern string) []string {
 
 // Keys returns backend keys in config order.
 func (bm *BackendManager) Keys() []string {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	out := make([]string, len(bm.keyOrder))
-	copy(out, bm.keyOrder)
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	out := make([]string, len(bm.KeyOrder))
+	copy(out, bm.KeyOrder)
 	return out
 }
 
 func (bm *BackendManager) keys() []string {
-	return bm.keyOrder
+	return bm.KeyOrder
 }
 
 // FirstKey returns the first configured backend key.
 func (bm *BackendManager) FirstKey() string {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
 	if bm.firstKey == "" {
 		panic("No backends configured")
 	}
@@ -571,16 +572,16 @@ func (bm *BackendManager) FirstKey() string {
 
 // NBackends returns the number of configured backends.
 func (bm *BackendManager) NBackends() int {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	return len(bm.backends)
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	return len(bm.Backends)
 }
 
 // Close shuts down all clients.
 func (bm *BackendManager) Close() {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	for _, info := range bm.backends {
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	for _, info := range bm.Backends {
 		info.Client.Close()
 		if info.AgentClient != nil {
 			info.AgentClient.Close()
@@ -590,7 +591,7 @@ func (bm *BackendManager) Close() {
 
 // --- Synthetic LCP models ---
 
-// generateLCPModels creates synthetic model aliases from chunk-level prefixes:
+// GenerateLCPModels creates synthetic model aliases from chunk-level prefixes:
 // strip provider prefix, split on -/_, take 1..N-1 chunk prefixes, keep those
 // that substring-match >= 2 real models.
 func lcpTokenize(s string) []string {
@@ -609,7 +610,7 @@ func lcpTokenize(s string) []string {
 	return pieces
 }
 
-func (bm *BackendManager) generateLCPModels(modelNames []string) []string {
+func (bm *BackendManager) GenerateLCPModels(modelNames []string) []string {
 	if len(modelNames) < 2 {
 		return []string{}
 	}
@@ -653,20 +654,20 @@ func (bm *BackendManager) discoverModelsCtx(ctx context.Context) error {
 	}
 	allDiscovered := map[string][]beCtx{}
 	firstSeen := []string{}
-	bm.mu.Lock()
+	bm.Mu.Lock()
 	bm.lastDiscoverTiming = []map[string]any{}
-	bm.mu.Unlock()
+	bm.Mu.Unlock()
 
 	appendTiming := func(entry map[string]any) {
-		bm.mu.Lock()
+		bm.Mu.Lock()
 		bm.lastDiscoverTiming = append(bm.lastDiscoverTiming, entry)
-		bm.mu.Unlock()
+		bm.Mu.Unlock()
 	}
 
 	for _, backendKey := range bm.Keys() {
-		bm.mu.RLock()
-		up := bm.backendState[backendKey]
-		bm.mu.RUnlock()
+		bm.Mu.RLock()
+		up := bm.BackendState[backendKey]
+		bm.Mu.RUnlock()
 		if !up {
 			appendTiming(map[string]any{"backend": backendKey, "skipped": true})
 			continue
@@ -714,12 +715,12 @@ func (bm *BackendManager) discoverModelsCtx(ctx context.Context) error {
 		}
 		merged[name] = &DiscoveredModel{
 			Name: name, NCtx: minCtx, Backends: backends, BackendNCTX: backendNCTX,
-			TotalSlots: 0, LastDiscovered: nowFloat(),
+			TotalSlots: 0, LastDiscovered: NowFloat(),
 		}
 	}
 
 	// Add synthetic LCP models.
-	lcpNames := bm.generateLCPModels(firstSeen)
+	lcpNames := bm.GenerateLCPModels(firstSeen)
 	syntheticAdded := []string{}
 	for _, lcpName := range lcpNames {
 		matching := []string{}
@@ -754,7 +755,7 @@ func (bm *BackendManager) discoverModelsCtx(ctx context.Context) error {
 			}
 			merged[lcpName] = &DiscoveredModel{
 				Name: lcpName, NCtx: lcpNCtx, Backends: lcpBackends, BackendNCTX: lcpBackendNCTX,
-				TotalSlots: 0, LastDiscovered: nowFloat(), Synthetic: true,
+				TotalSlots: 0, LastDiscovered: NowFloat(), Synthetic: true,
 			}
 			syntheticAdded = append(syntheticAdded, lcpName)
 			logInfo("backend_manager", "Synthetic LCP model '%s' matches %d models on backends %s",
@@ -762,12 +763,12 @@ func (bm *BackendManager) discoverModelsCtx(ctx context.Context) error {
 		}
 	}
 
-	bm.mu.Lock()
-	bm.discoveredModels = merged
-	bm.modelOrder = append(append([]string{}, firstSeen...), syntheticAdded...)
-	bm.mu.Unlock()
+	bm.Mu.Lock()
+	bm.DiscoveredModels = merged
+	bm.ModelOrder = append(append([]string{}, firstSeen...), syntheticAdded...)
+	bm.Mu.Unlock()
 
-	for _, name := range bm.modelOrder {
+	for _, name := range bm.ModelOrder {
 		info := merged[name]
 		logInfo("backend_manager", "Discovered model '%s' on backends %s with n_ctx=%d",
 			name, info.Backends, info.NCtx)
@@ -777,9 +778,9 @@ func (bm *BackendManager) discoverModelsCtx(ctx context.Context) error {
 
 // GetModelNCtx returns the (min across backends) n_ctx for a model.
 func (bm *BackendManager) GetModelNCtx(canonicalName string) int {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	if info, ok := bm.discoveredModels[canonicalName]; ok {
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	if info, ok := bm.DiscoveredModels[canonicalName]; ok {
 		return info.NCtx
 	}
 	return DefaultNCtx
@@ -787,9 +788,9 @@ func (bm *BackendManager) GetModelNCtx(canonicalName string) int {
 
 // GetBackendNCtx returns the per-backend n_ctx for a model.
 func (bm *BackendManager) GetBackendNCtx(canonicalName, backendKey string) int {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
-	if info, ok := bm.discoveredModels[canonicalName]; ok {
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	if info, ok := bm.DiscoveredModels[canonicalName]; ok {
 		if c, ok2 := info.BackendNCTX[backendKey]; ok2 {
 			return c
 		}
@@ -800,26 +801,26 @@ func (bm *BackendManager) GetBackendNCtx(canonicalName, backendKey string) int {
 // GetDiscoveredModels resolves a client model name to matching DiscoveredModel
 // objects: exact match, then substring (case-insensitive), then "any".
 func (bm *BackendManager) GetDiscoveredModels(modelName string) []*DiscoveredModel {
-	bm.mu.RLock()
-	defer bm.mu.RUnlock()
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
 	if modelName == "any" {
-		if len(bm.discoveredModels) == 0 {
+		if len(bm.DiscoveredModels) == 0 {
 			return []*DiscoveredModel{}
 		}
-		out := make([]*DiscoveredModel, 0, len(bm.modelOrder))
-		for _, name := range bm.modelOrder {
-			if info, ok := bm.discoveredModels[name]; ok {
+		out := make([]*DiscoveredModel, 0, len(bm.ModelOrder))
+		for _, name := range bm.ModelOrder {
+			if info, ok := bm.DiscoveredModels[name]; ok {
 				out = append(out, info)
 			}
 		}
 		return out
 	}
-	if info, ok := bm.discoveredModels[modelName]; ok {
+	if info, ok := bm.DiscoveredModels[modelName]; ok {
 		return []*DiscoveredModel{info}
 	}
 	out := []*DiscoveredModel{}
-	for _, name := range bm.modelOrder {
-		info, ok := bm.discoveredModels[name]
+	for _, name := range bm.ModelOrder {
+		info, ok := bm.DiscoveredModels[name]
 		if !ok {
 			continue
 		}
@@ -840,13 +841,13 @@ func (bm *BackendManager) RefreshSlotCounts() (map[string]map[string]int, error)
 
 func (bm *BackendManager) refreshSlotCountsCtx(ctx context.Context) (map[string]map[string]int, error) {
 	backendKeys := bm.Keys()
-	bm.mu.RLock()
-	nModels := len(bm.discoveredModels)
-	modelNames := make([]string, 0, len(bm.discoveredModels))
-	for _, name := range bm.modelOrder {
+	bm.Mu.RLock()
+	nModels := len(bm.DiscoveredModels)
+	modelNames := make([]string, 0, len(bm.DiscoveredModels))
+	for _, name := range bm.ModelOrder {
 		modelNames = append(modelNames, name)
 	}
-	bm.mu.RUnlock()
+	bm.Mu.RUnlock()
 
 	logInfo("backend_manager", "Refreshing slot counts: %d known models, %d backends", nModels, len(backendKeys))
 	if len(backendKeys) == 0 {
@@ -858,17 +859,17 @@ func (bm *BackendManager) refreshSlotCountsCtx(ctx context.Context) (map[string]
 	refreshedAny := false
 
 	for _, canonicalName := range modelNames {
-		bm.mu.RLock()
-		info := bm.discoveredModels[canonicalName]
-		bm.mu.RUnlock()
+		bm.Mu.RLock()
+		info := bm.DiscoveredModels[canonicalName]
+		bm.Mu.RUnlock()
 		if info == nil {
 			continue
 		}
 		logInfo("backend_manager", "Model '%s' has backends: %s", canonicalName, info.Backends)
 		for _, backendKey := range info.Backends {
-			bm.mu.RLock()
-			_, known := bm.backends[backendKey]
-			bm.mu.RUnlock()
+			bm.Mu.RLock()
+			_, known := bm.Backends[backendKey]
+			bm.Mu.RUnlock()
 			if !known {
 				continue
 			}
@@ -902,15 +903,15 @@ func (bm *BackendManager) refreshSlotCountsCtx(ctx context.Context) (map[string]
 					slotCounts[backendKey] = map[string]int{}
 				}
 				slotCounts[backendKey][canonicalName] = nSlots
-				bm.mu.Lock()
-				bm.refreshState[backendModelKey{canonicalName, backendKey}] = refreshEntry{nowFloat(), true, nSlots}
-				bm.mu.Unlock()
+				bm.Mu.Lock()
+				bm.RefreshState[BackendModelKey{canonicalName, backendKey}] = RefreshEntry{NowFloat(), true, nSlots}
+				bm.Mu.Unlock()
 				refreshedAny = true
 			} else {
 				logWarn("backend_manager", "Model '%s' not loaded on backend '%s'", canonicalName, backendKey)
-				bm.mu.Lock()
-				bm.refreshState[backendModelKey{canonicalName, backendKey}] = refreshEntry{nowFloat(), false, 0}
-				bm.mu.Unlock()
+				bm.Mu.Lock()
+				bm.RefreshState[BackendModelKey{canonicalName, backendKey}] = RefreshEntry{NowFloat(), false, 0}
+				bm.Mu.Unlock()
 				refreshedAny = true
 			}
 		}
@@ -921,9 +922,9 @@ func (bm *BackendManager) refreshSlotCountsCtx(ctx context.Context) (map[string]
 	}
 
 	// Update total_slots on each DiscoveredModel.
-	bm.mu.Lock()
-	for _, name := range bm.modelOrder {
-		info := bm.discoveredModels[name]
+	bm.Mu.Lock()
+	for _, name := range bm.ModelOrder {
+		info := bm.DiscoveredModels[name]
 		if info == nil {
 			continue
 		}
@@ -933,7 +934,7 @@ func (bm *BackendManager) refreshSlotCountsCtx(ctx context.Context) (map[string]
 		}
 		info.TotalSlots = total
 	}
-	bm.mu.Unlock()
+	bm.Mu.Unlock()
 
 	return slotCounts, nil
 }
@@ -943,18 +944,18 @@ func (bm *BackendManager) refreshSlotCountsCtx(ctx context.Context) (map[string]
 // StartLivenessChecker launches the 5s health-check loop.
 func (bm *BackendManager) StartLivenessChecker() {
 	ctx, cancel := context.WithCancel(context.Background())
-	bm.mu.Lock()
+	bm.Mu.Lock()
 	bm.livenessCancel = cancel
-	bm.mu.Unlock()
+	bm.Mu.Unlock()
 	go bm.livenessLoop(ctx)
 }
 
 // StopLivenessChecker stops the health-check loop.
 func (bm *BackendManager) StopLivenessChecker() {
-	bm.mu.Lock()
+	bm.Mu.Lock()
 	cancel := bm.livenessCancel
 	bm.livenessCancel = nil
-	bm.mu.Unlock()
+	bm.Mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
@@ -965,13 +966,13 @@ func (bm *BackendManager) StopLivenessChecker() {
 func (bm *BackendManager) livenessLoop(ctx context.Context) {
 	// Initialize all backends as up so discover_models() doesn't skip them
 	// before the first health check runs.
-	bm.mu.Lock()
-	for _, k := range bm.keyOrder {
-		if _, ok := bm.backendState[k]; !ok {
-			bm.backendState[k] = true
+	bm.Mu.Lock()
+	for _, k := range bm.KeyOrder {
+		if _, ok := bm.BackendState[k]; !ok {
+			bm.BackendState[k] = true
 		}
 	}
-	bm.mu.Unlock()
+	bm.Mu.Unlock()
 
 	// Loop-local per-backend rate-limit state for liveness events (the
 	// liveness loop is the sole accessor).
@@ -979,7 +980,7 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 	missingModelsLast := map[string]float64{}
 
 	for {
-		loopT0 := nowFloat()
+		loopT0 := NowFloat()
 		select {
 		case <-ctx.Done():
 			return
@@ -991,9 +992,9 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 
 		for _, backendKey := range bm.Keys() {
 			client := bm.GetClient(backendKey)
-			bm.mu.RLock()
-			oldState := bm.backendState[backendKey]
-			bm.mu.RUnlock()
+			bm.Mu.RLock()
+			oldState := bm.BackendState[backendKey]
+			bm.Mu.RUnlock()
 			isUp := false
 			hcT0 := time.Now()
 			hcError := ""
@@ -1020,9 +1021,9 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 			stateChanged := false
 			if isUp != oldState {
 				stateChanged = true
-				bm.mu.Lock()
-				bm.backendState[backendKey] = isUp
-				bm.mu.Unlock()
+				bm.Mu.Lock()
+				bm.BackendState[backendKey] = isUp
+				bm.Mu.Unlock()
 				changed = true
 				stateChanges = append(stateChanges, map[string]any{
 					"backend": backendKey, "old_state": oldState, "new_state": isUp,
@@ -1041,15 +1042,15 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 		}
 
 		// Also trigger if an up backend has no models in the registry.
-		bm.mu.RLock()
+		bm.Mu.RLock()
 		upKeys := map[string]bool{}
-		for k, v := range bm.backendState {
+		for k, v := range bm.BackendState {
 			if v {
 				upKeys[k] = true
 			}
 		}
 		discoveredBackends := map[string]bool{}
-		for _, info := range bm.discoveredModels {
+		for _, info := range bm.DiscoveredModels {
 			for _, be := range info.Backends {
 				discoveredBackends[be] = true
 			}
@@ -1057,7 +1058,7 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 		// Gated per-backend: re-trigger discovery at most once per
 		// MissingModelsRetryInterval seconds per backend so a persistently
 		// missing model does not trigger discovery + events every tick.
-		now := nowFloat()
+		now := NowFloat()
 		missingCandidates := map[string]bool{}
 		missingModels := []string{}
 		for k := range upKeys {
@@ -1074,7 +1075,7 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 				delete(missingModelsLast, be)
 			}
 		}
-		bm.mu.RUnlock()
+		bm.Mu.RUnlock()
 		if len(missingModels) > 0 {
 			changed = true
 			for _, be := range missingModels {
@@ -1133,16 +1134,16 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 				}
 			}
 
-			bm.mu.RLock()
-			discoveredModels := map[string][]string{}
-			for name, info := range bm.discoveredModels {
-				discoveredModels[name] = info.Backends
+			bm.Mu.RLock()
+			DiscoveredModels := map[string][]string{}
+			for name, info := range bm.DiscoveredModels {
+				DiscoveredModels[name] = info.Backends
 			}
-			bm.mu.RUnlock()
+			bm.Mu.RUnlock()
 			Metrics.Record(map[string]any{
 				"event":             "liveness_change",
 				"state_changes":     stateChanges,
-				"discovered_models": discoveredModels,
+				"discovered_models": DiscoveredModels,
 			})
 		}
 
@@ -1159,16 +1160,16 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 			}
 		}
 		worthRecording := changed || len(noteworthy) > 0 || discError != "" || slotsError != ""
-		if worthRecording && livenessDiagDue(noteworthy, livenessDiagLast, changed, now, LivenessDiagRecordInterval) {
-			bm.mu.RLock()
+		if worthRecording && LivenessDiagDue(noteworthy, livenessDiagLast, changed, now, LivenessDiagRecordInterval) {
+			bm.Mu.RLock()
 			states := map[string]bool{}
-			for k, v := range bm.backendState {
+			for k, v := range bm.BackendState {
 				states[k] = v
 			}
-			nDiscovered := len(bm.discoveredModels)
+			nDiscovered := len(bm.DiscoveredModels)
 			timing := make([]map[string]any, len(bm.lastDiscoverTiming))
 			copy(timing, bm.lastDiscoverTiming)
-			bm.mu.RUnlock()
+			bm.Mu.RUnlock()
 			record := map[string]any{
 				"event":             "liveness_diag",
 				"health":            healthResults,
@@ -1180,7 +1181,7 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 				"discover_error":    discError,
 				"slots_ms":          nil,
 				"slots_error":       slotsError,
-				"total_ms":          round1((nowFloat() - loopT0) * 1000),
+				"total_ms":          round1((NowFloat() - loopT0) * 1000),
 			}
 			if discMS != nil {
 				record["discover_ms"] = round1(*discMS)
@@ -1196,13 +1197,13 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 	}
 }
 
-// livenessDiagDue reports whether a liveness_diag event is due this tick.
+// LivenessDiagDue reports whether a liveness_diag event is due this tick.
 // State transitions (changed) always record. Otherwise a record is due only
 // if a noteworthy backend has not been recorded within interval seconds.
 // This rate-limits sustained noteworthy states (e.g. a health check that
 // keeps failing and retrying while the backend is busy) so liveness events
 // cannot fill the shared metrics ring buffer and evict request records.
-func livenessDiagDue(noteworthy []string, lastRecorded map[string]float64, changed bool, now, interval float64) bool {
+func LivenessDiagDue(noteworthy []string, lastRecorded map[string]float64, changed bool, now, interval float64) bool {
 	if changed {
 		return true
 	}
@@ -1252,3 +1253,9 @@ func errName(err error) string {
 
 // backendManager is the global singleton, created in init() from BACKENDS.
 var backendManager *BackendManager
+
+// GetBackendManager returns the global backend manager singleton.
+func GetBackendManager() *BackendManager { return backendManager }
+
+// SetBackendManager replaces the global backend manager singleton.
+func SetBackendManager(bm *BackendManager) { backendManager = bm }
