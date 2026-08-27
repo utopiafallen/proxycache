@@ -426,6 +426,57 @@ func TestCacheBackendBusyFallback(t *testing.T) {
 	}
 }
 
+func withRetryBase(t *testing.T, base float64) {
+	t.Helper()
+	old := proxycache.SlotAcquireRetryBaseSeconds
+	proxycache.SlotAcquireRetryBaseSeconds = base
+	t.Cleanup(func() { proxycache.SlotAcquireRetryBaseSeconds = old })
+}
+
+func TestAcquireSeesBackendsComingOnlineDuringRetry(t *testing.T) {
+	withTempMetaDir(t)
+	m1 := newMockLlama(t, "model-a", 32768, seq(10), 1)
+	m2 := newMockLlama(t, "model-a", 32768, seq(10), 1)
+	be1 := backendKeyFromURL(m1.srv.URL)
+	be2 := backendKeyFromURL(m2.srv.URL)
+	bm := withTestBackend(t, []map[string]any{
+		{"url": m1.srv.URL, "cache_dir": t.TempDir()},
+		{"url": m2.srv.URL, "cache_dir": t.TempDir()},
+	})
+	markBackendsUp(bm)
+	// Only backend 1 serves the model when the request arrives.
+	injectModels(bm, dm("model-a", 32768, be1))
+	beSm1 := proxycache.GetSlotManager().Get(be1)
+	beSm1.EnsurePool("model-a", 1)
+	if s := beSm1.TryAcquire("model-a"); s != 0 {
+		t.Fatalf("pre-acquire = %d, want 0", s)
+	}
+	withRetryBase(t, 0.2)
+	// Simulate the liveness loop discovering backend 2 while the request
+	// is waiting for a slot.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		bm.Mu.Lock()
+		if info, ok := bm.DiscoveredModels["model-a"]; ok {
+			info.Backends = []string{be1, be2}
+		}
+		bm.Mu.Unlock()
+		// Mirror the liveness loop, which refreshes slot pools after
+		// discovery.
+		proxycache.GetSlotManager().RefreshSlotCounts()
+	}()
+	w := postChat(t, `{"model": "model-a", "messages": [{"role": "user", "content": "hello"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if m2.chatCount() != 1 {
+		t.Errorf("newly-online backend chat count = %d, want 1", m2.chatCount())
+	}
+	if m1.chatCount() != 0 {
+		t.Errorf("busy backend chat count = %d, want 0", m1.chatCount())
+	}
+}
+
 func TestCacheHitWaitPhase0Success(t *testing.T) {
 	withTempMetaDir(t)
 	m1 := newMockLlama(t, "test-model", 32768, seq(800), 1)

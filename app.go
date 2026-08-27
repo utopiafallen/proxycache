@@ -316,6 +316,7 @@ func handleTokenizeError(w http.ResponseWriter, requestID, model string, t0 floa
 func acquireSlotForRequest(
 	ctx context.Context,
 	candidateBackends []candidateBackend,
+	rebuild func() []candidateBackend,
 	restoreBackend string,
 	canonicalName string,
 	hitType *CacheHitType,
@@ -461,11 +462,15 @@ func acquireSlotForRequest(
 			return GSlot{ModelName: cb.ModelName, BackendID: cb.BackendID, SlotID: slotID}, restored, skipRestoreDiag, prevKV, nil
 		}
 		attempt++
-		backoff := float64(attempt) * 5
+		backoff := float64(attempt) * SlotAcquireRetryBaseSeconds
 		logInfo("app", "No slots available across all backends, retrying in %ds (attempt %d)", int(backoff), attempt)
 		if err := ctxSleep(ctx, backoff); err != nil {
 			return GSlot{}, nil, skipRestoreDiag, nil, err
 		}
+		// Re-derive candidates so backends/models that came online during
+		// the wait (liveness loop discovery) are considered, and backends
+		// that went offline drop out.
+		candidateBackends = rebuild()
 	}
 }
 
@@ -681,41 +686,51 @@ func ChatHandler(w http.ResponseWriter, r *http.Request) {
 		reqType = "summarization"
 	}
 
-	candidateBackends := []candidateBackend{}
-	for _, opt := range options {
-		for _, beID := range opt.Backends {
-			if restoreBackend != "" && beID == restoreBackend {
-				continue
+	buildCandidateBackends := func(opts []*DiscoveredModel) []candidateBackend {
+		cbs := []candidateBackend{}
+		for _, opt := range opts {
+			for _, beID := range opt.Backends {
+				if restoreBackend != "" && beID == restoreBackend {
+					continue
+				}
+				cbs = append(cbs, candidateBackend{BackendID: beID, ModelName: opt.Name})
 			}
-			candidateBackends = append(candidateBackends, candidateBackend{BackendID: beID, ModelName: opt.Name})
 		}
+		ringSizeOf := func(beID string) int {
+			if slotManager.HasBackend(beID) {
+				return slotManager.Get(beID).GetRingSize()
+			}
+			return 0
+		}
+		sort.SliceStable(cbs, func(i, j int) bool {
+			a, b := cbs[i], cbs[j]
+			ar, br := backendCacheRatios[a.BackendID], backendCacheRatios[b.BackendID]
+			if ar != br {
+				return ar < br
+			}
+			au, bu := backendManager.GetBackendLastUsed(a.BackendID), backendManager.GetBackendLastUsed(b.BackendID)
+			if au != bu {
+				return au < bu
+			}
+			ari, bri := ringSizeOf(a.BackendID), ringSizeOf(b.BackendID)
+			if ari != bri {
+				return ari < bri
+			}
+			return backendManager.GetBackendModelLatencyEMA(a.BackendID, a.ModelName, reqType) <
+				backendManager.GetBackendModelLatencyEMA(b.BackendID, b.ModelName, reqType)
+		})
+		return cbs
 	}
-	ringSizeOf := func(beID string) int {
-		if slotManager.HasBackend(beID) {
-			return slotManager.Get(beID).GetRingSize()
-		}
-		return 0
+	// Re-resolves models from the backend manager on each retry so the
+	// fallback set reflects backends that came online (or offline) while
+	// this request waits for a slot.
+	rebuildCandidates := func() []candidateBackend {
+		return buildCandidateBackends(backendManager.GetDiscoveredModels(clientModel))
 	}
-	sort.SliceStable(candidateBackends, func(i, j int) bool {
-		a, b := candidateBackends[i], candidateBackends[j]
-		ar, br := backendCacheRatios[a.BackendID], backendCacheRatios[b.BackendID]
-		if ar != br {
-			return ar < br
-		}
-		au, bu := backendManager.GetBackendLastUsed(a.BackendID), backendManager.GetBackendLastUsed(b.BackendID)
-		if au != bu {
-			return au < bu
-		}
-		ari, bri := ringSizeOf(a.BackendID), ringSizeOf(b.BackendID)
-		if ari != bri {
-			return ari < bri
-		}
-		return backendManager.GetBackendModelLatencyEMA(a.BackendID, a.ModelName, reqType) <
-			backendManager.GetBackendModelLatencyEMA(b.BackendID, b.ModelName, reqType)
-	})
+	candidateBackends := buildCandidateBackends(options)
 
 	g, restored, skipRestoreDiag, prevKV, acqErr := acquireSlotForRequest(
-		r.Context(), candidateBackends, restoreBackend, canonicalName, hitType, restoreKey, backendBlocks, promptTokens,
+		r.Context(), candidateBackends, rebuildCandidates, restoreBackend, canonicalName, hitType, restoreKey, backendBlocks, promptTokens,
 	)
 	if acqErr != nil {
 		logError("app", "Could not acquire slot from client %s for model '%s': %v", ip, clientModel, acqErr)

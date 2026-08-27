@@ -54,7 +54,8 @@ The cache hit scan lives in `chatHandler` in `app.go`, between model resolution 
 
 **Phase 2 — Retry loop:**
 - Iterates all candidate backends (fallback only, excludes cache backend), sorted by composite score: `(cache_ratio, ring_size, latency_ema, last_used)` to minimize cache churn and latency
-- Retries forever until a slot frees (backoff grows 5s, 10s, 15s, ...); aborts only on client disconnect / context cancellation
+- Retries forever until a slot frees (backoff grows `SLOT_ACQUIRE_RETRY_BASE_SECONDS` × attempt, default 5s, 10s, 15s, ...); aborts only on client disconnect / context cancellation
+- After each backoff, candidates are re-derived from live model discovery, so backends coming online mid-wait join the set (and backends going offline drop out)
 - Picks first available slot
 
 **After slot acquisition succeeds (all phases):**
