@@ -8,10 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +23,7 @@ const (
 	recomputeThresholdRatio = 0.7
 )
 
-type candidateBackend struct {
+type CandidateBackend struct {
 	BackendID string
 	ModelName string
 }
@@ -166,16 +164,6 @@ func hasRoutingDiagnostics(v any) bool {
 	}
 }
 
-func clampF(v, min, max float64) float64 {
-	if v < min {
-		return min
-	}
-	if v > max {
-		return max
-	}
-	return v
-}
-
 func latencyMS(t0 float64) float64 {
 	return (NowFloat() - t0) * 1000
 }
@@ -293,187 +281,9 @@ func ModelsHandler(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, map[string]any{"data": data})
 }
 
-func handleTokenizeError(w http.ResponseWriter, requestID, model string, t0 float64, err error) {
-	var statusErr *HTTPStatusError
-	if errors.As(err, &statusErr) {
-		detail := statusErr.Body
-		if detail == "" {
-			detail = statusErr.Error()
-		}
-		recordEarlyError(requestID, model, t0)
-		WriteJSON(w, statusErr.StatusCode, map[string]any{"error": detail})
-		return
-	}
-	if errors.Is(err, ErrConn) {
-		recordEarlyError(requestID, model, t0)
-		WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend unreachable"})
-		return
-	}
-	recordEarlyError(requestID, model, t0)
-	WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-}
-
-func acquireSlotForRequest(
-	ctx context.Context,
-	candidateBackends []candidateBackend,
-	rebuild func() []candidateBackend,
-	restoreBackend string,
-	canonicalName string,
-	hitType *CacheHitType,
-	restoreKey string,
-	backendBlocks map[string][]string,
-	promptTokens int,
-) (GSlot, *bool, map[string]any, []string, error) {
-	slotManager.RefreshSlotCounts()
-	skipRestoreDiag := map[string]any{}
-	var cacheBlocks []string
-	if hitType != nil && *hitType == CacheHitDiskRestore && restoreBackend != "" {
-		cacheBlocks = backendBlocks[restoreBackend]
-	}
-
-	doRestoreCall := func(beSm *BackendSlotManager, slotID int, key string, blocks []string, prevBlocks []string) *bool {
-		if skipEntry := beSm.FlushSaveSkipped(slotID); skipEntry != nil {
-			if skipEntry.Legacy {
-				beSm.SaveAfter(canonicalName, slotID, skipEntry.Key, skipEntry.Blocks, skipEntry.NTokens)
-				logInfo("app", "Saved skipped cache (legacy) for model '%s' on backend '%s' slot %d before restore", canonicalName, beSm.BackendID, slotID)
-			} else {
-				nCtxFlush := backendManager.GetBackendNCtx(canonicalName, beSm.BackendID)
-				if !ShouldSkipSaveHeuristic(skipEntry.NTokens, nCtxFlush, nil, nil) && ShouldSaveCache(skipEntry.ServingRatio, skipEntry.Recompute) {
-					beSm.SaveAfter(canonicalName, slotID, skipEntry.Key, skipEntry.Blocks, skipEntry.NTokens)
-					logInfo("app", "Saved skipped cache for model '%s' on backend '%s' slot %d before restore", canonicalName, beSm.BackendID, slotID)
-				}
-			}
-		}
-
-		var restored *bool
-		if len(blocks) > 0 {
-			logWarn("app", "[diag] _do_restore_call: slot %d, blocks=%d, prev_blocks=%d, key=%v", slotID, len(blocks), len(prevBlocks), key16OrNil(key))
-			if beSm.ShouldSkipRestore(slotID, blocks, prevBlocks, true) {
-				logInfo("app", "Skipping restore for model '%s' on backend '%s' slot %d: slot cache already matches", canonicalName, beSm.BackendID, slotID)
-				skipRestoreDiag = map[string]any{
-					"skipped":       true,
-					"backend":       beSm.BackendID,
-					"slot_id":       slotID,
-					"old_kv_blocks": len(prevBlocks),
-					"req_blocks":    len(blocks),
-					"restore_key":   key16OrNil(key),
-				}
-				v := false
-				restored = &v
-			} else if key != "" {
-				beSm.Restore(slotID, key, canonicalName, true)
-				v := true
-				restored = &v
-			} else {
-				logInfo("app", "No restore key for model '%s' on backend '%s' slot %d", canonicalName, beSm.BackendID, slotID)
-				v := false
-				restored = &v
-			}
-		} else if key != "" {
-			beSm.Restore(slotID, key, canonicalName, true)
-			v := true
-			restored = &v
-		} else {
-			restored = nil
-		}
-		return restored
-	}
-
-	tryCacheBackend := func() (GSlot, *bool, []string, bool) {
-		if restoreBackend == "" || promptTokens >= backendManager.GetBackendNCtx(canonicalName, restoreBackend) {
-			return GSlot{}, nil, nil, false
-		}
-		beSm := slotManager.Get(restoreBackend)
-		slotID := beSm.TryAcquire(canonicalName)
-		if slotID == -1 {
-			return GSlot{}, nil, nil, false
-		}
-		prevKV := beSm.GetKVState(slotID)
-		logWarn("app", "[diag] _try_cache_backend: slot %d, old_kv blocks=%d, cache_blocks=%d", slotID, len(prevKV), len(cacheBlocks))
-		acquireBlocks := backendBlocks[restoreBackend]
-		if len(acquireBlocks) == 0 {
-			acquireBlocks = []string{}
-		}
-		beSm.SetKVState(slotID, acquireBlocks)
-		restored := doRestoreCall(beSm, slotID, restoreKey, cacheBlocks, prevKV)
-		backendManager.TouchBackend(restoreBackend)
-		return GSlot{ModelName: canonicalName, BackendID: restoreBackend, SlotID: slotID}, restored, prevKV, true
-	}
-
-	if restoreBackend != "" && hitType != nil && promptTokens < backendManager.GetBackendNCtx(canonicalName, restoreBackend) {
-		if g, restored, prevKV, ok := tryCacheBackend(); ok {
-			return g, restored, skipRestoreDiag, prevKV, nil
-		}
-		pending := slotManager.GetCacheWaitPending(restoreBackend)
-		if pending < CacheHitWaitMaxPending {
-			ema := slotManager.Get(restoreBackend).GetSlotDurationEMA()
-			waitTimeout := clampF(ema, CacheHitWaitEMAMinT, CacheHitWaitEMAMaxT)
-			logInfo("app", "Cache backend '%s' busy for model '%s', polling up to %.1fs", restoreBackend, canonicalName, waitTimeout)
-			decPending := func() {
-				cur := slotManager.GetCacheWaitPending(restoreBackend)
-				slotManager.SetCacheWaitPending(restoreBackend, cur-1)
-			}
-			slotManager.SetCacheWaitPending(restoreBackend, pending+1)
-			elapsed := 0.0
-			for elapsed < waitTimeout {
-				if err := ctxSleep(ctx, math.Min(5.0, waitTimeout-elapsed)); err != nil {
-					decPending()
-					return GSlot{}, nil, skipRestoreDiag, nil, err
-				}
-				elapsed += 5.0
-				if g, restored, prevKV, ok := tryCacheBackend(); ok {
-					decPending()
-					return g, restored, skipRestoreDiag, prevKV, nil
-				}
-			}
-			decPending()
-		}
-	}
-
-	// Retry forever until a slot frees (aborts only on context cancellation)
-	attempt := 0
-	for {
-		if restoreBackend != "" && hitType != nil && promptTokens < backendManager.GetBackendNCtx(canonicalName, restoreBackend) {
-			if g, restored, prevKV, ok := tryCacheBackend(); ok {
-				return g, restored, skipRestoreDiag, prevKV, nil
-			}
-		}
-		for _, cb := range candidateBackends {
-			if cb.ModelName == "" {
-				continue
-			}
-			if promptTokens >= backendManager.GetBackendNCtx(cb.ModelName, cb.BackendID) {
-				continue
-			}
-			beSm := slotManager.Get(cb.BackendID)
-			slotID := beSm.TryAcquire(cb.ModelName)
-			if slotID == -1 {
-				continue
-			}
-			fbBlocks := backendBlocks[cb.BackendID]
-			prevKV := beSm.GetKVState(slotID)
-			logWarn("app", "[diag] fallback: slot %d, old_kv=%d, fb_blocks=%d", slotID, len(prevKV), len(fbBlocks))
-			if len(fbBlocks) == 0 {
-				fbBlocks = []string{}
-			}
-			beSm.SetKVState(slotID, fbBlocks)
-			restored := doRestoreCall(beSm, slotID, "", fbBlocks, prevKV)
-			backendManager.TouchBackend(cb.BackendID)
-			return GSlot{ModelName: cb.ModelName, BackendID: cb.BackendID, SlotID: slotID}, restored, skipRestoreDiag, prevKV, nil
-		}
-		attempt++
-		backoff := float64(attempt) * SlotAcquireRetryBaseSeconds
-		logInfo("app", "No slots available across all backends, retrying in %ds (attempt %d)", int(backoff), attempt)
-		if err := ctxSleep(ctx, backoff); err != nil {
-			return GSlot{}, nil, skipRestoreDiag, nil, err
-		}
-		// Re-derive candidates so backends/models that came online during
-		// the wait (liveness loop discovery) are considered, and backends
-		// that went offline drop out.
-		candidateBackends = rebuild()
-	}
-}
-
+// ChatHandler parses the request, records arrival metrics, hands it to the
+// global matcher, and blocks until the response is complete (or the client
+// disconnects, which cancels the request context the worker watches).
 func ChatHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
@@ -518,430 +328,34 @@ func ChatHandler(w http.ResponseWriter, r *http.Request) {
 		"summarization_signals": reqClass.Signals,
 	})
 
-	options := backendManager.GetDiscoveredModels(clientModel)
-	if len(options) == 0 {
-		_ = backendManager.DiscoverModels()
-		options = backendManager.GetDiscoveredModels(clientModel)
+	d := GetDispatcher()
+	d.Start()
+	reqCtx, reqCancel := context.WithCancel(r.Context())
+	req := &ProcRequest{
+		w:             w,
+		r:             r,
+		ctx:           reqCtx,
+		cancel:        reqCancel,
+		requestJSON:   requestJSON,
+		messages:      messages,
+		stream:        stream,
+		clientModel:   clientModel,
+		requestID:     requestID,
+		promptPreview: promptPreview,
+		reqClass:      reqClass,
+		t0:            t0,
+		ip:            ip,
+		done:          make(chan struct{}),
 	}
-	if len(options) == 0 {
+	if !d.Submit(req) {
 		recordEarlyError(requestID, clientModel, t0)
-		WriteJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("model '%s' not found", clientModel)})
+		WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "shutting down"})
 		return
 	}
-
-	firstOpt := options[0]
-	if len(firstOpt.Backends) == 0 {
-		recordEarlyError(requestID, clientModel, t0)
-		WriteJSON(w, http.StatusBadGateway, map[string]any{"error": "backend unavailable"})
-		return
+	select {
+	case <-req.done:
+	case <-r.Context().Done():
 	}
-	firstBeID := firstOpt.Backends[0]
-	firstClient := backendManager.GetClient(firstBeID)
-	templated, err := firstClient.ApplyChatTemplate(r.Context(), messages)
-	if err != nil {
-		handleTokenizeError(w, requestID, clientModel, t0, err)
-		return
-	}
-	firstTokenIDs, err := firstClient.Tokenize(r.Context(), templated, true)
-	if err != nil {
-		handleTokenizeError(w, requestID, clientModel, t0, err)
-		return
-	}
-
-	promptTokens := len(firstTokenIDs)
-	minCtx := options[0].NCtx
-	for _, opt := range options[1:] {
-		if opt.NCtx < minCtx {
-			minCtx = opt.NCtx
-		}
-	}
-	if promptTokens >= minCtx {
-		recordEarlyError(requestID, clientModel, t0)
-		WriteJSON(w, http.StatusBadRequest, map[string]any{
-			"error": fmt.Sprintf("prompt too long (tokens=%d, n_ctx=%d)", promptTokens, minCtx),
-		})
-		return
-	}
-	canonicalName := firstOpt.Name
-
-	restoreKey := ""
-	restoreBackend := ""
-	bestRatio := 0.0
-	var hitType *CacheHitType
-
-	scanDiagnostics := []map[string]any{}
-	backendCacheRatios := map[string]float64{}
-	backendTokenIDs := map[string][]int{}
-	backendBlocks := map[string][]string{}
-
-	for _, opt := range options {
-		for _, beID := range opt.Backends {
-			optClient := backendManager.GetClient(beID)
-			var optTokenIDs []int
-			optTemplated, tErr := optClient.ApplyChatTemplate(r.Context(), messages)
-			if tErr == nil {
-				optTokenIDs, tErr = optClient.Tokenize(r.Context(), optTemplated, true)
-			}
-			if tErr != nil {
-				if errors.Is(tErr, ErrConn) {
-					logWarn("app", "Backend %s error, skipping for model '%s' from client %s", beID, opt.Name, ip)
-					scanDiagnostics = append(scanDiagnostics, map[string]any{
-						"model":   opt.Name,
-						"backend": beID,
-						"status":  "unreachable",
-					})
-					continue
-				}
-				logError("app", "Backend %s scan error for model '%s' from client %s: %v", beID, opt.Name, ip, tErr)
-				recordEarlyError(requestID, clientModel, t0)
-				WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": tErr.Error()})
-				return
-			}
-			optBlocks := BlockHashesFromTokens(optTokenIDs, WordsPerBlock)
-			backendTokenIDs[beID] = optTokenIDs
-			backendBlocks[beID] = optBlocks
-			diagEntry := map[string]any{
-				"model":    opt.Name,
-				"backend":  beID,
-				"n_blocks": len(optBlocks),
-				"n_tokens": len(optTokenIDs),
-			}
-
-			if backendManager.CacheEnabled(beID) {
-				if candKey, candRatio, found := kvMeta.FindBestRestoreCandidate(optBlocks, WordsPerBlock, LCPTh, opt.Name, beID); found {
-					diagEntry["cache_file_key"] = key16(candKey)
-					diagEntry["cache_file_ratio"] = round4(candRatio)
-					if candRatio > bestRatio {
-						bestRatio = candRatio
-						restoreKey = candKey
-						restoreBackend = beID
-						canonicalName = opt.Name
-						dt := CacheHitDiskRestore
-						hitType = &dt
-						logInfo("app", "Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f) — replacing previous best",
-							key16(restoreKey), canonicalName, restoreBackend, bestRatio)
-					}
-				} else {
-					diagEntry["cache_file_ratio"] = nil
-				}
-
-				beSm := slotManager.Get(beID)
-				pendingRatios := []map[string]any{}
-				for slotID, kvBlocks := range beSm.GetKVStates() {
-					if len(optBlocks) < len(kvBlocks)-1 {
-						pendingRatios = append(pendingRatios, map[string]any{
-							"slot": slotID, "lcp_blocks": 0, "slot_blocks": len(kvBlocks), "ratio": 0.0,
-						})
-						continue
-					}
-					lcp := 0
-					var ratio float64
-					if len(optBlocks) > 0 {
-						lcp = LCPBlocks(optBlocks, kvBlocks)
-						ratio = float64(lcp) / float64(len(optBlocks))
-					}
-					pendingRatios = append(pendingRatios, map[string]any{
-						"slot": slotID, "lcp_blocks": lcp, "slot_blocks": len(kvBlocks), "ratio": round4(ratio),
-					})
-					if ratio >= LCPTh && ratio >= bestRatio {
-						bestRatio = ratio
-						restoreKey = ""
-						restoreBackend = beID
-						canonicalName = opt.Name
-						dt := CacheHitSkip
-						hitType = &dt
-						logInfo("app", "Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
-							canonicalName, restoreBackend, slotID, ratio)
-					}
-				}
-				diagEntry["pending_slots"] = pendingRatios
-			} else {
-				diagEntry["cache_file_ratio"] = nil
-				diagEntry["pending_slots"] = []map[string]any{}
-			}
-			scanDiagnostics = append(scanDiagnostics, diagEntry)
-
-			beBest := 0.0
-			if v, okV := diagEntry["cache_file_ratio"].(float64); okV {
-				beBest = v
-			}
-			if psList, okV := diagEntry["pending_slots"].([]map[string]any); okV {
-				for _, ps := range psList {
-					if v, okV := ps["ratio"].(float64); okV && v > beBest {
-						beBest = v
-					}
-				}
-			}
-			if beBest > 0 {
-				backendCacheRatios[beID] = beBest
-			}
-		}
-	}
-
-	logInfo("app", "Chat request from %s: model '%s', %d tokens, restore key=%v on backend %s",
-		ip, clientModel, promptTokens, key16OrNil(restoreKey), restoreBackend)
-
-	reqType := "conversation"
-	if reqClass.Score >= 0.4 {
-		reqType = "summarization"
-	}
-
-	buildCandidateBackends := func(opts []*DiscoveredModel) []candidateBackend {
-		cbs := []candidateBackend{}
-		for _, opt := range opts {
-			for _, beID := range opt.Backends {
-				if restoreBackend != "" && beID == restoreBackend {
-					continue
-				}
-				cbs = append(cbs, candidateBackend{BackendID: beID, ModelName: opt.Name})
-			}
-		}
-		ringSizeOf := func(beID string) int {
-			if slotManager.HasBackend(beID) {
-				return slotManager.Get(beID).GetRingSize()
-			}
-			return 0
-		}
-		sort.SliceStable(cbs, func(i, j int) bool {
-			a, b := cbs[i], cbs[j]
-			ar, br := backendCacheRatios[a.BackendID], backendCacheRatios[b.BackendID]
-			if ar != br {
-				return ar < br
-			}
-			au, bu := backendManager.GetBackendLastUsed(a.BackendID), backendManager.GetBackendLastUsed(b.BackendID)
-			if au != bu {
-				return au < bu
-			}
-			ari, bri := ringSizeOf(a.BackendID), ringSizeOf(b.BackendID)
-			if ari != bri {
-				return ari < bri
-			}
-			return backendManager.GetBackendModelLatencyEMA(a.BackendID, a.ModelName, reqType) <
-				backendManager.GetBackendModelLatencyEMA(b.BackendID, b.ModelName, reqType)
-		})
-		return cbs
-	}
-	// Re-resolves models from the backend manager on each retry so the
-	// fallback set reflects backends that came online (or offline) while
-	// this request waits for a slot.
-	rebuildCandidates := func() []candidateBackend {
-		return buildCandidateBackends(backendManager.GetDiscoveredModels(clientModel))
-	}
-	candidateBackends := buildCandidateBackends(options)
-
-	g, restored, skipRestoreDiag, prevKV, acqErr := acquireSlotForRequest(
-		r.Context(), candidateBackends, rebuildCandidates, restoreBackend, canonicalName, hitType, restoreKey, backendBlocks, promptTokens,
-	)
-	if acqErr != nil {
-		logError("app", "Could not acquire slot from client %s for model '%s': %v", ip, clientModel, acqErr)
-		recordEarlyError(requestID, clientModel, t0)
-		WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "all slots busy, please retry later"})
-		return
-	}
-
-	modelName := g.ModelName
-	beID := g.BackendID
-	slotID := g.SlotID
-	client := backendManager.GetClient(beID)
-	beSm := slotManager.Get(beID)
-
-	servingTokenIDs := backendTokenIDs[beID]
-	if len(servingTokenIDs) == 0 {
-		servingTokenIDs = firstTokenIDs
-	}
-	key := MetaKey(modelName, servingTokenIDs)
-	blocks := BlockHashesFromTokens(servingTokenIDs, WordsPerBlock)
-
-	var routingReason string
-	switch {
-	case hitType != nil && *hitType == CacheHitSkip && beID == restoreBackend:
-		routingReason = "pending_slot_hit"
-	case hitType != nil && *hitType == CacheHitDiskRestore && beID == restoreBackend:
-		routingReason = "cache_hit"
-	case hitType == nil:
-		routingReason = "no_cache_entry"
-	default:
-		routingReason = "cache_backend_unavailable"
-	}
-
-	if restoreKey == "" && restoreBackend == "" {
-		logInfo("app", "No cache hit: using key '%s' for model '%s' (client model '%s')", key16(key), modelName, clientModel)
-	}
-	logInfo("app", "Slot acquired: model '%s' on backend '%s' slot %d, restored=%v, save_key='%s', canonical_name='%s'",
-		modelName, beID, slotID, restored, key16(key), canonicalName)
-
-	candidateIDs := make([]string, 0, len(candidateBackends))
-	for _, cb := range candidateBackends {
-		candidateIDs = append(candidateIDs, cb.BackendID)
-	}
-	Metrics.Record(map[string]any{
-		"request_id":     requestID,
-		"model":          modelName,
-		"backend":        beID,
-		"slot_id":        slotID,
-		"routing_reason": routingReason,
-		"cache_hit":      hitType != nil,
-		"restored":       restored,
-		"status":         "incomplete",
-		"routing_diagnostics": map[string]any{
-			"best_ratio":           round4(bestRatio),
-			"restore_key":          key16OrNil(restoreKey),
-			"restore_backend":      strOrNone(restoreBackend),
-			"restore_info_backend": strOrNone(restoreBackend),
-			"candidate_backends":   candidateIDs,
-			"scan":                 scanDiagnostics,
-			"skip_restore":         skipRestoreDiag,
-		},
-	})
-
-	body := make(map[string]any, len(requestJSON)+3)
-	for k, v := range requestJSON {
-		body[k] = v
-	}
-	body["model"] = canonicalName
-	opts := map[string]any{}
-	if existingOpts, okOpts := requestJSON["options"].(map[string]any); okOpts {
-		for k, v := range existingOpts {
-			opts[k] = v
-		}
-	}
-	opts["slot_id"] = slotID
-	opts["id_slot"] = slotID
-	opts["n_keep"] = -1
-	opts["cache_prompt"] = true
-	body["options"] = opts
-	body["n_keep"] = -1
-	body["cache_prompt"] = true
-
-	logInfo("app", "Dispatching request from client %s: model '%s' on backend '%s' slot %d, restore=%v, restored=%v",
-		ip, modelName, beID, slotID, key16OrNil(restoreKey), restored)
-
-	if stream {
-		serveStream(w, r, requestJSON, body, beID, slotID, modelName, key, blocks, promptTokens,
-			bestRatio, hitType, restoreKey, restoreBackend, backendCacheRatios, reqClass.Score,
-			requestID, routingReason, promptPreview, prevKV, t0, messages)
-		return
-	}
-
-	released := false
-	defer func() {
-		if !released {
-			beSm.Release(slotID)
-		}
-	}()
-
-	out, err := client.ChatCompletions(r.Context(), body, slotID)
-	if err != nil {
-		if errors.Is(err, ErrTimeout) {
-			logError("app", "Chat timeout for client %s, model '%s' on backend '%s' slot %d (key %s): %v",
-				ip, modelName, beID, slotID, key16(key), err)
-			recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-			WriteJSON(w, http.StatusGatewayTimeout, map[string]any{"error": err.Error()})
-			return
-		}
-		if errors.Is(err, ErrConn) {
-			logError("app", "Backend connection error for client %s, model '%s' on backend '%s' slot %d (key %s): %v",
-				ip, modelName, beID, slotID, key16(key), err)
-			restorePrevKV(beSm, slotID, prevKV, modelName, beID)
-			beSm.Release(slotID)
-			released = true
-			recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-			WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend connection failed"})
-			return
-		}
-		logError("app", "Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %v",
-			ip, modelName, beID, slotID, key16(key), err)
-		restorePrevKV(beSm, slotID, prevKV, modelName, beID)
-		recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	if out == nil {
-		restorePrevKV(beSm, slotID, prevKV, modelName, beID)
-		recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
-		WriteJSON(w, http.StatusBadGateway, map[string]any{"error": "provider non-JSON body"})
-		return
-	}
-
-	saveOK := false
-	cacheSize := 0
-	recomputeHappened := false
-	llmPromptTokens := 0
-	cachedTokens := 0
-	if hitType != nil {
-		usage, _ := out["usage"].(map[string]any)
-		if usage == nil {
-			usage = map[string]any{}
-		}
-		ptDetails, _ := usage["prompt_tokens_details"].(map[string]any)
-		if ptDetails == nil {
-			ptDetails = map[string]any{}
-		}
-		cachedTokens = intFromAny(ptDetails["cached_tokens"])
-		llmPromptTokens = intFromAny(usage["prompt_tokens"])
-		logInfo("app", "Recompute check for model '%s' slot %d: cached_tokens=%d, request_prompt_tokens=%d (llm=%d), ratio=%.3f",
-			modelName, slotID, cachedTokens, promptTokens, llmPromptTokens, bestRatio)
-		var cacheMeta map[string]any
-		if restoreKey != "" {
-			cacheMeta = kvMeta.ReadMeta(restoreKey, restoreBackend)
-		}
-		cacheNTokens := metaNTokens(cacheMeta, llmPromptTokens)
-		if isRecompute(cachedTokens, llmPromptTokens, cacheNTokens) {
-			recomputeHappened = true
-			logWarn("app", "Recompute detected for model '%s' on backend '%s' slot %d (key %s): cached_tokens=%d llm_prompt_tokens=%d cache_n_tokens=%d, KV cache restore was partial/useless",
-				modelName, beID, slotID, key16(key), cachedTokens, llmPromptTokens, cacheNTokens)
-			if restoreKey != "" && restoreBackend != "" {
-				kvMeta.IncrementRecomputePenalty(restoreKey, restoreBackend)
-			}
-		}
-	}
-
-	servingBeRatio := backendCacheRatios[beID]
-	skipEntry := &SaveSkipEntry{
-		Key:          key,
-		Blocks:       blocks,
-		NTokens:      promptTokens,
-		HitType:      hitType,
-		ServingRatio: servingBeRatio,
-		Recompute:    recomputeHappened,
-		Legacy:       false,
-	}
-	if ShouldSkipSaveHeuristic(promptTokens, backendManager.GetBackendNCtx(modelName, beID), messages, requestJSON) {
-		beSm.MarkSaveSkipped(slotID, skipEntry)
-	} else if ShouldSaveCache(servingBeRatio, recomputeHappened) {
-		saveOK, cacheSize = beSm.SaveAfter(modelName, slotID, key, blocks, promptTokens)
-	} else {
-		beSm.MarkSaveSkipped(slotID, skipEntry)
-	}
-
-	latency := latencyMS(t0)
-	cacheSizeBytes := 0
-	if saveOK {
-		cacheSizeBytes = cacheSize
-	}
-	Metrics.Record(map[string]any{
-		"request_id":       requestID,
-		"t0":               t0,
-		"request_json":     requestJSON,
-		"model":            modelName,
-		"backend":          beID,
-		"slot_id":          slotID,
-		"cache_hit":        hitType != nil,
-		"restored":         restored,
-		"recompute":        recomputeHappened,
-		"saved":            saveOK,
-		"latency_ms":       latency,
-		"n_tokens":         llmPromptTokens,
-		"cached_tokens":    cachedTokens,
-		"stream":           false,
-		"cache_size_bytes": cacheSizeBytes,
-		"prompt_preview":   promptPreview,
-		"routing_reason":   routingReason,
-		"status":           "complete",
-	})
-	backendManager.UpdateBackendLatency(beID, latency)
-	backendManager.UpdateBackendModelLatency(beID, modelName, latency, reqType)
-	WriteJSON(w, http.StatusOK, out)
 }
 
 func metricsDashboardHandler(w http.ResponseWriter, r *http.Request) {
@@ -950,6 +364,7 @@ func metricsDashboardHandler(w http.ResponseWriter, r *http.Request) {
 	summary["slots"] = getSlotStatus()
 	summary["cache"] = getCacheStats()
 	summary["backend_model_performance"] = backendManager.GetAllLatencyEMA()
+	summary["queues"] = GetDispatcher().QueuesSnapshot()
 	WriteJSON(w, http.StatusOK, summary)
 }
 
@@ -1067,11 +482,12 @@ func getBackendHealth() map[string]any {
 			}
 		}
 		result[key] = map[string]any{
-			"url":       info.URL,
-			"up":        backendManager.GetBackendState(key),
-			"cache_dir": info.CacheDir,
-			"has_agent": info.HasAgent,
-			"models":    modelsMap,
+			"url":         info.URL,
+			"up":          backendManager.GetBackendState(key),
+			"cache_dir":   info.CacheDir,
+			"has_agent":   info.HasAgent,
+			"queue_depth": GetDispatcher().QueueDepth(key),
+			"models":      modelsMap,
 		}
 	}
 	return result
@@ -1343,6 +759,7 @@ func (ss *StreamState) save() (bool, int) {
 		logInfo("app", "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): heuristic skip", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
 		ss.beSm.MarkSaveSkipped(ss.slotID, &SaveSkipEntry{
 			Key:          ss.key,
+			Model:        ss.modelName,
 			Blocks:       ss.blocks,
 			NTokens:      ss.nTokens,
 			HitType:      ss.hitType,
@@ -1356,6 +773,7 @@ func (ss *StreamState) save() (bool, int) {
 		logInfo("app", "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): restore ratio %.3f >= threshold (no recompute, cache was useful)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort, servingBeRatio)
 		ss.beSm.MarkSaveSkipped(ss.slotID, &SaveSkipEntry{
 			Key:          ss.key,
+			Model:        ss.modelName,
 			Blocks:       ss.blocks,
 			NTokens:      ss.nTokens,
 			HitType:      ss.hitType,

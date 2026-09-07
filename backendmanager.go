@@ -176,6 +176,14 @@ func (bm *BackendManager) GetAgent(key string) *CacheAgentClient {
 	return be.AgentClient
 }
 
+// Info returns the internal registry entry for a backend (nil if unknown).
+// Fields are immutable after construction, so the pointer is safe to share.
+func (bm *BackendManager) Info(key string) *BackendInfo {
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	return bm.Backends[key]
+}
+
 // GetCacheDir returns the local cache dir ("" for agent backends).
 func (bm *BackendManager) GetCacheDir(key string) string {
 	bm.Mu.RLock()
@@ -831,6 +839,18 @@ func (bm *BackendManager) GetDiscoveredModels(modelName string) []*DiscoveredMod
 	return out
 }
 
+// ServesModel reports whether the registry currently lists backendKey as a
+// backend for the exact canonical model name (false if unknown).
+func (bm *BackendManager) ServesModel(canonicalName, backendKey string) bool {
+	bm.Mu.RLock()
+	defer bm.Mu.RUnlock()
+	info, ok := bm.DiscoveredModels[canonicalName]
+	if !ok {
+		return false
+	}
+	return containsString(info.Backends, backendKey)
+}
+
 // --- Slot counts ---
 
 // RefreshSlotCounts queries slot counts for every discovered model+backend
@@ -1145,6 +1165,9 @@ func (bm *BackendManager) livenessLoop(ctx context.Context) {
 				"state_changes":     stateChanges,
 				"discovered_models": DiscoveredModels,
 			})
+			// Backend set changed — let the matcher re-examine requests parked
+			// in the overflow queue against the fresh discovery.
+			GetDispatcher().notify()
 		}
 
 		// Record a diagnostic event only when something noteworthy happened,

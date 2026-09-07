@@ -9,8 +9,8 @@ description: Metrics collector with multi-phase request recording, routing diagn
 
 Requests flow through multiple recording phases, all updating the same ring buffer entry in-place via `request_id` matching.
 
-1. **Arrival**: `chatHandler()` generates `requestID` (`newRequestID()`, UUID) and calls `Metrics.Record()` with `status="incomplete"`, `prompt_preview`, `request_json`, and the request classification fields. The entry is appended to the ring buffer.
-2. **Routing**: After slot acquisition, `Metrics.Record()` updates the entry with resolved `model` (canonical name), `backend`, `slot_id`, `routing_reason`, `cache_hit`, `restored`, and `routing_diagnostics`. Status remains `"incomplete"`.
+1. **Arrival**: `ChatHandler()` generates `requestID` (`newRequestID()`, UUID) and calls `Metrics.Record()` with `status="incomplete"`, `prompt_preview`, `request_json`, and the request classification fields. The entry is appended to the ring buffer.
+2. **Routing**: After slot acquisition on the per-backend worker, `Metrics.Record()` (in `processWorkerRequest`, `processor.go`) updates the entry with resolved `model` (canonical name), `backend`, `slot_id`, `routing_reason`, `cache_hit`, `restored`, and `routing_diagnostics`. Status remains `"incomplete"`.
 3. **Terminal**: The request reaches a final status:
    - **`"complete"`** — normal finish (streaming `StreamState.cleanup()` with `streamComplete=true`, or non-streaming success). Includes latency, tokens, save status, recompute.
    - **`"cancelled"`** — streaming request where client disconnected (`cancelled=true`, `streamComplete=false`).
@@ -31,16 +31,14 @@ Both event types are rate-limited for a reason: liveness events share the metric
 
 ## Routing Reasons
 
-Set after slot acquisition in `app.go`, explains why each request was dispatched to its chosen backend:
+Set after slot acquisition in `processor.go` (`processWorkerRequest`), explains why each request was dispatched to its chosen backend:
 
 | Reason | Meaning |
 |--------|---------|
-| `cache_hit` | Disk cache hit found, routed to that backend |
-| `pending_slot_hit` | In-flight slot found with better ratio, routed to that backend |
-| `no_cache_entry` | No cache entry found, first available backend |
-| `cache_backend_unavailable` | Cache hit found but desired backend was busy/unavailable, fell back |
-
-The `pending_slot_hit` flag is set when the pending slot scan finds a better ratio than the disk cache hit. It must be reset to `false` when a disk cache hit supersedes it in the per-backend loop.
+| `cache_hit` | Disk cache hit found, served on that backend |
+| `pending_slot_hit` | In-flight slot found with matching KV, served on that backend |
+| `no_cache_entry` | No cache entry found, round-robin fallback backend |
+| `cache_backend_unavailable` | Cache hit exists but the request was routed to a different (fallback) backend; a P2P transfer of the disk cache is triggered toward it |
 
 ## Routing Diagnostics
 
@@ -74,16 +72,18 @@ Captured during the routing phase (phase 2) and stored as `routing_diagnostics` 
                 {"slot": 0, "lcp_blocks": 515, "slot_blocks": 515, "ratio": 0.992}
             ]
         }
-    ]
+    ],
+    "p2p_transfer": false
 }
 ```
-(`skip_restore` is `{}` when skip-restore did not fire; absent `restore_key`/`restore_backend`/`restore_info_backend`/`cache_file_*` fields mean `null`.)
+(`skip_restore` is `{}` when skip-restore did not fire; absent `restore_key`/`restore_backend`/`restore_info_backend`/`cache_file_*` fields mean `null`; `p2p_transfer` is true when the matcher triggered a P2P cache transfer toward the serving backend.)
 
 **Key fields:**
 - `restore_key` is absent/`null` when a pending slot hit won (no disk restore needed)
 - `restore_info_backend` is absent/`null` when `restore_key` is null (no priority routing)
-- `candidate_backends` excludes the restore backend ONLY when `restore_key` is set (pending slot hits don't exclude)
+- `candidate_backends` excludes the primary hit's backend whenever a hit exists (disk or pending-slot)
 - `skip_restore` is populated (non-empty dict) when skip-restore fires, with `skipped=true`, block counts, and restore key. Empty dict `{}` means skip-restore did not fire.
+- `p2p_transfer` true → the request was routed away from the cache's backend; the worker bounded-waited for the transfer before restoring (see proxycache-architecture skill)
 - `scan` entries with `status="unreachable"` mean the backend was down during the cache scan
 - `pending_slots` lists all matching slots per backend with their LCP details
 
@@ -163,6 +163,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 - **Badge consolidation**: single routing badge per request (`DISK HIT`, `PENDING HIT`, `DISK HIT / RECOMPUTE`, `NO ENTRY`, `BACKEND UNAVAIL`). A conditional status badge (`INCOMPLETE`, `CANCELLED`, `BACKEND ERROR`) is shown only for non-complete requests.
 - **Sorting**: explicit timestamp sort (descending) in `_doRenderFilteredRequests()` ensures newest-first after client-side filtering.
 - **Pagination**: `currentPage` persisted in `localStorage`. Clamped to last valid page on refresh when ring buffer shrinks. Auto-refresh calls `refreshRequests()` without resetting page.
+- **Queue visibility**: `GetSummary()` includes per-backend `queue_depth` (queued, not in-flight) in each backend's health entry and a top-level `queues` snapshot (`QueuesSnapshot()`: per-backend depths + global `overflow` length), so the dashboard can show where requests are waiting.
 - **Embedding**: `dashboard.html` is embedded into the binary via `//go:embed` in `app.go` and served at `/dashboard`. It has no build step — edit the file and rebuild.
 
 ## Key Functions

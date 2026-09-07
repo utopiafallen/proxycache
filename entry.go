@@ -50,6 +50,7 @@ func Main() {
 	logInfo("main", "After startup reconcile: %d meta files, %d cache files on disk", metaCount, cacheFiles)
 
 	backendManager.StartLivenessChecker()
+	GetDispatcher().Start()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", ModelsHandler)
@@ -84,6 +85,7 @@ func Main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logError("main", "Graceful shutdown failed: %v", err)
 	}
+	GetDispatcher().Stop(10 * time.Second)
 	backendManager.StopLivenessChecker()
 	backendManager.Close()
 }

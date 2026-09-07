@@ -15,14 +15,6 @@ import (
 	"sync"
 )
 
-// GSlot identifies a slot acquired for a request:
-// (canonical_model_name, backend_id, slot_id).
-type GSlot struct {
-	ModelName string
-	BackendID string
-	SlotID    int
-}
-
 // CacheHitType — explicit routing decision that tells downstream what to do
 // with the slot.
 type CacheHitType string
@@ -45,6 +37,7 @@ type ringEntry struct {
 // (key, blocks, n_tokens, hit_type, serving_be_ratio, recompute_happened).
 type SaveSkipEntry struct {
 	Key          string
+	Model        string // canonical model name of the cached content
 	Blocks       []string
 	NTokens      int
 	HitType      *CacheHitType
@@ -362,7 +355,18 @@ func (b *BackendSlotManager) SaveAfter(modelName string, slotID int, key string,
 	if ok && size > 0 {
 		b.RingMu.Lock()
 		kvMeta.WriteMeta(key, nTokens, blocks, WordsPerBlock, modelName, b.BackendID, size)
-		b.CacheRing = append(b.CacheRing, ringEntry{Key: key, Size: int64(size), TS: NowFloat()})
+		replaced := false
+		for i := range b.CacheRing {
+			if b.CacheRing[i].Key == key {
+				b.totalBytes -= b.CacheRing[i].Size
+				b.CacheRing[i] = ringEntry{Key: key, Size: int64(size), TS: NowFloat()}
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			b.CacheRing = append(b.CacheRing, ringEntry{Key: key, Size: int64(size), TS: NowFloat()})
+		}
 		b.totalBytes += int64(size)
 		b.EvictIfNeeded()
 		b.RingMu.Unlock()
@@ -382,67 +386,16 @@ func (b *BackendSlotManager) EvictIfNeeded() {
 	}
 	now := NowFloat()
 
-	// Pass 1: drop ring entries whose meta/blocks are gone (orphaned).
-	blocksMap := map[string][]string{}
-	validRing := make([]ringEntry, 0, len(b.CacheRing))
-	for _, entry := range b.CacheRing {
-		blocks := kvMeta.GetBlocks(entry.Key, b.BackendID)
-		if len(blocks) > 0 {
-			blocksMap[entry.Key] = blocks
-			validRing = append(validRing, entry)
-		} else {
-			b.totalBytes -= entry.Size
-			logInfo("slot_manager", "Evicting orphaned ring entry '%s' for backend '%s' (%d bytes)",
-				truncateKey(entry.Key), b.BackendID, entry.Size)
-			b.deleteEntry(entry.Key, "ring_evict_orphan", fmt.Sprintf("(%d bytes)", entry.Size))
-		}
-	}
+	blocksMap, validRing := b.pruneOrphans()
 	b.CacheRing = validRing
 
 	if len(b.CacheRing) == 0 || float64(b.totalBytes) <= maxBytes {
 		return
 	}
 
-	type scored struct {
-		key   string
-		score float64
-	}
 	ringList := make([]ringEntry, len(b.CacheRing))
 	copy(ringList, b.CacheRing)
-	scoredList := make([]scored, 0, len(ringList))
-	for i, entry := range ringList {
-		stale := now - entry.TS
-		blocks := blocksMap[entry.Key]
-		if len(blocks) == 0 {
-			// Dead code path (orphans were removed above), ported for fidelity.
-			scoredList = append(scoredList, scored{entry.Key, stale * 2.0})
-			continue
-		}
-		maxLCPRatio := 0.0
-		for j, other := range ringList {
-			if i == j {
-				continue
-			}
-			otherBlocks := blocksMap[other.Key]
-			if len(otherBlocks) == 0 {
-				continue
-			}
-			lcp := LCPBlocks(blocks, otherBlocks)
-			denom := float64(len(blocks))
-			if denom < 1 {
-				denom = 1
-			}
-			ratio := float64(lcp) / denom
-			if ratio > maxLCPRatio {
-				maxLCPRatio = ratio
-			}
-		}
-		uniqueness := 1.0 - maxLCPRatio
-		scoredList = append(scoredList, scored{entry.Key, stale * (2.0 - uniqueness)})
-	}
-	sort.SliceStable(scoredList, func(i, j int) bool {
-		return scoredList[i].score > scoredList[j].score
-	})
+	scoredList := b.scoreEntries(ringList, blocksMap, now)
 
 	keysToEvict := map[string]bool{}
 	projected := b.totalBytes
@@ -497,6 +450,129 @@ func (b *BackendSlotManager) deleteEntry(key, logMsg, logExtra string) {
 		logWarn("slot_manager", "%s_agent_fail: %s", logMsg, truncateKey(key))
 	}
 	kvMeta.DeleteMetaFile(key)
+}
+
+type ringScored struct {
+	key   string
+	score float64
+}
+
+// pruneOrphans drops ring entries whose meta/blocks are gone. Returns the
+// blocks of surviving entries and the pruned ring. Must be called with RingMu held.
+func (b *BackendSlotManager) pruneOrphans() (map[string][]string, []ringEntry) {
+	blocksMap := map[string][]string{}
+	validRing := make([]ringEntry, 0, len(b.CacheRing))
+	for _, entry := range b.CacheRing {
+		blocks := kvMeta.GetBlocks(entry.Key, b.BackendID)
+		if len(blocks) > 0 {
+			blocksMap[entry.Key] = blocks
+			validRing = append(validRing, entry)
+		} else {
+			b.totalBytes -= entry.Size
+			logInfo("slot_manager", "Evicting orphaned ring entry '%s' for backend '%s' (%d bytes)",
+				truncateKey(entry.Key), b.BackendID, entry.Size)
+			b.deleteEntry(entry.Key, "ring_evict_orphan", fmt.Sprintf("(%d bytes)", entry.Size))
+		}
+	}
+	return blocksMap, validRing
+}
+
+// scoreEntries computes eviction scores for ring entries and returns them
+// sorted worst-first. Must be called with RingMu held.
+func (b *BackendSlotManager) scoreEntries(ringList []ringEntry, blocksMap map[string][]string, now float64) []ringScored {
+	scoredList := make([]ringScored, 0, len(ringList))
+	for i, entry := range ringList {
+		stale := now - entry.TS
+		blocks := blocksMap[entry.Key]
+		if len(blocks) == 0 {
+			// Dead code path (orphans were removed above), ported for fidelity.
+			scoredList = append(scoredList, ringScored{entry.Key, stale * 2.0})
+			continue
+		}
+		maxLCPRatio := 0.0
+		for j, other := range ringList {
+			if i == j {
+				continue
+			}
+			otherBlocks := blocksMap[other.Key]
+			if len(otherBlocks) == 0 {
+				continue
+			}
+			lcp := LCPBlocks(blocks, otherBlocks)
+			denom := float64(len(blocks))
+			if denom < 1 {
+				denom = 1
+			}
+			ratio := float64(lcp) / denom
+			if ratio > maxLCPRatio {
+				maxLCPRatio = ratio
+			}
+		}
+		uniqueness := 1.0 - maxLCPRatio
+		scoredList = append(scoredList, ringScored{entry.Key, stale * (2.0 - uniqueness)})
+	}
+	sort.SliceStable(scoredList, func(i, j int) bool {
+		return scoredList[i].score > scoredList[j].score
+	})
+	return scoredList
+}
+
+// AddTransferredEntry registers a cache file that arrived on this backend via
+// P2P transfer so it participates in ring eviction accounting. Must not be
+// called with RingMu held.
+func (b *BackendSlotManager) AddTransferredEntry(key string, size int64) {
+	b.RingMu.Lock()
+	defer b.RingMu.Unlock()
+	for _, e := range b.CacheRing {
+		if e.Key == key {
+			return
+		}
+	}
+	b.CacheRing = append(b.CacheRing, ringEntry{Key: key, Size: size, TS: NowFloat()})
+	b.totalBytes += size
+	logInfo("slot_manager", "Registered transferred cache entry '%s' for backend '%s' (%d bytes)",
+		truncateKey(key), b.BackendID, size)
+	b.EvictIfNeeded()
+}
+
+// MakeSpaceFor evicts worst-scored ring entries until `need` extra bytes fit
+// within the backend's cache budget (or the ring is empty). Used before a P2P
+// transfer lands on this backend.
+func (b *BackendSlotManager) MakeSpaceFor(need int64) {
+	b.RingMu.Lock()
+	defer b.RingMu.Unlock()
+	if need <= 0 {
+		return
+	}
+	maxBytes := float64(backendManager.GetCacheMaxSizeGB(b.BackendID)) * 1024 * 1024 * 1024
+	now := NowFloat()
+	blocksMap, validRing := b.pruneOrphans()
+	b.CacheRing = validRing
+	for b.totalBytes+need > int64(maxBytes) && len(b.CacheRing) > 0 {
+		scoredList := b.scoreEntries(b.CacheRing, blocksMap, now)
+		if len(scoredList) == 0 {
+			break
+		}
+		worst := scoredList[0]
+		idx := -1
+		for i := range b.CacheRing {
+			if b.CacheRing[i].Key == worst.key {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			delete(blocksMap, worst.key)
+			continue
+		}
+		entry := b.CacheRing[idx]
+		b.totalBytes -= entry.Size
+		delete(blocksMap, entry.Key)
+		b.CacheRing = append(b.CacheRing[:idx], b.CacheRing[idx+1:]...)
+		logInfo("slot_manager", "P2P make-space: evicted '%s' for backend '%s' (%d bytes, score=%.0f, remaining=%d)",
+			truncateKey(entry.Key), b.BackendID, entry.Size, worst.score, b.totalBytes)
+		b.deleteEntry(entry.Key, "p2p_make_space", fmt.Sprintf("(%d bytes)", entry.Size))
+	}
 }
 
 // InitFromDisk rebuilds the in-memory ring buffer from disk.
@@ -640,17 +716,15 @@ type BackendSlotKey struct {
 // SlotManager — global coordinator: per-backend managers + cross-backend state.
 type SlotManager struct {
 	Mu sync.Mutex
-	// backends and cacheWaitPending are guarded by Mu.
-	backends         map[string]*BackendSlotManager
-	backendOrder     []string // first-seen insertion order (dict-order parity)
-	cacheWaitPending map[string]int
+	// backends and backendOrder are guarded by Mu.
+	backends     map[string]*BackendSlotManager
+	backendOrder []string // first-seen insertion order (dict-order parity)
 }
 
 func NewSlotManager() *SlotManager {
 	return &SlotManager{
-		backends:         map[string]*BackendSlotManager{},
-		backendOrder:     []string{},
-		cacheWaitPending: map[string]int{},
+		backends:     map[string]*BackendSlotManager{},
+		backendOrder: []string{},
 	}
 }
 
@@ -737,20 +811,6 @@ func (s *SlotManager) RefreshSlotCounts() {
 			beSm.EnsurePool(modelName, nSlots)
 		}
 	}
-}
-
-// GetCacheWaitPending returns the current pending-waiter count for a backend.
-func (s *SlotManager) GetCacheWaitPending(backendID string) int {
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
-	return s.cacheWaitPending[backendID]
-}
-
-// SetCacheWaitPending sets the pending-waiter count for a backend.
-func (s *SlotManager) SetCacheWaitPending(backendID string, n int) {
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
-	s.cacheWaitPending[backendID] = n
 }
 
 // slotManager is the global instance (created in app startup).

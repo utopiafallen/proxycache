@@ -248,6 +248,16 @@ header .controls select, header .controls button {
 .slot-cell.in-use { background: var(--green); color: white; }
 .slot-cell.free { background: var(--gray-bg); color: var(--gray); border: 1px solid var(--border); }
 .slot-cell.restoring { background: var(--blue); color: white; }
+
+/* Request queue state */
+.queue-row { display: flex; align-items: center; gap: 3px; margin: 2px 0 6px 18px; }
+.queue-label { font-size: 11px; color: var(--text-secondary); margin-right: 2px; }
+.queue-seg { width: 12px; height: 12px; border-radius: 2px; background: var(--gray-bg); border: 1px solid var(--border); display: inline-block; }
+.queue-seg.on { background: var(--green); border-color: var(--green); }
+.queue-seg.full { background: var(--red); border-color: var(--red); }
+.queue-seg.running { background: var(--blue); border-color: var(--blue); color: white; font-size: 8px; display: inline-flex; align-items: center; justify-content: center; }
+.queue-count { font-size: 11px; color: var(--text-secondary); margin-left: 4px; font-family: var(--mono); }
+.overflow-chip { background: var(--red-bg); color: var(--red); font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 4px; margin-bottom: 12px; }
   white-space: nowrap;
   z-index: 10;
   pointer-events: none;
@@ -505,7 +515,7 @@ async function fetchMetrics() {
     const resp = await fetch(API_BASE + '/metrics/dashboard');
     if (!resp.ok) return;
     const data = await resp.json();
-    renderBackendHealth(data.backends || {}, data.cache || {}, data.slots || {}, data.backend_model_performance || {});
+    renderBackendHealth(data.backends || {}, data.cache || {}, data.slots || {}, data.backend_model_performance || {}, data.queues || {});
     renderCachePerformance(data.performance || {}, data.backend_performance || {}, data);
     updateBackendFilter(data.backends || {});
     if (!expandedRequests.size) {
@@ -567,13 +577,19 @@ function updateBackendFilter(backends) {
   sel.innerHTML = options.join('');
 }
 
-function renderBackendHealth(backends, cache, slots, backendModelPerf) {
+function renderBackendHealth(backends, cache, slots, backendModelPerf, queues) {
   const el = document.getElementById('backendHealth');
   if (!Object.keys(backends).length) {
     el.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;">No backends configured</p>';
     return;
   }
-  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(250px, 1fr));gap:24px;">';
+  let html = '';
+  const overflow = (queues && typeof queues.overflow === 'number') ? queues.overflow : 0;
+  if (overflow > 0) {
+    html += `<div class="overflow-chip">OVERFLOW: ${overflow} request(s) parked in the global queue — all backend queues full</div>`;
+  }
+  const qmax = (queues && typeof queues.queue_max === 'number') ? queues.queue_max : 5;
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(250px, 1fr));gap:24px;">';
   const now = Date.now() / 1000;
   for (const [key, info] of Object.entries(backends)) {
     const uptime = info.up ? 'UP' : 'DOWN';
@@ -585,13 +601,31 @@ function renderBackendHealth(backends, cache, slots, backendModelPerf) {
       </div>
       <div class="cache-backend">${cacheInfo.total_gb} / ${cacheInfo.max_gb} GB &middot; ${cacheInfo.ring_size} files${cacheInfo.cache_dir ? ` &middot; ${cacheInfo.cache_dir}` : ''}</div>
     </div>` : '';
+    // Per-backend request queue: one cell for the in-flight request (if any),
+    // then one segment per queued slot up to the cap.
+    const q = (queues && queues[key] && typeof queues[key].queued === 'number')
+      ? queues[key]
+      : { queued: info.queue_depth || 0, in_flight: 0 };
+    let segs = '';
+    for (let i = 0; i < qmax; i++) {
+      if (i < q.queued) {
+        segs += `<span class="queue-seg ${q.queued >= qmax ? 'full' : 'on'}" data-tooltip="${i + 1} of ${q.queued} queued request(s)"></span>`;
+      } else {
+        segs += `<span class="queue-seg" data-tooltip="free queue slot"></span>`;
+      }
+    }
+    const runCell = q.in_flight ? `<span class="queue-seg running" data-tooltip="request in flight on this backend">&#9654;</span>` : '';
+    const queueHtml = `<div class="queue-row">
+      <span class="queue-label">queue:</span>${runCell}${segs}
+      <span class="queue-count">${q.queued}/${qmax}</span>
+    </div>`;
     html += `<div style="flex:1;min-width:250px;">`;
     html += `<div class="backend-item" style="margin-bottom:4px;">
       <span class="backend-dot ${dotClass}"></span>
       <span class="backend-name">${key}</span>
       <span class="backend-status">${uptime}</span>
     </div>
-    ${cacheHtml}`;
+    ${queueHtml}${cacheHtml}`;
     if (info.models) {
       for (const [modelName, modelInfo] of Object.entries(info.models)) {
         // Get slot status for this model/backend

@@ -34,6 +34,9 @@ func withTestBackend(t *testing.T, cfg []map[string]any) *proxycache.BackendMana
 	bm := proxycache.NewBackendManager(cfg)
 	proxycache.SetBackendManager(bm)
 	t.Cleanup(func() {
+		// Detach any worker goroutines still referencing this backend
+		// manager before it is swapped back out.
+		proxycache.GetDispatcher().AbortAll(5 * time.Second)
 		bm.Close()
 		proxycache.SetBackendManager(old)
 	})
@@ -190,10 +193,14 @@ func TestPoolResize(t *testing.T) {
 	}
 }
 
-func TestGSlotAndCacheHitTypes(t *testing.T) {
-	g := proxycache.GSlot{ModelName: "M", BackendID: "127.0.0.1-8000", SlotID: 2}
-	if g.ModelName != "M" || g.BackendID != "127.0.0.1-8000" || g.SlotID != 2 {
-		t.Errorf("GSlot fields = %+v", g)
+func TestRoutingTypes(t *testing.T) {
+	c := proxycache.CandidateBackend{ModelName: "M", BackendID: "127.0.0.1-8000"}
+	if c.ModelName != "M" || c.BackendID != "127.0.0.1-8000" {
+		t.Errorf("CandidateBackend fields = %+v", c)
+	}
+	h := &proxycache.HitInfo{Backend: "B", Canonical: "M"}
+	if h.Backend != "B" || h.Canonical != "M" {
+		t.Errorf("HitInfo fields = %+v", h)
 	}
 	if string(proxycache.CacheHitDiskRestore) != "disk_restore" || string(proxycache.CacheHitSkip) != "skip" {
 		t.Errorf("CacheHitType constants = %q/%q", proxycache.CacheHitDiskRestore, proxycache.CacheHitSkip)
@@ -401,18 +408,57 @@ func TestSaveSkippedMarkFlush(t *testing.T) {
 	}
 }
 
-func TestCacheWaitPending(t *testing.T) {
-	sm := proxycache.NewSlotManager()
-	if got := sm.GetCacheWaitPending("B1"); got != 0 {
-		t.Errorf("GetCacheWaitPending(new) = %d, want 0", got)
+func TestSlotManagerAddTransferredEntry(t *testing.T) {
+	withTempMetaDir(t)
+	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:8000", "cache_dir": t.TempDir()}})
+	beID := "127.0.0.1-8000"
+	bsm := proxycache.NewBackendSlotManager(beID)
+	proxycache.GetKVMeta().WriteMeta("kA", 10, blk("a", 2), 100, "m", beID, 300)
+	proxycache.GetKVMeta().WriteMeta("kB", 10, blk("b", 2), 100, "m", beID, 200)
+	bsm.AddTransferredEntry("kA", 300)
+	bsm.AddTransferredEntry("kB", 200)
+	if got := bsm.GetRingSize(); got != 2 {
+		t.Errorf("ring size = %d, want 2", got)
 	}
-	sm.SetCacheWaitPending("B1", 3)
-	if got := sm.GetCacheWaitPending("B1"); got != 3 {
-		t.Errorf("GetCacheWaitPending = %d, want 3", got)
+	if got := bsm.GetTotalBytes(); got != 500 {
+		t.Errorf("total bytes = %d, want 500", got)
 	}
-	sm.SetCacheWaitPending("B1", 0)
-	if got := sm.GetCacheWaitPending("B1"); got != 0 {
-		t.Errorf("GetCacheWaitPending after reset = %d, want 0", got)
+	// Duplicate registration is a no-op.
+	bsm.AddTransferredEntry("kA", 999)
+	if got := bsm.GetTotalBytes(); got != 500 {
+		t.Errorf("total bytes after dup = %d, want 500", got)
+	}
+}
+
+func TestSlotManagerMakeSpaceFor(t *testing.T) {
+	withTempMetaDir(t)
+	// ~1 KB budget so small entries trigger eviction.
+	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:8000", "cache_dir": t.TempDir(), "cache_max_size_gb": 0.000001}})
+	beID := "127.0.0.1-8000"
+	bsm := proxycache.NewBackendSlotManager(beID)
+	for _, k := range []string{"kA", "kB", "kC"} {
+		proxycache.GetKVMeta().WriteMeta(k, 10, blk(k, 2), 100, "m", beID, 300)
+		bsm.AddTransferredEntry(k, 300)
+	}
+	if got := bsm.GetTotalBytes(); got != 900 {
+		t.Fatalf("total bytes = %d, want 900", got)
+	}
+	// Need 500 more bytes of headroom: evict until total + 500 <= ~1074,
+	// i.e. total <= ~574 -> the two oldest entries go (kA, then kB).
+	bsm.MakeSpaceFor(500)
+	if got := bsm.GetRingSize(); got != 1 {
+		t.Errorf("ring size after make-space = %d, want 1", got)
+	}
+	if got := bsm.GetTotalBytes(); got != 300 {
+		t.Errorf("total bytes after make-space = %d, want 300", got)
+	}
+	for _, k := range []string{"kA", "kB"} {
+		if meta := proxycache.GetKVMeta().ReadMeta(k, beID); meta != nil {
+			t.Errorf("evicted entry %s still has meta, want deleted", k)
+		}
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta("kC", beID); meta == nil {
+		t.Errorf("surviving entry kC lost its meta")
 	}
 }
 

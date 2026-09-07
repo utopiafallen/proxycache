@@ -54,7 +54,6 @@ var (
 	SlotAcquireRetryBaseSeconds = EnvFloat("SLOT_ACQUIRE_RETRY_BASE_SECONDS", 5)
 	ClientRecreateInterval      = EnvInt("CLIENT_RECREATE_INTERVAL", 50)
 	CacheHitWaitEMAMinT         = EnvFloat("CACHE_HIT_WAIT_EMA_MIN_TIMEOUT", 10)
-	CacheHitWaitMaxPending      = EnvInt("CACHE_HIT_WAIT_MAX_PENDING_REQS", 3)
 	CacheHitWaitEMAAlpha        = EnvFloat("CACHE_HIT_WAIT_EMA_ALPHA", 0.2)
 	CacheHitWaitEMAInitialT     = EnvFloat("CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT", 30)
 	CacheHitWaitEMAMaxT         = EnvFloat("CACHE_HIT_WAIT_EMA_MAX_TIMEOUT", 300)
@@ -63,6 +62,25 @@ var (
 	MissingModelsRetryInterval  = EnvFloat("MISSING_MODELS_RETRY_INTERVAL", 30)
 	DashboardEnabled            = EnvBool("DASHBOARD_ENABLED", true)
 	LogLevel                    = os.Getenv("LOG_LEVEL")
+
+	// --- Request pipeline (matcher + per-backend queues) ---
+	// BackendQueueMax caps the number of queued (not yet processed) requests
+	// per backend. When a chosen backend's queue is full, the matcher parks
+	// the request in the global overflow queue until capacity frees up.
+	BackendQueueMax = EnvInt("BACKEND_QUEUE_MAX", 5)
+	// CacheHitQueueLimit caps how many queued requests the matcher will route
+	// to a cache-hit backend before falling back to round-robin distribution
+	// across the other matching backends (which triggers a P2P cache transfer).
+	CacheHitQueueLimit = EnvInt("CACHE_HIT_QUEUE_LIMIT", 2)
+	// CacheTransferTimeout bounds a single P2P transfer HTTP exchange.
+	CacheTransferTimeout = EnvFloat("CACHE_TRANSFER_TIMEOUT", 300)
+	// CacheTransferWait bounds how long the serving worker waits for an
+	// in-flight P2P transfer of its own request's cache key to complete
+	// before proceeding without a restore.
+	CacheTransferWait = EnvFloat("CACHE_TRANSFER_WAIT", 5)
+	// MatchScanTimeout bounds the tokenize/disk-scan phase run by the global
+	// matcher for one request.
+	MatchScanTimeout = EnvFloat("MATCH_SCAN_TIMEOUT", 15)
 )
 
 func init() {
