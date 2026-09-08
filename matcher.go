@@ -431,7 +431,7 @@ func (d *RequestDispatcher) migrateStale() {
 	type xfer struct{ src, dst, key string }
 	var transfers []xfer
 	for srcID, sw := range d.workers {
-		for i := range sw.queue {
+		for i := 0; i < len(sw.queue); i++ {
 			req := sw.queue[i]
 			if req.migratedFrom != "" || req.route == nil {
 				continue
@@ -455,6 +455,7 @@ func (d *RequestDispatcher) migrateStale() {
 			}
 			age := now.Sub(req.enqueuedAt)
 			sw.queue = append(sw.queue[:i], sw.queue[i+1:]...)
+			i--
 			tw := d.getWorkerLocked(target)
 			tw.queue = append(tw.queue, req)
 			req.enqueuedAt = now
