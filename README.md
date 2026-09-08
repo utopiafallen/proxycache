@@ -106,7 +106,7 @@ Each request record includes:
 - **Cache performance**: hit rate, mispredict rate (cache hit attempted but restore was partial/useless), utility rate, save rate, restore success rate
 - **Latency**: avg, p50, p95, p99 percentiles
 - **Per-model and per-backend breakdowns**
-- **Routing diagnostics**: per-backend cache scan results (cache file ratio, pending slot ratios, unreachable status), best match ratio, selected backend, candidate list, whether a P2P transfer was triggered, and `migrated_from` when the queue-migration monitor moved the request to an idle backend before it ran
+- **Routing diagnostics**: per-backend cache scan results (cache file ratio, pending slot ratios, unreachable status), best match ratio, selected backend, candidate list, whether a P2P transfer was triggered, `migrated_from` when the queue-migration monitor moved the request to an idle backend before it ran, and `cache_migrated` (true/false/null) indicating whether a migrated request's disk cache hit followed it to the target backend (restored or warm slot) or was lost to a recompute
 
 Metrics are recorded in three phases: arrival (status=`incomplete`), routing decision (backend, slot, routing reason), and completion (latency, cache hit/miss, save status). Streaming requests record metrics in `StreamState.cleanup()` after the full response lifecycle.
 

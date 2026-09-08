@@ -281,6 +281,16 @@ func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, s
 	restored, skipRestoreDiag := doWorkerRestore(beSm, slotID, restoreKey, blocks, prevKV, modelName, beID)
 	backendManager.TouchBackend(beID)
 
+	// For queue-migrated requests with a disk cache hit: did the cache follow
+	// the request to the target? True when the target restored from the (possibly
+	// transferred) disk key or skipped restore on an already-warm slot; false
+	// when the P2P transfer lost the bounded wait and the request recomputed.
+	// nil = not applicable (not migrated, or no disk key to carry).
+	cacheMigrated := any(nil)
+	if req.migratedFrom != "" && dec.diskRestoreKey != "" {
+		cacheMigrated = restoreKey != "" || skipRestoreDiag["skipped"] == true
+	}
+
 	servingTokenIDs := dec.backendTokenIDs[beID]
 	if len(servingTokenIDs) == 0 {
 		servingTokenIDs = dec.firstTokenIDs
@@ -344,6 +354,7 @@ func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, s
 			"skip_restore":         skipRestoreDiag,
 			"p2p_transfer":         dec.p2pTriggered,
 			"migrated_from":        strOrNone(req.migratedFrom),
+			"cache_migrated":       cacheMigrated,
 		},
 	})
 

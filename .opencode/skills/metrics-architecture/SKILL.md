@@ -74,10 +74,11 @@ Captured during the routing phase (phase 2) and stored as `routing_diagnostics` 
         }
     ],
     "p2p_transfer": false,
-    "migrated_from": null
+    "migrated_from": null,
+    "cache_migrated": null
 }
 ```
-(`skip_restore` is `{}` when skip-restore did not fire; absent `restore_key`/`restore_backend`/`restore_info_backend`/`cache_file_*` fields mean `null`; `p2p_transfer` is true when the matcher triggered a P2P cache transfer toward the serving backend; `migrated_from` names the source backend when the queue-migration monitor moved the request to an idle backend before it ran, else `null`.)
+(`skip_restore` is `{}` when skip-restore did not fire; absent `restore_key`/`restore_backend`/`restore_info_backend`/`cache_file_*` fields mean `null`; `p2p_transfer` is true when the matcher triggered a P2P cache transfer toward the serving backend; `migrated_from` names the source backend when the queue-migration monitor moved the request to an idle backend before it ran, else `null`; `cache_migrated` is `true`/`false` only for migrated requests that had a disk cache hit — `true` when the target restored from the (possibly transferred) disk key or skipped restore on an already-warm slot, `false` when the P2P transfer lost the bounded wait and the request recomputed; `null` otherwise.)
 
 **Key fields:**
 - `restore_key` is absent/`null` when a pending slot hit won (no disk restore needed)
@@ -86,6 +87,7 @@ Captured during the routing phase (phase 2) and stored as `routing_diagnostics` 
 - `skip_restore` is populated (non-empty dict) when skip-restore fires, with `skipped=true`, block counts, and restore key. Empty dict `{}` means skip-restore did not fire.
  - `p2p_transfer` true → the request was routed away from the cache's backend; the worker bounded-waited for the transfer before restoring (see proxycache-architecture skill)
  - `migrated_from` non-null → the queue-migration monitor moved the request off its original (busy) backend to an idle one after it had waited past `QUEUE_MIGRATION_AFTER`; the serving `backend` is the migration target, not the original routing choice
+- `cache_migrated` pairs with `migrated_from`: `true` = the request's disk cache hit was available on the target at run time (P2P transfer landed within `CACHE_TRANSFER_WAIT`, or the key already lived there, or skip-restore fired on a warm slot); `false` = the transfer lost the race and the request did a full recompute; `null` = not migrated or no disk key to carry
 - `scan` entries with `status="unreachable"` mean the backend was down during the cache scan
 - `pending_slots` lists all matching slots per backend with their LCP details
 
@@ -162,7 +164,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 
 ## Dashboard
 
-- **Badge consolidation**: single routing badge per request (`DISK HIT`, `PENDING HIT`, `DISK HIT / RECOMPUTE`, `NO ENTRY`, `BACKEND UNAVAIL`). A conditional status badge (`INCOMPLETE`, `CANCELLED`, `BACKEND ERROR`) is shown only for non-complete requests.
+- **Badge consolidation**: single routing badge per request (`DISK HIT`, `PENDING HIT`, `DISK HIT / RECOMPUTE`, `NO ENTRY`, `BACKEND UNAVAIL`). A conditional status badge (`INCOMPLETE`, `CANCELLED`, `BACKEND ERROR`) is shown only for non-complete requests. Migrated requests (routing_diagnostics.migrated_from) get an extra badge: `MIGRATED · CACHED` (green, cache_migrated=true), `MIGRATED · RECOMPUTE` (red, false), or plain `MIGRATED` (teal, null — nothing to carry); native title tooltip shows source → target backends.
 - **Sorting**: explicit timestamp sort (descending) in `_doRenderFilteredRequests()` ensures newest-first after client-side filtering.
 - **Pagination**: `currentPage` persisted in `localStorage`. Clamped to last valid page on refresh when ring buffer shrinks. Auto-refresh calls `refreshRequests()` without resetting page.
 - **Queue visibility**: `GetSummary()` includes per-backend `queue_depth` (queued, not in-flight) in each backend's health entry and a top-level `queues` snapshot (`QueuesSnapshot()`: per-backend `queued` + `in_flight` counts — up to the free-slot count per backend — plus `queue_max` and the global `overflow` length), so the dashboard can show where requests are waiting.

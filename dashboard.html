@@ -21,6 +21,8 @@
   --blue-bg: #e3f2fd;
   --purple: #7b1fa2;
   --purple-bg: #f3e5f5;
+  --teal: #00695c;
+  --teal-bg: #e0f2f1;
   --gray: #9e9e9e;
   --gray-bg: #fafafa;
   --accent: #0d47a1;
@@ -44,6 +46,8 @@
     --blue-bg: #1b2a3a;
     --purple: #ce93d8;
     --purple-bg: #2a1b3a;
+    --teal: #4db6ac;
+    --teal-bg: #17352f;
     --gray: #777;
     --gray-bg: #1a1a2e;
     --accent: #64b5f6;
@@ -331,6 +335,7 @@ header .controls select, header .controls button {
 .request-badge.cancelled { background: var(--gray-bg); color: var(--gray); }
 .request-badge.backend_error { background: var(--red-bg); color: var(--red); }
 .request-badge.summarization { background: var(--purple-bg, #f3e5f5); color: var(--purple, #7b1fa2); }
+.request-badge.migrated { background: var(--teal-bg); color: var(--teal); }
 .request-latency { color: var(--text-secondary); margin-left: auto; }
 .request-body {
   display: none;
@@ -438,6 +443,7 @@ header .controls select, header .controls button {
         <span class="request-badge recompute" style="font-size:10px;">DISK HIT / RECOMPUTE</span><span style="color:var(--text-secondary);">restore was useless</span>
         <span class="request-badge miss" style="font-size:10px;">NO ENTRY</span><span style="color:var(--text-secondary);">no cache entry</span>
         <span class="request-badge backend_unavail" style="font-size:10px;">BACKEND UNAVAIL</span><span style="color:var(--text-secondary);">cache hit but backend busy, fell back</span>
+        <span class="request-badge migrated" style="font-size:10px;">MIGRATED</span><span style="color:var(--text-secondary);">queue-migrated to an idle backend (CACHED = disk cache followed, RECOMPUTE = transfer lost the race)</span>
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px;padding:8px;background:var(--surface);border-radius:6px;font-size:11px;align-items:center;">
         <span style="color:var(--text-secondary);font-weight:600;">Type:</span>
@@ -941,6 +947,16 @@ function _doRenderFilteredRequests() {
     const sumBadge = sumScore != null && sumScore >= 0.4
       ? `<span class="request-badge summarization" style="font-size:10px;" data-tooltip="Signals: ${(req.summarization_signals || []).join(', ')}">SUMMARIZATION (${sumScore.toFixed(2)})</span>`
       : '';
+    const rd = req.routing_diagnostics || {};
+    let migrationBadge = '';
+    if (rd.migrated_from) {
+      const carried = rd.cache_migrated;
+      let mLabel, mClass, mNote;
+      if (carried === true) { mLabel = 'MIGRATED · CACHED'; mClass = 'hit'; mNote = 'disk cache followed the request (restored or warm slot)'; }
+      else if (carried === false) { mLabel = 'MIGRATED · RECOMPUTE'; mClass = 'recompute'; mNote = 'cache transfer did not land in time; full recompute on target'; }
+      else { mLabel = 'MIGRATED'; mClass = 'migrated'; mNote = 'no disk cache to carry'; }
+      migrationBadge = `<span class="request-badge ${mClass}" style="font-size:10px;" title="Queue-migrated from '${rd.migrated_from}' to idle backend '${req.backend}': ${mNote}">${mLabel}</span>`;
+    }
     const expanded = expandedRequests.has(req.timestamp) ? 'open' : '';
     const bodyOpen = expanded ? 'open' : '';
     const arrowOpen = expanded ? 'open' : '';
@@ -964,6 +980,7 @@ function _doRenderFilteredRequests() {
         <span class="request-backend">${req.backend}</span>
         <span class="request-slot">S${req.slot_id}</span>
         <span class="request-badge ${routingClass}" style="font-size:10px;">${routingLabel}</span>
+        ${migrationBadge}
         ${sumBadge}
         ${statusBadge}
         <span class="request-latency">${req.latency_ms.toFixed(0)}ms</span>
