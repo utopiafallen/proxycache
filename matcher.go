@@ -944,6 +944,15 @@ func (d *RequestDispatcher) pumpBackend(beID string) {
 			return
 		}
 		if err := req.ctx.Err(); err != nil {
+			// The client disconnected while the request was queued. If the pump
+			// pre-acquired a real slot for it (slotID >= 0), release that slot
+			// back to the pool. Discarding without doing so leaks the slot — it
+			// stays inUse forever — and once every slot on a backend has leaked,
+			// TryAcquire always returns -1 and the backend can never dispatch
+			// again (its queue fills to the cap with zero in-flight work).
+			if slotID >= 0 {
+				slotManager.Get(beID).Release(slotID)
+			}
 			d.dropInFlight(beID, req)
 			d.discard(req, "client_disconnected")
 			continue

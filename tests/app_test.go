@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -936,6 +937,65 @@ func TestMultiSlotConcurrency(t *testing.T) {
 	}
 	if mc := m.maxChatConcurrency(); mc < 2 {
 		t.Fatalf("max concurrent backend chats = %d, want 2 (free slot should be served in parallel)", mc)
+	}
+}
+
+// TestPumpDiscardDoesNotLeakSlot guards against the dispatcher lockup. A request
+// that queues behind an in-flight one and whose client disconnects right before
+// its turn causes the pump to pre-acquire the (now free) slot, see the already
+// cancelled context, and discard the request. The pump must release the slot it
+// just acquired: discarding without doing so leaks the slot (it stays inUse
+// forever), so once every slot on a backend has leaked, TryAcquire always fails
+// and the backend can never dispatch again — its queue fills to the cap with zero
+// in-flight work while idle backends sit unused.
+func TestPumpDiscardDoesNotLeakSlot(t *testing.T) {
+	withTempMetaDir(t)
+	const model = "leak-model"
+	m := newMockLlama(t, model, 32768, seq(10), 1) // single slot
+	m.chatDelay = time.Second
+	be := backendKeyFromURL(m.srv.URL)
+	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
+	bm := proxycache.GetBackendManager()
+	markBackendsUp(bm)
+	injectModels(bm, dm(model, 32768, be))
+	beSm := proxycache.GetSlotManager().Get(be)
+	// Pre-create the pool so both requests take the normal acquire path (no lazy
+	// discovery) and the test is not dependent on liveness timing.
+	beSm.EnsurePool(model, 1)
+	body := `{"model": "leak-model", "messages": [{"role": "user", "content": "hello"}]}`
+
+	// Request A grabs the only slot and holds it for chatDelay.
+	doneA := make(chan int, 1)
+	go func() { doneA <- postChat(t, body).Code }()
+	waitFor(t, 5*time.Second, func() bool { return m.chatCount() >= 1 })
+
+	// Request B arrives with a cancellable client context and queues behind A.
+	ctxB, cancelB := context.WithCancel(context.Background())
+	reqB := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	reqB.Header.Set("Content-Type", "application/json")
+	reqB = reqB.WithContext(ctxB)
+	wB := httptest.NewRecorder()
+	doneB := make(chan struct{})
+	go func() { proxycache.ChatHandler(wB, reqB); close(doneB) }()
+	waitFor(t, 5*time.Second, func() bool {
+		return m.chatCount() == 1 && proxycache.GetDispatcher().QueueDepth(be) >= 1
+	})
+
+	// B's client disconnects while it is still queued. A then finishes and frees
+	// the slot; the pump dispatches B, finds its context already cancelled, and
+	// discards it — releasing the slot it just acquired.
+	cancelB()
+	codeA := <-doneA
+	<-doneB
+
+	if got := beSm.CountInUse(model); got != 0 {
+		t.Fatalf("slot leaked after a queued request was discarded: CountInUse=%d, want 0", got)
+	}
+	if got := m.chatCount(); got != 1 {
+		t.Errorf("backend chat count = %d, want 1 (discarded request must not be dispatched)", got)
+	}
+	if codeA != http.StatusOK {
+		t.Errorf("request A status = %d, want 200", codeA)
 	}
 }
 
