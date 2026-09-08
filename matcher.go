@@ -810,9 +810,11 @@ func (d *RequestDispatcher) handleTokenizeError(req *ProcRequest, err error) {
 //  1. If there is a cache hit and the hit backend's queue depth is below
 //     CacheHitQueueLimit, the hit backend wins (preferring the candidate pair
 //     whose model matches the hit).
-//  2. Otherwise round-robin across matching backends starting from the first
-//     non-hit candidate at/after startIdx; the saturated hit backend is only
-//     considered in a second pass when every other candidate is full.
+//  2. Otherwise pick the candidate on the least-loaded backend (lowest queue
+//     depth) so idle backends absorb new work first, breaking exact depth ties
+//     in round-robin order from the first non-hit candidate at/after startIdx;
+//     the saturated hit backend is only considered in a second pass when every
+//     other candidate's queue is at the cap.
 func SelectBackend(cands []CandidateBackend, hit *HitInfo, pendingOf func(backendID string) int, startIdx int) (int, string) {
 	n := len(cands)
 	if n == 0 {
@@ -848,21 +850,41 @@ func SelectBackend(cands []CandidateBackend, hit *HitInfo, pendingOf func(backen
 			}
 		}
 	}
-	// First pass: every candidate except the saturated hit backend.
-	for k := 0; k < n; k++ {
-		i := (start + k) % n
-		if hasHit && cands[i].BackendID == hit.Backend {
-			continue
+	// Fallback distribution: prefer the candidate on the least-loaded backend
+	// (lowest queue depth) so idle backends absorb new work first. Exact depth
+	// ties are broken in round-robin order from `start` — the candidate reached
+	// first at the minimal depth wins — keeping the rotation fair across equal
+	// backends. pick(allowHit) skips the saturated hit backend unless allowHit,
+	// so the first pass excludes it and the second takes it only as a last
+	// resort.
+	pick := func(allowHit bool) int {
+		best := -1
+		bestDepth := 0
+		for k := 0; k < n; k++ {
+			i := (start + k) % n
+			if !allowHit && cands[i].BackendID == hit.Backend {
+				continue
+			}
+			depth := pendingOf(cands[i].BackendID)
+			if depth >= BackendQueueMax {
+				continue
+			}
+			if best == -1 || depth < bestDepth {
+				best = i
+				bestDepth = depth
+			}
 		}
-		if pendingOf(cands[i].BackendID) < BackendQueueMax {
-			return i, "fallback_round_robin"
-		}
+		return best
 	}
-	// Second pass: all others full — take anyone with room (possibly the hit
-	// backend, still bounded by the queue cap).
-	for k := 0; k < n; k++ {
-		i := (start + k) % n
-		if pendingOf(cands[i].BackendID) < BackendQueueMax {
+
+	if i := pick(!hasHit); i != -1 {
+		return i, "fallback_round_robin"
+	}
+	// Only a saturated hit backend makes the second pass distinct: allow it once
+	// every other candidate is at the cap. (With no hit, pick(true) above already
+	// covered every candidate.)
+	if hasHit {
+		if i := pick(true); i != -1 {
 			return i, "fallback_round_robin"
 		}
 	}

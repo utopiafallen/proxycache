@@ -46,6 +46,30 @@ func TestSelectBackendNoHitRoundRobin(t *testing.T) {
 	}
 }
 
+func TestSelectBackendNoHitPrefersIdleBackend(t *testing.T) {
+	cands := candList("A", "B", "C")
+	// The idle backend (lowest queue depth) wins even when it is not reached
+	// first in walk order: C(0) beats A(3) and B(4).
+	pending := map[string]int{"A": 3, "B": 4, "C": 0}
+	if i, reason := proxycache.SelectBackend(cands, nil, pendingOfFrom(pending), 0); i != 2 || reason != "fallback_round_robin" {
+		t.Errorf("idle pick = (%d, %s), want (2, fallback_round_robin)", i, reason)
+	}
+	// A backend at the cap is skipped even though it sits earlier in walk order.
+	pending = map[string]int{"A": proxycache.BackendQueueMax, "B": 2, "C": 1}
+	if i, _ := proxycache.SelectBackend(cands, nil, pendingOfFrom(pending), 0); i != 2 {
+		t.Errorf("cap-skipped pick = %d, want 2 (C idle, A at cap)", i)
+	}
+	// Exact depth ties fall back to round-robin order from start: the candidate
+	// reached first at the minimal depth wins.
+	pending = map[string]int{"A": 0, "B": 4, "C": 0}
+	if i, _ := proxycache.SelectBackend(cands, nil, pendingOfFrom(pending), 0); i != 0 {
+		t.Errorf("tie pick from start=0 = %d, want 0 (A reached first)", i)
+	}
+	if i, _ := proxycache.SelectBackend(cands, nil, pendingOfFrom(pending), 1); i != 2 {
+		t.Errorf("tie pick from start=1 = %d, want 2 (C reached before A in walk)", i)
+	}
+}
+
 func TestSelectBackendNoCandidates(t *testing.T) {
 	if i, reason := proxycache.SelectBackend(nil, nil, pendingOfFrom(nil), 0); i != -1 || reason != "no_candidates" {
 		t.Errorf("empty cands = (%d, %s), want (-1, no_candidates)", i, reason)
