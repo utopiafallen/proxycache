@@ -19,22 +19,27 @@ proxycache sits between clients and one or more `llama.cpp` backends. It interce
 
 - **Name resolution** — resolves client model names (e.g. "qwen3.6-32b") to canonical names discovered from backends. Exact match first, then case-insensitive substring match. The special name "any" matches all discovered models. In addition, chunk-level prefix aliases are auto-generated from pairwise model names (e.g. `unsloth/Qwen3.6-27B` matches both `unsloth/Qwen3.6-27B-MTP-GGUF:Q6_K` and `unsloth/Qwen3.6-27B-GGUF:Q5_K_S`). Prefixes shorter than `provider/model` (fewer than 1 `/`) are filtered out. Using a more generic name (e.g. "qwen3.6") matches multiple canonical models and distributes requests across all backends that serve them.
 
-- **Cache-first routing** — when multiple backends serve the same model, requests are routed to the backend that holds the matching cache file. The proxy also scans in-flight (pending) slots for matches during the save window, allowing subsequent requests to reuse slots before the cache is persisted. If the preferred backend's slots are busy, the proxy falls back to other backends. For cache-miss requests (no matching cache file), fallback backends are sorted by a composite score: cache ratio (lowest first, to minimize redundant cache), ring buffer size (fewest entries first, to spread cache and reduce eviction pressure), average request latency (fastest first, learned via EMA), then LRU (least recently used first, to distribute load). Routing diagnostics capture the full per-backend scan trace for post-hoc analysis.
+- **Request dispatcher** — a single goroutine scans each incoming request (per-backend tokenization plus disk and in-flight-slot cache scan across all matching backends), routes it, and enqueues it on the chosen backend's FIFO queue. The same goroutine's *pump* then dispatches each queue head to a fresh worker while a slot is free — the slot pool is the concurrency limiter, so a backend with N free slots runs up to N requests in flight (single-slot backends degrade to one at a time). A request whose chosen backend's queue is full (default 5) parks in a global FIFO overflow queue and is re-matched as capacity frees.
 
-- **Slot management** — per-model, per-backend slot pools with lazy discovery. Free slots are preferred; when none are available, the least-recently-used slot is reclaimed. The proxy tracks per-backend last-used time and average request latency (EMA) for fallback sorting on cache-miss requests. For cache-hit requests whose backend is busy, the proxy polls every 5s (up to an EMA-derived timeout, limited concurrency) before falling back. Slots with existing KV cache that already matches the incoming prompt skip restore entirely.
+- **Cache-aware routing** — a request with a cache hit goes to the backend holding the cache while its queue depth stays below `CACHE_HIT_QUEUE_LIMIT` (default 2); otherwise it is distributed round-robin across the other matching backends, which triggers an async P2P transfer of the cache file so the chosen backend has it when the request runs. The proxy also scans in-flight (pending) slots for matches, letting subsequent requests reuse a slot's KV state before the cache is persisted to disk. Routing diagnostics capture the full per-backend scan trace for post-hoc analysis.
 
-- **Cache lifecycle** — KV state is saved to disk after a response completes, but only when the new state is worth persisting: skipped for cancelled streams, skipped when the serving backend's cache ratio >= threshold with no recompute, skipped when request tokens exceed `CACHE_SAVE_CTX_THRESHOLD` of the backend's max context (impending compaction), and skipped for single-user-message requests (likely one-off summarization). Recompute is detected by comparing llama.cpp's `cached_tokens` against request length, covering both disk cache restores and pending slot hits. A per-backend ring buffer evicts expired entries (age-first) then LRU when cache exceeds the configured size. Orphaned/corrupted metadata is reconciled on startup.
+- **Queue migration** — a monitor (1s cadence) moves a request that has waited in a backend queue past `QUEUE_MIGRATION_AFTER` (default 120s) to a fully idle backend that serves the same model, so it starts immediately; the best disk cache is P2P-transferred to the target when needed. Each request migrates at most once, and requests without a transferable disk key (pending-slot-only or cold) need twice the age before they move — for them, migration trades a cheap future restore for an immediate full recompute.
+
+- **P2P cache transfer** — cache files move between backends over four paths (agent→agent push, local↔local direct copy, local→agent upload, agent→local pull). Transfers are async and deduped per (key, target), skipped when the target already holds the file; the receiving side makes space within its own `cache_max_size_gb` budget. This is what makes "route to a backend that doesn't have the cache yet" safe: the serving worker bounded-waits (`CACHE_TRANSFER_WAIT`, default 5s) for an in-flight transfer before falling back to recompute.
+
+- **Slot management** — per-model, per-backend slot pools with lazy discovery (first request for an unseen model triggers a refresh; if the backend no longer serves the model, the request is requeued for re-matching rather than failing). Free slots are preferred; when all are busy the request simply waits in the queue. Slots whose tracked KV cache already matches the incoming prompt skip restore entirely (the proxy re-validates this against the actually-acquired slot, falling back to a disk restore if the warm state went stale).
+
+- **Cache lifecycle** — KV state is saved to disk after a response completes, but only when the new state is worth persisting: skipped for cancelled streams, skipped when the restore ratio >= `CACHE_SAVE_RATIO_THRESHOLD` with no recompute (disk already covers the content well enough; the unsaved tail is cheap to recompute and saving would risk evicting other ring entries), skipped when request tokens exceed `CACHE_SAVE_CTX_THRESHOLD` of the backend's max context (impending compaction), and skipped for requests classified as summarization. Skipped saves are tracked per slot and flushed to disk if a later request is about to clobber that slot's content and disk coverage has degraded in the meantime. Recompute is detected by comparing llama.cpp's `cached_tokens` against request length, covering both disk cache restores and pending slot hits; a useless restore increments the meta file's recompute penalty, degrading its future candidate score. A per-backend ring buffer evicts expired entries (age-first) then LRU when cache exceeds the configured size. Orphaned/corrupted metadata is reconciled on startup.
 
 ### Request flow
 
 1. Client sends `POST /v1/chat/completions` with a model name (e.g. "qwen3.6-32b")
-2. Proxy resolves the model name to a canonical name via discovered models
-3. Scans cache files across all backends for matching prefixes
-4. Builds an ordered backend list — cache backend first, then fallback backends sorted by composite score: cache ratio (lowest first), ring buffer size (fewest entries first), average request latency (fastest first, learned via EMA), then LRU (least recently used first)
-5. If the cache backend is busy, waits briefly for a slot to free up (Phase 0 wait queue)
-6. Acquires a slot (with lock retry across backends) and restores KV cache if available
-7. Forwards the request to llama.cpp with the canonical model name and pinned slot
-8. Saves KV state to disk if the response completed normally and the new cache is worth persisting (skipped for cancelled streams or when existing cache was already a good match)
+2. The dispatcher resolves the model name to canonical name(s) via discovered models and tokenizes the prompt on each matching backend
+3. Scans disk cache files and in-flight slots on every matching backend for the best match
+4. Routes the request: cache hit → the hit backend (while its queue is below the limit); otherwise round-robin across matching backends, triggering a P2P transfer of the best disk cache to the chosen one. A full queue parks the request in the global overflow queue instead.
+5. The pump dispatches the request when a slot on that backend is free (one worker per free slot) and restores KV state from disk if available — including files that just arrived via P2P transfer
+6. Forwards the request to llama.cpp with the canonical model name and pinned slot
+7. Saves KV state to disk if the response completed normally and the new cache is worth persisting (see Cache lifecycle); skipped saves are remembered per slot and flushed if a later request is about to clobber that slot's content
 
 The proxy supports both streaming (SSE) and non-streaming responses.
 
@@ -50,19 +55,25 @@ All config via environment variables (defaults in `config.go`). No `.env` file s
 | `META_DIR` | `./kv_meta` | Local metadata directory (organized by backend subdirectories) |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
 | `LCP_TH` | `0.2` | LCP similarity threshold for cache match (0–1) |
-| `KV_CACHE_SKIP_THRESHOLD` | `0.9` | Skip restore if slot KV cache matches >= this ratio |
-| `CACHE_SAVE_RATIO_THRESHOLD` | `0.8` | Skip cache save if restore ratio >= this (avoids overwriting good cache) |
+| `KV_CACHE_SKIP_THRESHOLD` | `0.9` | Skip restore if slot KV cache matches >= this ratio (and the block-count difference is within `KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT`) |
+| `KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT` | `0.1` | Max relative block-count difference for a skip-restore to apply |
+| `CACHE_SAVE_RATIO_THRESHOLD` | `0.8` | Skip cache save if restore ratio >= this and no recompute (ring-budget protection: don't grow the cache when disk already covers the content) |
 | `CACHE_SAVE_CTX_THRESHOLD` | `0.7` | Skip cache save if request tokens >= this fraction of backend's max context (avoids saving cache that will be invalidated by compaction) |
 | `SLOT_TIMEOUT` | `30` | Timeout for slot save/restore operations (seconds) |
+| `SLOT_ACQUIRE_RETRY_BASE_SECONDS` | `5` | Base backoff for the lazy-discovery worker's slot acquire retries (grows with attempt count) |
 | `REQUEST_TIMEOUT` | `600` | HTTP timeout to backend (seconds) |
 | `CLIENT_RECREATE_INTERVAL` | `50` | Recreate the HTTP client after this many requests per backend to avoid stale connections |
 | `MODEL_ID` | `llama.cpp` | Default model ID when client omits it |
-| `CACHE_HIT_WAIT_EMA_INITIAL_TIMEOUT` | `30` | Initial EMA timeout for cache-hit wait queue (seconds) |
-| `CACHE_HIT_WAIT_EMA_MIN_TIMEOUT` | `10` | Minimum wait queue timeout (seconds) |
-| `CACHE_HIT_WAIT_EMA_MAX_TIMEOUT` | `300` | Maximum wait queue timeout (seconds) |
-| `CACHE_HIT_WAIT_EMA_ALPHA` | `0.2` | EMA smoothing factor (0–1) |
-| `CACHE_HIT_WAIT_MAX_PENDING_REQS` | `3` | Max concurrent waiters per backend |
 | `DEFAULT_N_CTX` | `16384` | Fallback context length when backend doesn't report `n_ctx` |
+| `BACKEND_QUEUE_MAX` | `5` | Max queued (not yet dispatched) requests per backend; overflow goes to the global FIFO queue |
+| `CACHE_HIT_QUEUE_LIMIT` | `2` | Max queued requests routed to a cache-hit backend before falling back to round-robin + P2P transfer |
+| `CACHE_TRANSFER_TIMEOUT` | `300` | Timeout for a single P2P transfer HTTP exchange (seconds) |
+| `CACHE_TRANSFER_WAIT` | `5` | How long a serving worker waits for an in-flight P2P transfer of its cache key before proceeding without a restore (seconds) |
+| `MATCH_SCAN_TIMEOUT` | `15` | Timeout for the matcher's tokenize/disk-scan phase per request (seconds) |
+| `QUEUE_MIGRATION_AFTER` | `120` | How long a request may sit in a backend queue before migrating to an idle backend serving its model (seconds; 2x for requests without a transferable disk key) |
+| `LIVENESS_DIAG_RECORD_INTERVAL` | `60` | Min seconds between `liveness_diag` metrics events per backend unless state changed |
+| `MISSING_MODELS_RETRY_INTERVAL` | `30` | Min seconds between re-triggering model discovery for backends with missing models |
+| `CACHE_HIT_WAIT_EMA_*` | see `config.go` | Legacy env vars (`INITIAL/MIN/MAX_TIMEOUT`, `ALPHA`) — slot-occupancy EMA bookkeeping is kept but no longer drives routing |
 | `LOG_LEVEL` | `INFO` | Log level (`DEBUG`, `INFO`, `WARN`, `ERROR`) |
 | `METRICS_RETENTION` | `200` | Single ring buffer size for requests + diagnostic events |
 | `DASHBOARD_ENABLED` | `true` | Enable the monitoring dashboard (`false`, `no`, `0` to disable) |
@@ -95,7 +106,7 @@ Each request record includes:
 - **Cache performance**: hit rate, mispredict rate (cache hit attempted but restore was partial/useless), utility rate, save rate, restore success rate
 - **Latency**: avg, p50, p95, p99 percentiles
 - **Per-model and per-backend breakdowns**
-- **Routing diagnostics**: per-backend cache scan results (cache file ratio, pending slot ratios, unreachable status), best match ratio, selected backend, and candidate fallback list
+- **Routing diagnostics**: per-backend cache scan results (cache file ratio, pending slot ratios, unreachable status), best match ratio, selected backend, candidate list, whether a P2P transfer was triggered, and `migrated_from` when the queue-migration monitor moved the request to an idle backend before it ran
 
 Metrics are recorded in three phases: arrival (status=`incomplete`), routing decision (backend, slot, routing reason), and completion (latency, cache hit/miss, save status). Streaming requests record metrics in `StreamState.cleanup()` after the full response lifecycle.
 
@@ -105,7 +116,7 @@ Diagnostic events are recorded when backends change liveness state (up/down), ca
 
 The dashboard at `/dashboard` provides a real-time view of:
 
-- **Backend Health** — up/down status, discovered models, slot counts, last discovery time
+- **Backend Health** — up/down status, discovered models, slot counts, last discovery time, plus per-backend request queues (in-flight ▶ cells + queued segments up to the cap) and the global overflow count
 - **Cache Performance** — hit rate, mispredict rate, utility rate, save rate, restore success rate, latency percentiles
 - **Cache Utilization** — per-backend cache ring size, total bytes, utilization percentage, cache directory
 - **Slot Status** — per-model slot grid showing in-use (green), free (gray), and restoring (blue) states
@@ -136,6 +147,8 @@ models:
 ## Cache Management
 
 Each backend can be configured with either `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). These options are mutually exclusive. Each backend can also optionally specify `cache_max_size_gb` to control its individual cache ring buffer size (default: `25`).
+
+These settings double as the transport for inter-backend P2P cache transfers: when routing sends a request to a backend that lacks its best cache, the proxy moves the file there using the agents' transfer/upload/fetch endpoints (or direct file copy between local backends).
 
 ### Local cache management
 
