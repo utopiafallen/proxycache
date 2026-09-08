@@ -81,6 +81,15 @@ var (
 	// MatchScanTimeout bounds the tokenize/disk-scan phase run by the global
 	// matcher for one request.
 	MatchScanTimeout = EnvFloat("MATCH_SCAN_TIMEOUT", 15)
+	// QueueMigrationAfter is how long a request may sit in a backend's queue
+	// before the dispatcher migrates it to an idle backend (queue empty and
+	// no in-flight work) that serves its model, triggering a P2P transfer of
+	// its best disk cache when the key does not already live there. Requests
+	// whose hit is not a transferable disk key (pending-slot-only or no
+	// cache) need twice this age before they are moved — migrating them
+	// trades a cheap future restore for an immediate full recompute, which
+	// only wins when the wait has really gone bad.
+	QueueMigrationAfter = EnvFloat("QUEUE_MIGRATION_AFTER", 120)
 )
 
 func init() {

@@ -73,17 +73,19 @@ Captured during the routing phase (phase 2) and stored as `routing_diagnostics` 
             ]
         }
     ],
-    "p2p_transfer": false
+    "p2p_transfer": false,
+    "migrated_from": null
 }
 ```
-(`skip_restore` is `{}` when skip-restore did not fire; absent `restore_key`/`restore_backend`/`restore_info_backend`/`cache_file_*` fields mean `null`; `p2p_transfer` is true when the matcher triggered a P2P cache transfer toward the serving backend.)
+(`skip_restore` is `{}` when skip-restore did not fire; absent `restore_key`/`restore_backend`/`restore_info_backend`/`cache_file_*` fields mean `null`; `p2p_transfer` is true when the matcher triggered a P2P cache transfer toward the serving backend; `migrated_from` names the source backend when the queue-migration monitor moved the request to an idle backend before it ran, else `null`.)
 
 **Key fields:**
 - `restore_key` is absent/`null` when a pending slot hit won (no disk restore needed)
 - `restore_info_backend` is absent/`null` when `restore_key` is null (no priority routing)
 - `candidate_backends` excludes the primary hit's backend whenever a hit exists (disk or pending-slot)
 - `skip_restore` is populated (non-empty dict) when skip-restore fires, with `skipped=true`, block counts, and restore key. Empty dict `{}` means skip-restore did not fire.
-- `p2p_transfer` true → the request was routed away from the cache's backend; the worker bounded-waited for the transfer before restoring (see proxycache-architecture skill)
+ - `p2p_transfer` true → the request was routed away from the cache's backend; the worker bounded-waited for the transfer before restoring (see proxycache-architecture skill)
+ - `migrated_from` non-null → the queue-migration monitor moved the request off its original (busy) backend to an idle one after it had waited past `QUEUE_MIGRATION_AFTER`; the serving `backend` is the migration target, not the original routing choice
 - `scan` entries with `status="unreachable"` mean the backend was down during the cache scan
 - `pending_slots` lists all matching slots per backend with their LCP details
 
@@ -163,7 +165,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 - **Badge consolidation**: single routing badge per request (`DISK HIT`, `PENDING HIT`, `DISK HIT / RECOMPUTE`, `NO ENTRY`, `BACKEND UNAVAIL`). A conditional status badge (`INCOMPLETE`, `CANCELLED`, `BACKEND ERROR`) is shown only for non-complete requests.
 - **Sorting**: explicit timestamp sort (descending) in `_doRenderFilteredRequests()` ensures newest-first after client-side filtering.
 - **Pagination**: `currentPage` persisted in `localStorage`. Clamped to last valid page on refresh when ring buffer shrinks. Auto-refresh calls `refreshRequests()` without resetting page.
-- **Queue visibility**: `GetSummary()` includes per-backend `queue_depth` (queued, not in-flight) in each backend's health entry and a top-level `queues` snapshot (`QueuesSnapshot()`: per-backend depths + global `overflow` length), so the dashboard can show where requests are waiting.
+- **Queue visibility**: `GetSummary()` includes per-backend `queue_depth` (queued, not in-flight) in each backend's health entry and a top-level `queues` snapshot (`QueuesSnapshot()`: per-backend `queued` + `in_flight` counts — up to the free-slot count per backend — plus `queue_max` and the global `overflow` length), so the dashboard can show where requests are waiting.
 - **Embedding**: `dashboard.html` is embedded into the binary via `//go:embed` in `app.go` and served at `/dashboard`. It has no build step — edit the file and rebuild.
 
 ## Key Functions

@@ -1,10 +1,10 @@
-// processor.go — per-backend request processing: slot acquisition on the
-// assigned backend, cache restore (including files that arrived via P2P
-// transfer), dispatch to llama.cpp, and post-response cache save.
+// processor.go — per-backend request processing: cache restore (including
+// files that arrived via P2P transfer), dispatch to llama.cpp, and
+// post-response cache save.
 //
-// Runs on the backend's worker goroutine (one in-flight request at a time
-// per backend), unlike the old design where every HTTP handler drove its own
-// slot acquisition across all backends.
+// Runs on a worker goroutine spawned by the dispatcher's pump, one in flight
+// per free slot on the backend, unlike the old design where every HTTP handler
+// drove its own slot acquisition across all backends.
 
 package proxycache
 
@@ -217,10 +217,14 @@ func buildChatBody(requestJSON map[string]any, modelName string, slotID int) map
 	return body
 }
 
-// processWorkerRequest handles one queued request end to end on this backend:
-// slot acquisition, restore, dispatch (stream or non-stream), save, release.
-// Always finishes the request (closes req.done) before returning.
-func processWorkerRequest(d *RequestDispatcher, w *backendWorker, req *ProcRequest) {
+// processWorkerRequest handles one queued request end to end on its assigned
+// backend: restore, dispatch (stream or non-stream), save, release. The
+// dispatcher's pump pre-acquires a slot and passes it in (slotID >= 0); when
+// slotID is negative this worker performs slot acquisition itself — the lazy
+// discovery path for a model whose pool does not exist on this backend yet
+// (refresh + ServesModel requeue gate + backoff retry). Always finishes the
+// request (closes req.done) before returning.
+func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, slotID int) {
 	// A requeued request is still alive on the global overflow queue; only
 	// finish it when this worker owns its terminal state.
 	requeued := false
@@ -230,10 +234,15 @@ func processWorkerRequest(d *RequestDispatcher, w *backendWorker, req *ProcReque
 		}
 	}()
 	dec := req.route
-	beID := w.beID
 	modelName := dec.selected.ModelName
 
+	beSm := slotManager.Get(beID)
+	client := backendManager.GetClient(beID)
+
 	if dec.promptTokens >= backendManager.GetBackendNCtx(modelName, beID) {
+		if slotID >= 0 {
+			beSm.Release(slotID) // pump pre-acquired it; the check below never did
+		}
 		recordChatError(req.requestID, modelName, beID, -1, req.t0, "prompt_too_long")
 		WriteJSON(req.w, http.StatusBadRequest, map[string]any{
 			"error": fmt.Sprintf("prompt too long for backend (tokens=%d)", dec.promptTokens),
@@ -241,13 +250,16 @@ func processWorkerRequest(d *RequestDispatcher, w *backendWorker, req *ProcReque
 		return
 	}
 
-	beSm := slotManager.Get(beID)
-	client := backendManager.GetClient(beID)
-
-	slotID, prevKV, wasRequeued := acquireSlotOnBackend(d, req, beSm, modelName)
-	requeued = wasRequeued
-	if slotID == -1 {
-		return // discarded or requeued by acquireSlotOnBackend
+	var prevKV []string
+	if slotID < 0 {
+		var wasRequeued bool
+		slotID, prevKV, wasRequeued = acquireSlotOnBackend(d, req, beSm, modelName)
+		requeued = wasRequeued
+		if slotID == -1 {
+			return // discarded or requeued by acquireSlotOnBackend
+		}
+	} else {
+		prevKV = beSm.GetKVState(slotID)
 	}
 
 	blocks := dec.backendBlocks[beID]
@@ -331,6 +343,7 @@ func processWorkerRequest(d *RequestDispatcher, w *backendWorker, req *ProcReque
 			"scan":                 dec.scanDiagnostics,
 			"skip_restore":         skipRestoreDiag,
 			"p2p_transfer":         dec.p2pTriggered,
+			"migrated_from":        strOrNone(req.migratedFrom),
 		},
 	})
 

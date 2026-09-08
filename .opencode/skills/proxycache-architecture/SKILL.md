@@ -4,44 +4,61 @@
 
 Go-native codebase at the repo root. The original Python implementation lives in `archive/python/` as a behavior reference only — prefer the Go code as canonical.
 
-## Request Pipeline (matcher + per-backend workers)
+ ## Request Pipeline (matcher + pump + per-slot workers)
 
-The old design had every HTTP handler drive its own multi-phase slot acquisition across all backends. That is gone. Now:
+ The old design had every HTTP handler drive its own multi-phase slot acquisition across all backends. That is gone. Now:
 
-```
-ChatHandler (app.go)          thin: parse, build ProcRequest, Submit(), block on req.done
-    |
-RequestDispatcher (matcher.go)  global singleton
-    |-- 1 matcher goroutine: scans each arrival (per-backend tokenize + disk/pending-slot
-    |   cache scan), runs SelectBackend(), enqueues onto the chosen backend's queue
-    |-- per-backend worker goroutines: process that backend's queue sequentially
-    |   (one in-flight request per backend): acquire slot ON THIS BACKEND ONLY, restore,
-    |   dispatch to llama.cpp, save, release
-    |-- global FIFO overflow queue: requests whose chosen backend is full; re-matched on
-        capacity free or liveness change (notify())
-```
+ ```
+ ChatHandler (app.go)          thin: parse, build ProcRequest, Submit(), block on req.done
+     |
+ RequestDispatcher (matcher.go)  global singleton — ONE goroutine owns all queue state
+     |-- matcher: scans each arrival (per-backend tokenize + disk/pending-slot
+     |   cache scan), runs SelectBackend(), enqueues onto the chosen backend's FIFO
+     |-- pump (same goroutine, after every arrival/overflow-drain/tick): for each
+     |   backend, dispatches queue HEAD to a fresh worker goroutine while
+     |   TryAcquire succeeds — the slot pool is the concurrency limiter (N free
+     |   slots → up to N in flight). Head-only FIFO: a head whose model has no
+     |   free slot stops that backend's pump; the next wake (slot release, tick)
+     |   resumes it. First request for an undiscovered model spawns a
+     |   lazy-discovery worker (refresh + ServesModel gate) instead.
+     |-- queue-migration monitor (same goroutine, 1s cadence): moves long-queued
+     |   requests to idle backends (see below)
+     |-- global FIFO overflow queue: requests whose chosen backend is full;
+     |   re-matched on every wake (capacity free, liveness change, tick)
+ worker goroutine (processor.go)  one per dispatched request: restore, dispatch to
+     llama.cpp, save, release slot — completion re-wakes the pump
+ ```
 
-**Why this shape:** one in-flight request per backend keeps slot/KV state deterministic (no cross-backend races), and the single matcher serializes the expensive scan+decide step so routing decisions see consistent queue depths.
+ **Why this shape:** the single dispatcher goroutine serializes all queue mutations and the expensive scan+decide step, so routing decisions see consistent queue depths; workers never touch each other's slots (each holds exactly one, pre-acquired by the pump under `PoolMu`, so in-flight count can never exceed free-slot count). On single-slot backends the pump degenerates to one-at-a-time — the historical behavior. **Backends must be proxy-exclusive**: the slot pool only tracks slots *we* assign, and with N workers a backend also driven directly can get double-booked.
 
-### Routing rule (`SelectBackend`, exported pure function — unit-tested directly)
+ ### Routing rule (`SelectBackend`, exported pure function — unit-tested directly)
 
-1. Cache hit + hit backend's **queue depth** (queued items, not in-flight count) < `CacheHitQueueLimit` (default 2) → route to the hit backend (prefers the candidate whose model name matches the hit's canonical name).
-2. Otherwise round-robin across the other matching backends, starting from the first non-hit candidate at/after the model's RR index; a P2P transfer of the best **disk** cache is triggered to the chosen backend. The saturated hit backend is only taken in a second pass when every other candidate is full.
+ 1. Cache hit + hit backend's **queue depth** (queued items, not in-flight count) < `CacheHitQueueLimit` (default 2) → route to the hit backend (prefers the candidate whose model name matches the hit's canonical name).
+ 2. Otherwise round-robin across the other matching backends, starting from the first non-hit candidate at/after the model's RR index; a P2P transfer of the best **disk** cache is triggered to the chosen backend. The saturated hit backend is only taken in a second pass when every other candidate is full.
 
-Per-backend queues cap at `BackendQueueMax` (default 5); beyond that, requests park in the global overflow queue (head-of-line ordering preserved — a non-routable head stops the drain pass).
+ Per-backend queues cap at `BackendQueueMax` (default 5); beyond that, requests park in the global overflow queue (head-of-line ordering preserved — a non-routable head stops the drain pass).
 
-### Worker processing (`processor.go`)
+ ### Queue migration (`migrateStale`, matcher.go)
 
-- `acquireSlotOnBackend`: retries forever on its own backend (growing backoff `SlotAcquireRetryBaseSeconds` × attempt). Empty/missing pool → `RefreshSlotCounts()` then immediate retry (pool may just have been created); if the backend no longer serves the model (`ServesModel()` false) → **requeue** to the global overflow for re-matching instead of failing. No 503 on slot exhaustion — abort only on client disconnect / ctx cancellation.
-- `resolveRestoreKey`: restores from the best *disk* candidate — directly when local; otherwise bounded-wait (`CacheTransferWait`, default 5s) for an in-flight P2P transfer, then `CacheExists()`. A pending-slot hit on the same backend suppresses disk restore (slot already warm).
-- `doWorkerRestore`: flush previously-skipped save, apply `ShouldSkipRestore` heuristic, issue restore.
-- Then dispatch (stream via `serveStream`, non-stream via `processNonStream`), recompute detection, save heuristics, post-response save.
+ A request enqueued on its hit backend can age out behind a long generation. The 1s monitor fixes this by moving it to a backend that will start it **immediately** — idle means empty queue AND zero in-flight workers (with the pump, that is a hard guarantee, no drain-speed estimation):
 
-**Request contexts:** each request runs on a context derived from the client's `r.Context()`; `ProcRequest.finish()` cancels it and closes `done`. A **requeued** request must NOT be finished by the worker that requeued it — its terminal state belongs to whoever completes it later; finishing early makes the overflow drain discard it as disconnected.
+ - **Eligible:** queued longer than `QueueMigrationAfter` (env `QUEUE_MIGRATION_AFTER`, default 120s) — except requests whose hit is not a transferable disk key (`diskRestoreKey == "": pending-slot-only or cold) need **2×** the age. Reason: for them, migration delivers a full recompute on the target instead of a cheap future restore — only worth it when the wait has really gone bad.
+ - **Target:** a live backend from the registry (not just backends with a queue entry) that `ServesModel()` for the request's model; at most one migrated request per idle target per pass (it stops being idle the moment it takes work).
+ - **One-shot:** `ProcRequest.migratedFrom` is set on move; never migrated twice.
+ - **Cache follows the request:** if `diskRestoreKey` doesn't live on the target, `RequestCacheTransfer(holder→target, key)` fires (the target worker's `CACHE_TRANSFER_WAIT` bounded wait picks it up; recompute fallback if the transfer loses). The content-addressed key means a copy on the target is interchangeable with the holder's.
+
+ ### Worker processing (`processor.go`)
+
+ - Pump-pre-acquired workers (the common path) receive their slotID and skip acquisition entirely. Only the **lazy-discovery** worker acquires itself: `acquireSlotOnBackend` retries forever on its own backend (growing backoff `SlotAcquireRetryBaseSeconds` × attempt); empty/missing pool → `RefreshSlotCounts()` then immediate retry (pool may just have been created); if the backend no longer serves the model (`ServesModel()` false) → **requeue** to the global overflow for re-matching instead of failing. No 503 on slot exhaustion — abort only on client disconnect / ctx cancellation.
+ - `resolveRestoreKey`: restores from the best *disk* candidate — directly when local; otherwise bounded-wait (`CacheTransferWait`, default 5s) for an in-flight P2P transfer, then `CacheExists()`. A pending-slot hit is **re-validated** against the actually-acquired slot (`canSkip` via `ShouldSkipRestore` with the captured `prevKV`): if stale and a local disk key exists, it falls back to the disk restore instead of recomputing.
+ - `flushSkippedSave`: before any clobbering restore/prefill, persist a previously-skipped save on the slot — but only when current disk coverage would now pass `ShouldSaveCache` (see Clobber-flush below).
+ - Then dispatch (stream via `serveStream`, non-stream via `processNonStream`), recompute detection, save heuristics, post-response save.
+
+ **Request contexts:** each request runs on a context derived from the client's `r.Context()`; `ProcRequest.finish()` cancels it and closes `done`. A **requeued** request must NOT be finished by the worker that requeued it — its terminal state belongs to whoever completes it later; finishing early makes the overflow drain discard it as disconnected.
 
 ## P2P Cache Transfer (`transfer.go`)
 
-When a cache-hit request is routed away from the backend holding the cache, `RequestCacheTransfer(src, dst, key)` migrates the file asynchronously so a restore is possible when the worker runs.
+When a request ends up scheduled on a backend that does not hold its best cache, `RequestCacheTransfer(src, dst, key)` migrates the file asynchronously so a restore is possible when the worker runs. Two triggers: (1) `SelectBackend` routes a cache hit to a fallback backend, and (2) queue migration moves a long-queued request to an idle backend.
 
 - Deduped per (key, dst) via an in-flight map; skipped when dst already holds the file.
 - Four backend-type combos: agent→agent push (`/cache/transfer`), local→local direct copy, local→agent upload (`/cache/receive`), agent→local pull (`/cache/file`).
@@ -149,7 +166,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 
 - **Tokenization is backend-specific**: Each backend applies its own chat template and tokenizer. Different backends may produce different token IDs for the same messages.
 - **Cache key = prompt tokens only**: The key is computed from `optTokenIDs` (prompt), not the full request+response. This is known at match time.
-- **Queue depth, not in-flight count, drives the hit limit**: `SelectBackend` sees only queued items; the single in-flight request per backend doesn't count against `CacheHitQueueLimit`. That's why a busy hit backend still accepts 2 queued followers.
+ - **Queue depth, not in-flight count, drives the hit limit**: `SelectBackend` sees only queued items; in-flight workers (up to the free-slot count per backend) don't count against `CacheHitQueueLimit`. That's why a busy hit backend still accepts 2 queued followers.
 - **`slotKVState` is keyed by `slotID`** (per `BackendSlotManager` instance, not globally). Access via `GetSlotManager().Get(backendID).GetKVState(slotID)`.
 - **`Invalidate()` clears `slotKVState`**: Called on cancellation/failure in `StreamState.cleanup()` before `Release()`.
 - **Ring buffer eviction is per-backend**: Uses `cache_max_size_gb` per backend (default 25 GB). Evicts age-first, then LRU. `MakeSpaceFor(need)` reuses the same scoring to free room for an incoming P2P transfer.
@@ -176,8 +193,10 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 | `FindBestRestoreCandidate()` | `kvmeta.go` | Scan disk meta files for best cache hit |
 | `ScanAllMeta()` | `kvmeta.go` | Load all meta files from disk for a backend |
 | `RequestDispatcher.match()` | `matcher.go` | Scan (tokenize + disk/pending-slot) + route one request; sets `RouteDecision` |
-| `SelectBackend()` | `matcher.go` | Exported pure routing decision (hit-under-limit vs RR fallback); unit-testable |
-| `acquireSlotOnBackend()` | `processor.go` | Worker-side slot acquisition on its own backend: backoff retry, refresh, requeue on model departure |
+ | `SelectBackend()` | `matcher.go` | Exported pure routing decision (hit-under-limit vs RR fallback); unit-testable |
+ | `pumpBackend()` | `matcher.go` | Dispatch one backend's queue head to a worker while `TryAcquire` succeeds (slot pool = concurrency limiter); spawns lazy-discovery worker for an undiscovered model |
+ | `migrateStale()` | `matcher.go` | 1s monitor: move long-queued requests to idle backends serving their model; triggers P2P transfer of the disk key; one-shot per request, 2× age for non-disk hits |
+ | `acquireSlotOnBackend()` | `processor.go` | Slot acquisition for the lazy-discovery worker: backoff retry on its own backend, refresh, requeue on model departure |
 | `resolveRestoreKey()` | `processor.go` | Pick the effective restore key (local disk or P2P-landed), suppress when slot is warm |
 | `doWorkerRestore()` | `processor.go` | Flush skipped save, skip-restore check, issue restore |
 | `RequestCacheTransfer()` | `transfer.go` | Async, deduped P2P transfer across the four backend-type combos |

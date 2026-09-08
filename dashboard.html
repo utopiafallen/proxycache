@@ -601,8 +601,8 @@ function renderBackendHealth(backends, cache, slots, backendModelPerf, queues) {
       </div>
       <div class="cache-backend">${cacheInfo.total_gb} / ${cacheInfo.max_gb} GB &middot; ${cacheInfo.ring_size} files${cacheInfo.cache_dir ? ` &middot; ${cacheInfo.cache_dir}` : ''}</div>
     </div>` : '';
-    // Per-backend request queue: one cell for the in-flight request (if any),
-    // then one segment per queued slot up to the cap.
+    // Per-backend request queue: one ▶ cell per in-flight request (up to the
+    // free-slot count), then one segment per queued slot up to the cap.
     const q = (queues && queues[key] && typeof queues[key].queued === 'number')
       ? queues[key]
       : { queued: info.queue_depth || 0, in_flight: 0 };
@@ -614,7 +614,11 @@ function renderBackendHealth(backends, cache, slots, backendModelPerf, queues) {
         segs += `<span class="queue-seg" data-tooltip="free queue slot"></span>`;
       }
     }
-    const runCell = q.in_flight ? `<span class="queue-seg running" data-tooltip="request in flight on this backend">&#9654;</span>` : '';
+    let runCell = '';
+    const runningShown = Math.min(q.in_flight, qmax);
+    for (let i = 0; i < runningShown; i++) {
+      runCell += `<span class="queue-seg running" data-tooltip="${q.in_flight} request(s) in flight on this backend">&#9654;</span>`;
+    }
     const queueHtml = `<div class="queue-row">
       <span class="queue-label">queue:</span>${runCell}${segs}
       <span class="queue-count">${q.queued}/${qmax}</span>

@@ -15,17 +15,19 @@ import (
 )
 
 type mockLlama struct {
-	mu         sync.Mutex
-	srv        *httptest.Server
-	model      string
-	nCtx       int
-	tokens     []int
-	nSlots     int
-	chatDelay  time.Duration
-	chatBodies []map[string]any
-	saves      []string
-	restores   []string
-	chatResp   map[string]any
+	mu            sync.Mutex
+	srv           *httptest.Server
+	model         string
+	nCtx          int
+	tokens        []int
+	nSlots        int
+	chatDelay     time.Duration
+	chatBodies    []map[string]any
+	saves         []string
+	restores      []string
+	chatResp      map[string]any
+	concurrent    int // chat completions currently being served
+	maxConcurrent int // high-water mark of concurrent
 }
 
 func newMockLlama(t *testing.T, model string, nCtx int, tokens []int, nSlots int) *mockLlama {
@@ -83,10 +85,17 @@ func newMockLlama(t *testing.T, model string, nCtx int, tokens []int, nSlots int
 		m.chatBodies = append(m.chatBodies, body)
 		resp := m.chatResp
 		delay := m.chatDelay
+		m.concurrent++
+		if m.concurrent > m.maxConcurrent {
+			m.maxConcurrent = m.concurrent
+		}
 		m.mu.Unlock()
 		if delay > 0 {
 			time.Sleep(delay)
 		}
+		m.mu.Lock()
+		m.concurrent--
+		m.mu.Unlock()
 		proxycache.WriteJSON(w, http.StatusOK, resp)
 	})
 	m.srv = httptest.NewServer(mux)
@@ -98,6 +107,12 @@ func (m *mockLlama) chatCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.chatBodies)
+}
+
+func (m *mockLlama) maxChatConcurrency() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.maxConcurrent
 }
 
 func (m *mockLlama) lastChatModel() string {
@@ -515,6 +530,137 @@ func withRetryBase(t *testing.T, base float64) {
 	t.Cleanup(func() { proxycache.SlotAcquireRetryBaseSeconds = old })
 }
 
+func withMigrationAfter(t *testing.T, seconds float64) {
+	t.Helper()
+	old := proxycache.QueueMigrationAfter
+	proxycache.QueueMigrationAfter = seconds
+	t.Cleanup(func() { proxycache.QueueMigrationAfter = old })
+}
+
+// TestQueueMigrationToIdleBackend verifies the queue-migration monitor: a
+// request with a disk cache hit gets queued on its (busy) hit backend; once it
+// has waited past QUEUE_MIGRATION_AFTER and another backend serving the model
+// is fully idle, the dispatcher moves it there and transfers the disk cache —
+// so it runs on the idle backend instead of waiting out the backlog.
+func TestQueueMigrationToIdleBackend(t *testing.T) {
+	withTempMetaDir(t)
+	withMigrationAfter(t, 1.0)
+	tokensP := seq(800) // prefix content with a disk cache on A
+	tokensQ := offsetSeq(400, 100000)
+	mA := newMockLlama(t, "mig-model", 32768, tokensP, 1)
+	mB := newMockLlama(t, "mig-model", 32768, tokensP, 1)
+	beA := backendKeyFromURL(mA.srv.URL)
+	beB := backendKeyFromURL(mB.srv.URL)
+	dirA, dirB := t.TempDir(), t.TempDir()
+	withTestBackend(t, []map[string]any{
+		{"url": mA.srv.URL, "cache_dir": dirA},
+		{"url": mB.srv.URL, "cache_dir": dirB},
+	})
+	bm := proxycache.GetBackendManager()
+	markBackendsUp(bm)
+	injectModels(bm, dm("mig-model", 32768, beA, beB))
+
+	// Keep B down so the warmup and the busy request route deterministically to A.
+	bm.Mu.Lock()
+	bm.BackendState[beB] = false
+	bm.Mu.Unlock()
+
+	// Warmup: establishes a disk cache for tokensP on A (meta + dummy file —
+	// the mock never writes physical cache files itself).
+	if w := postChat(t, `{"model": "mig-model", "messages": [{"role": "user", "content": "warm"}]}`); w.Code != http.StatusOK {
+		t.Fatalf("warmup status = %d, want 200", w.Code)
+	}
+	keyP := proxycache.MetaKey("mig-model", tokensP)
+	if err := os.WriteFile(filepath.Join(dirA, keyP), []byte("warm-cache-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A1: holds A's only slot for 3s (no cache anywhere).
+	mA.tokens = tokensQ
+	mA.chatDelay = 3 * time.Second
+	doneA1 := make(chan *httptest.ResponseRecorder, 1)
+	go func() { doneA1 <- postChat(t, `{"model": "mig-model", "messages": [{"role": "user", "content": "busy"}]}`) }()
+	waitFor(t, 5*time.Second, func() bool { return mA.chatCount() >= 1 })
+
+	// R: disk hit on A while A is busy -> queued on A, then migrated to idle B.
+	mA.tokens = tokensP
+	bm.Mu.Lock()
+	bm.BackendState[beB] = true
+	bm.Mu.Unlock()
+	doneR := make(chan *httptest.ResponseRecorder, 1)
+	go func() { doneR <- postChat(t, `{"model": "mig-model", "messages": [{"role": "user", "content": "hit"}]}`) }()
+
+	wR := <-doneR
+	wA1 := <-doneA1
+	if wR.Code != http.StatusOK || wA1.Code != http.StatusOK {
+		t.Fatalf("statuses: R=%d A1=%d, want 200/200", wR.Code, wA1.Code)
+	}
+	if got := mA.chatCount(); got != 2 {
+		t.Errorf("A chat count = %d, want 2 (warmup + busy request; R should have migrated away)", got)
+	}
+	if got := mB.chatCount(); got != 1 {
+		t.Errorf("B chat count = %d, want 1 (the migrated request)", got)
+	}
+	mB.mu.Lock()
+	restores := len(mB.restores)
+	mB.mu.Unlock()
+	if restores < 1 {
+		t.Error("migrated request did not restore its transferred disk cache on B")
+	}
+}
+
+// TestQueueMigrationColdWaitsDoubleThreshold verifies the guard for requests
+// without a transferable disk key: a cold queued request is NOT migrated at
+// QUEUE_MIGRATION_AFTER (migration would trade an imminent serve for a full
+// recompute) — it stays on the busy backend and is served there once the slot
+// frees before its doubled age threshold elapses.
+func TestQueueMigrationColdWaitsDoubleThreshold(t *testing.T) {
+	withTempMetaDir(t)
+	withMigrationAfter(t, 1.0) // cold requests need >= 2s to be migrated
+	tokensP := seq(800)
+	tokensR := offsetSeq(400, 200000)
+	mA := newMockLlama(t, "cold-model", 32768, tokensP, 1)
+	mB := newMockLlama(t, "cold-model", 32768, tokensP, 1)
+	beA := backendKeyFromURL(mA.srv.URL)
+	beB := backendKeyFromURL(mB.srv.URL)
+	withTestBackend(t, []map[string]any{
+		{"url": mA.srv.URL, "cache_dir": t.TempDir()},
+		{"url": mB.srv.URL, "cache_dir": t.TempDir()},
+	})
+	bm := proxycache.GetBackendManager()
+	markBackendsUp(bm)
+	injectModels(bm, dm("cold-model", 32768, beA, beB))
+
+	bm.Mu.Lock()
+	bm.BackendState[beB] = false
+	bm.Mu.Unlock()
+
+	// A1: holds A's slot for 1.5s — enough to outlast the 1s disk-migration
+	// threshold, short of R's 2s cold threshold.
+	mA.tokens = tokensP
+	mA.chatDelay = 1500 * time.Millisecond
+	doneA1 := make(chan *httptest.ResponseRecorder, 1)
+	go func() { doneA1 <- postChat(t, `{"model": "cold-model", "messages": [{"role": "user", "content": "busy"}]}`) }()
+	waitFor(t, 5*time.Second, func() bool { return mA.chatCount() >= 1 })
+
+	// R: cold (no cache anywhere), queued on A while B stays down.
+	mA.tokens = tokensR
+	doneR := make(chan *httptest.ResponseRecorder, 1)
+	go func() { doneR <- postChat(t, `{"model": "cold-model", "messages": [{"role": "user", "content": "cold"}]}`) }()
+
+	wR := <-doneR
+	wA1 := <-doneA1
+	if wR.Code != http.StatusOK || wA1.Code != http.StatusOK {
+		t.Fatalf("statuses: R=%d A1=%d, want 200/200", wR.Code, wA1.Code)
+	}
+	if got := mA.chatCount(); got != 2 {
+		t.Errorf("A chat count = %d, want 2 (cold request should wait for the slot, not migrate at 1x)", got)
+	}
+	if got := mB.chatCount(); got != 0 {
+		t.Errorf("B chat count = %d, want 0 (nothing should have migrated)", got)
+	}
+}
+
 // TestRequeueWhenBackendStopsServingModel verifies that a worker whose backend
 // no longer serves the requested model (model disappeared from the registry,
 // e.g. after liveness re-discovery) hands the request back to the global
@@ -759,6 +905,37 @@ func TestQueueCapOverflowGlobalQueue(t *testing.T) {
 	}
 	if got := proxycache.GetDispatcher().OverflowLen(); got != 0 {
 		t.Errorf("overflow queue after drain = %d, want 0", got)
+	}
+}
+
+// TestMultiSlotConcurrency verifies the pump serves one in-flight request per
+// free slot: with a 2-slot backend, a second request dispatched while the
+// first is still running overlaps it instead of waiting in its queue.
+func TestMultiSlotConcurrency(t *testing.T) {
+	withTempMetaDir(t)
+	m := newMockLlama(t, "conc-model", 32768, seq(200), 2)
+	m.chatDelay = 400 * time.Millisecond
+	be := backendKeyFromURL(m.srv.URL)
+	withTestBackend(t, []map[string]any{{"url": m.srv.URL, "cache_dir": t.TempDir()}})
+	markBackendsUp(proxycache.GetBackendManager())
+	injectModels(proxycache.GetBackendManager(), dm("conc-model", 32768, be))
+
+	body1 := `{"model": "conc-model", "messages": [{"role": "user", "content": "one"}]}`
+	body2 := `{"model": "conc-model", "messages": [{"role": "user", "content": "two"}]}`
+	done1 := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done1 <- postChat(t, body1) }()
+
+	// Wait until request 1 is in flight on the backend (holding a slot).
+	waitFor(t, 5*time.Second, func() bool { return m.chatCount() >= 1 })
+
+	w2 := postChat(t, body2) // must dispatch to the other free slot in parallel
+	w1 := <-done1
+
+	if w1.Code != http.StatusOK || w2.Code != http.StatusOK {
+		t.Fatalf("statuses = %d/%d, want 200/200", w1.Code, w2.Code)
+	}
+	if mc := m.maxChatConcurrency(); mc < 2 {
+		t.Fatalf("max concurrent backend chats = %d, want 2 (free slot should be served in parallel)", mc)
 	}
 }
 

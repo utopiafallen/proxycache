@@ -8,10 +8,15 @@
 //	    backend, and enqueues it on that backend's queue. A request whose
 //	    chosen backend has a full queue is parked in the global overflow queue
 //	    (FIFO) and re-matched whenever capacity frees up.
-//	backendWorker.run (1 goroutine per backend) processes queued requests
-//	    sequentially: acquire a slot on this backend, restore the cache if it
-//	    is available here (including files that arrived via P2P transfer),
-//	    dispatch to llama.cpp, save the cache, release the slot.
+//	The dispatcher's pump (same goroutine) dispatches each backend's queue
+//	    head to a fresh worker goroutine while TryAcquire succeeds — the slot
+//	    pool is the concurrency limiter, so a backend with N free slots runs
+//	    up to N requests in flight. Each worker restores the cache if it is
+//	    available on its backend (including files that arrived via P2P
+//	    transfer), dispatches to llama.cpp, saves the cache, and releases the
+//	    slot; completion re-wakes the pump for the next queued request. The
+//	    first request for a model whose pool does not exist yet gets a worker
+//	    that performs lazy discovery (refresh + ServesModel gate).
 //
 // Routing rule: a request with a cache hit goes to the hit backend while its
 // queue depth stays below CacheHitQueueLimit; otherwise it is distributed
@@ -50,6 +55,13 @@ type ProcRequest struct {
 	done     chan struct{}
 	doneOnce sync.Once
 	route    *RouteDecision // set by the matcher before enqueue
+
+	// enqueuedAt is when the request was placed on its current backend queue
+	// (used for queue-migration aging); migratedFrom is the source backend
+	// when the dispatcher moved the request to a different (idle) one, "" if
+	// never migrated. A request migrates at most once.
+	enqueuedAt   time.Time
+	migratedFrom string
 }
 
 func (p *ProcRequest) finish() {
@@ -95,19 +107,20 @@ type HitInfo struct {
 	Canonical string // model name of the hit
 }
 
-// --- Per-backend worker ---
+// --- Per-backend queue ---
 
-// backendWorker is one backend's queue + sequential processing goroutine.
+// backendWorker is one backend's FIFO request queue. There is no long-lived
+// goroutine per backend: the dispatcher's pump spawns a worker goroutine for
+// each dispatched request, bounded by the slot pool (one in flight per free
+// slot). All fields are guarded by the dispatcher's mu.
 type backendWorker struct {
-	beID  string
-	queue chan *ProcRequest
-	// queued counts items currently sitting in `queue` (guarded by the
-	// dispatcher's mu). Incremented when enqueued, decremented when popped;
-	// at all times queued == len(queue).
-	queued int
-	// current is the request being processed right now (nil between
-	// requests), guarded by the dispatcher's mu.
-	current *ProcRequest
+	beID string
+	// queue holds requests waiting for a free slot, FIFO.
+	queue []*ProcRequest
+	// inFlight holds requests whose worker goroutine has been spawned and
+	// not yet finished (each holds — or, in the lazy-discovery case, is
+	// working toward — exactly one slot).
+	inFlight []*ProcRequest
 }
 
 // --- Dispatcher ---
@@ -152,8 +165,8 @@ func (d *RequestDispatcher) Start() {
 	logInfo("matcher", "Request matcher started (queue_max=%d, hit_limit=%d)", BackendQueueMax, CacheHitQueueLimit)
 }
 
-// Stop cancels the matcher and workers, discards parked requests, and waits
-// up to timeout for in-flight work to drain.
+// Stop cancels the matcher, discards parked and queued requests, and waits up
+// to timeout for in-flight work to drain.
 func (d *RequestDispatcher) Stop(timeout time.Duration) {
 	d.mu.Lock()
 	if !d.started || d.stopped {
@@ -162,14 +175,13 @@ func (d *RequestDispatcher) Stop(timeout time.Duration) {
 	}
 	d.stopped = true
 	d.cancel()
-	overflow := d.overflow
-	d.overflow = nil
+	toDiscard := d.takeParkedLocked()
 	d.mu.Unlock()
-	for _, req := range overflow {
+	for _, req := range toDiscard {
 		d.discard(req, "shutdown")
 	}
 	done := make(chan struct{})
-	go func() { d.wg.Wait(); close(done) }()
+	go func() { d.active.Wait(); d.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(timeout):
@@ -177,26 +189,38 @@ func (d *RequestDispatcher) Stop(timeout time.Duration) {
 	}
 }
 
+// takeParkedLocked returns and clears every non-in-flight request: the global
+// overflow queue plus everything sitting in per-backend queues. Caller holds d.mu.
+func (d *RequestDispatcher) takeParkedLocked() []*ProcRequest {
+	out := d.overflow
+	d.overflow = nil
+	for _, w := range d.workers {
+		out = append(out, w.queue...)
+		w.queue = nil
+	}
+	return out
+}
+
 // AbortAll cancels every parked, queued, and in-flight request, then waits up
-// to timeout for in-flight processing to wind down. Queued items are dropped
-// by their workers at the next dequeue (the cancellation check). The matcher
-// loop itself keeps running; this is meant for tests that swap out the global
-// backend manager while worker goroutines may still reference it.
+// to timeout for in-flight processing to wind down. The matcher loop itself
+// keeps running; this is meant for tests that swap out the global backend
+// manager while worker goroutines may still reference it.
 func (d *RequestDispatcher) AbortAll(timeout time.Duration) {
 	d.mu.Lock()
 	if !d.started {
 		d.mu.Unlock()
 		return
 	}
+	toDiscard := d.takeParkedLocked()
 	var toAbort []*ProcRequest
-	toAbort = append(toAbort, d.overflow...)
-	d.overflow = nil
 	for _, w := range d.workers {
-		if w.current != nil {
-			toAbort = append(toAbort, w.current)
-		}
+		toAbort = append(toAbort, w.inFlight...)
+		w.inFlight = nil
 	}
 	d.mu.Unlock()
+	for _, req := range toDiscard {
+		d.discard(req, "shutdown")
+	}
 	for _, req := range toAbort {
 		req.abort()
 	}
@@ -237,12 +261,12 @@ func (d *RequestDispatcher) notify() {
 	}
 }
 
-// QueueDepth returns the number of queued (not yet processed) requests for a backend.
+// QueueDepth returns the number of queued (not yet dispatched) requests for a backend.
 func (d *RequestDispatcher) QueueDepth(beID string) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if w, ok := d.workers[beID]; ok {
-		return w.queued
+		return len(w.queue)
 	}
 	return 0
 }
@@ -255,17 +279,14 @@ func (d *RequestDispatcher) OverflowLen() int {
 }
 
 // QueuesSnapshot returns per-backend queue state (queued count, in-flight
-// flag), the per-backend queue cap, and the global overflow length.
+// count — up to the number of free slots), the per-backend queue cap, and the
+// global overflow length.
 func (d *RequestDispatcher) QueuesSnapshot() map[string]any {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	out := map[string]any{}
 	for beID, w := range d.workers {
-		inFlight := 0
-		if w.current != nil {
-			inFlight = 1
-		}
-		out[beID] = map[string]any{"queued": w.queued, "in_flight": inFlight}
+		out[beID] = map[string]any{"queued": len(w.queue), "in_flight": len(w.inFlight)}
 	}
 	out["queue_max"] = BackendQueueMax
 	out["overflow"] = len(d.overflow)
@@ -305,6 +326,8 @@ func (d *RequestDispatcher) run() {
 		}
 		burst = burst[:0]
 		d.drainOverflow()
+		d.migrateStale()
+		d.pumpAll()
 	}
 }
 
@@ -358,6 +381,105 @@ func (d *RequestDispatcher) drainOverflow() {
 			return
 		}
 		logInfo("matcher", "Routed overflow request %s to backend '%s' (%s)", req.requestID, decision.selected.BackendID, routingLogExtra(decision))
+	}
+}
+
+// migrateStale moves queued requests that have waited longer than
+// QueueMigrationAfter to a fully idle backend (empty queue, no in-flight work)
+// that serves the same model, so they start immediately instead of waiting out
+// the source's backlog. Runs on the dispatcher goroutine after every overflow
+// drain and on each tick. Guard rails:
+//   - only requests older than QueueMigrationAfter are eligible; a request
+//     whose hit is not a transferable disk key (pending-slot-only, or no cache
+//     at all) needs twice that age — for it, migrating trades a cheap future
+//     restore for an immediate full recompute on the target.
+//   - each request migrates at most once (migratedFrom stays set).
+//   - at most one request per idle backend per pass (the target stops being
+//     idle the moment it takes work).
+//
+// When the request's best disk key does not already live on the target, a P2P
+// transfer is triggered so the target worker can restore from it (bounded wait;
+// recompute fallback if the transfer loses the race).
+func (d *RequestDispatcher) migrateStale() {
+	d.mu.Lock()
+	now := time.Now()
+	base := time.Duration(QueueMigrationAfter * float64(time.Second))
+
+	var idle []string
+	// Idle targets come from the backend registry, not d.workers — a backend
+	// that has never been enqueued to has no worker entry yet.
+	bm := backendManager
+	bm.Mu.RLock()
+	beIDs := make([]string, len(bm.KeyOrder))
+	copy(beIDs, bm.KeyOrder)
+	states := make(map[string]bool, len(bm.BackendState))
+	for k, v := range bm.BackendState {
+		states[k] = v
+	}
+	bm.Mu.RUnlock()
+	for _, beID := range beIDs {
+		if !states[beID] {
+			continue
+		}
+		if w := d.workers[beID]; w != nil && (len(w.queue) > 0 || len(w.inFlight) > 0) {
+			continue
+		}
+		idle = append(idle, beID)
+	}
+
+	moved := 0
+	type xfer struct{ src, dst, key string }
+	var transfers []xfer
+	for srcID, sw := range d.workers {
+		for i := range sw.queue {
+			req := sw.queue[i]
+			if req.migratedFrom != "" || req.route == nil {
+				continue
+			}
+			need := base
+			if req.route.diskRestoreKey == "" {
+				need = 2 * base
+			}
+			if now.Sub(req.enqueuedAt) < need {
+				continue
+			}
+			target := ""
+			for _, tb := range idle {
+				if tb != srcID && backendManager.ServesModel(req.route.selected.ModelName, tb) {
+					target = tb
+					break
+				}
+			}
+			if target == "" {
+				continue
+			}
+			age := now.Sub(req.enqueuedAt)
+			sw.queue = append(sw.queue[:i], sw.queue[i+1:]...)
+			tw := d.getWorkerLocked(target)
+			tw.queue = append(tw.queue, req)
+			req.enqueuedAt = now
+			req.migratedFrom = srcID
+			moved++
+			for k, tb := range idle {
+				if tb == target {
+					idle = append(idle[:k], idle[k+1:]...)
+					break
+				}
+			}
+			if req.route.diskRestoreKey != "" && req.route.diskRestoreBackend != target {
+				transfers = append(transfers, xfer{req.route.diskRestoreBackend, target, req.route.diskRestoreKey})
+			}
+			logInfo("matcher", "Migrated stale request %s from backend '%s' to idle backend '%s' (queued %.0fs, key=%s)",
+				req.requestID, srcID, target, age.Seconds(), key16OrNil(req.route.diskRestoreKey))
+		}
+	}
+	d.mu.Unlock()
+	// Fire P2P transfers outside the lock (they stat files / spawn goroutines).
+	for _, xf := range transfers {
+		RequestCacheTransfer(xf.src, xf.dst, xf.key)
+	}
+	if moved > 0 {
+		logInfo("matcher", "Queue migration: moved %d stale request(s) to idle backends", moved)
 	}
 }
 
@@ -623,7 +745,7 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		if w, ok := d.workers[beID]; ok {
-			return w.queued
+			return len(w.queue)
 		}
 		return 0
 	}
@@ -747,71 +869,114 @@ func SelectBackend(cands []CandidateBackend, hit *HitInfo, pendingOf func(backen
 	return -1, "all_queues_full"
 }
 
-// --- Worker queue management ---
+// --- Backend queue management + pump ---
 
 func (d *RequestDispatcher) getWorkerLocked(beID string) *backendWorker {
 	w, ok := d.workers[beID]
 	if !ok {
-		w = &backendWorker{beID: beID, queue: make(chan *ProcRequest, BackendQueueMax)}
+		w = &backendWorker{beID: beID}
 		d.workers[beID] = w
-		d.wg.Add(1)
-		go w.run(d)
 	}
 	return w
 }
 
 // tryEnqueue reserves a queue slot for the backend and enqueues the request.
-// Returns false when the queue is full. The reservation and the send are
-// consistent: queued counts channel contents exactly, so a successful
-// reservation guarantees the send cannot block.
+// Returns false when the queue is full. The reservation and the append happen
+// under the same lock, so a successful reservation is the send itself.
 func (d *RequestDispatcher) tryEnqueue(req *ProcRequest, beID string) bool {
 	d.mu.Lock()
 	w := d.getWorkerLocked(beID)
-	if w.queued >= BackendQueueMax {
+	if len(w.queue) >= BackendQueueMax {
 		d.mu.Unlock()
 		return false
 	}
-	w.queued++
+	req.enqueuedAt = time.Now()
+	w.queue = append(w.queue, req)
 	d.mu.Unlock()
-	w.queue <- req
 	return true
 }
 
-func (w *backendWorker) run(d *RequestDispatcher) {
-	defer d.wg.Done()
+// pumpAll dispatches queued requests on every backend as far as free slots
+// allow. Runs on the dispatcher goroutine; called after each batch of
+// arrivals, after overflow drain, and on every activity/tick wake so that a
+// freeing slot promptly starts the next queued request.
+func (d *RequestDispatcher) pumpAll() {
+	d.mu.Lock()
+	beIDs := make([]string, 0, len(d.workers))
+	for beID := range d.workers {
+		beIDs = append(beIDs, beID)
+	}
+	d.mu.Unlock()
+	for _, beID := range beIDs {
+		d.pumpBackend(beID)
+	}
+}
+
+// pumpBackend keeps dispatching the head of one backend's queue while a free
+// slot is available (FIFO head-only). For each dispatch it atomically
+// TryAcquires a slot and hands it to a fresh worker goroutine, so the number
+// of in-flight workers never exceeds the number of free slots. When the head
+// model's pool does not exist yet and nothing is in flight, it instead spawns
+// one worker that performs lazy discovery (refresh + ServesModel gate).
+func (d *RequestDispatcher) pumpBackend(beID string) {
 	for {
-		select {
-		case <-d.ctx.Done():
-			for {
-				select {
-				case req := <-w.queue:
-					d.mu.Lock()
-					w.queued--
-					d.mu.Unlock()
-					d.discard(req, "shutdown")
-				default:
-					return
-				}
+		var req *ProcRequest
+		slotID := -1
+		d.mu.Lock()
+		if w, ok := d.workers[beID]; ok && len(w.queue) > 0 {
+			head := w.queue[0]
+			modelName := head.route.selected.ModelName
+			beSm := slotManager.Get(beID)
+			pool := beSm.GetPool(modelName)
+			if pool != nil && len(pool) > 0 {
+				slotID = beSm.TryAcquire(modelName)
+			} else if len(w.inFlight) == 0 {
+				slotID = -2 // bootstrap: no pool yet, spawn a discovering worker
 			}
-		case req := <-w.queue:
-			d.mu.Lock()
-			w.queued--
-			d.mu.Unlock()
-			if err := req.ctx.Err(); err != nil {
-				d.discard(req, "client_disconnected")
-				d.notify()
-				continue
+			if slotID != -1 {
+				req = head
+				w.queue = w.queue[1:]
+				w.inFlight = append(w.inFlight, req)
 			}
-			d.mu.Lock()
-			w.current = req
-			d.mu.Unlock()
-			d.active.Add(1)
-			processWorkerRequest(d, w, req)
-			d.active.Done()
-			d.mu.Lock()
-			w.current = nil
-			d.mu.Unlock()
-			d.notify()
+		}
+		d.mu.Unlock()
+		if req == nil {
+			return
+		}
+		if err := req.ctx.Err(); err != nil {
+			d.dropInFlight(beID, req)
+			d.discard(req, "client_disconnected")
+			continue
+		}
+		d.active.Add(1)
+		go d.runWorker(beID, req, slotID)
+	}
+}
+
+// runWorker is one dispatched request's goroutine: process it (slotID >= 0
+// means the pump pre-acquired the slot; slotID == -2 means acquire it here via
+// lazy discovery), then release the in-flight mark and re-wake the pump.
+func (d *RequestDispatcher) runWorker(beID string, req *ProcRequest, slotID int) {
+	defer d.active.Done()
+	defer d.workerFinished(beID, req)
+	processWorkerRequest(d, beID, req, slotID)
+}
+
+// workerFinished clears the in-flight mark and wakes the dispatcher so a freed
+// slot can start the next queued request.
+func (d *RequestDispatcher) workerFinished(beID string, req *ProcRequest) {
+	d.dropInFlight(beID, req)
+	d.notify()
+}
+
+func (d *RequestDispatcher) dropInFlight(beID string, req *ProcRequest) {
+	d.mu.Lock()
+	w := d.workers[beID]
+	for i, r := range w.inFlight {
+		if r == req {
+			w.inFlight = append(w.inFlight[:i], w.inFlight[i+1:]...)
+			break
 		}
 	}
+	d.mu.Unlock()
 }
