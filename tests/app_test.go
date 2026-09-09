@@ -981,12 +981,21 @@ func TestPumpDiscardDoesNotLeakSlot(t *testing.T) {
 		return m.chatCount() == 1 && proxycache.GetDispatcher().QueueDepth(be) >= 1
 	})
 
-	// B's client disconnects while it is still queued. A then finishes and frees
-	// the slot; the pump dispatches B, finds its context already cancelled, and
-	// discards it — releasing the slot it just acquired.
+	// B's client disconnects while it is still queued. A then finishes and
+	// frees the slot; the pump dispatches B, finds its context already
+	// cancelled, and discards it — releasing the slot it just acquired.
+	// Note: ChatHandler returns as soon as the client context is cancelled,
+	// so doneB fires *before* the dispatcher has processed B's cancellation.
+	// The slot is legitimately in use for a few microseconds while the pump
+	// pre-acquires-then-releases it, so assert on the settled state (queue
+	// drained, nothing in use) rather than racing that window: a real leak
+	// would never settle to 0.
 	cancelB()
 	codeA := <-doneA
 	<-doneB
+	waitFor(t, 5*time.Second, func() bool {
+		return proxycache.GetDispatcher().QueueDepth(be) == 0 && beSm.CountInUse(model) == 0
+	})
 
 	if got := beSm.CountInUse(model); got != 0 {
 		t.Fatalf("slot leaked after a queued request was discarded: CountInUse=%d, want 0", got)

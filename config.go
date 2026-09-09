@@ -76,8 +76,15 @@ var (
 	CacheTransferTimeout = EnvFloat("CACHE_TRANSFER_TIMEOUT", 300)
 	// CacheTransferWait bounds how long the serving worker waits for an
 	// in-flight P2P transfer of its own request's cache key to complete
-	// before proceeding without a restore.
+	// before proceeding without a restore. It is a FLOOR: the effective wait
+	// is scaled up by file size at CacheTransferAssumedMBps so multi-GB
+	// entries get a realistic chance to land (the wait still ends the moment
+	// the transfer completes, so the scale-up costs nothing on fast links).
 	CacheTransferWait = EnvFloat("CACHE_TRANSFER_WAIT", 5)
+	// CacheTransferAssumedMBps is the assumed worst-case P2P throughput used
+	// to scale the worker's transfer wait by file size (e.g. ~100 covers a
+	// 1GbE LAN; raise it on faster networks). 0 disables the size scaling.
+	CacheTransferAssumedMBps = EnvFloat("CACHE_TRANSFER_ASSUMED_MBPS", 100)
 	// MatchScanTimeout bounds the tokenize/disk-scan phase run by the global
 	// matcher for one request.
 	MatchScanTimeout = EnvFloat("MATCH_SCAN_TIMEOUT", 15)

@@ -25,7 +25,7 @@ proxycache sits between clients and one or more `llama.cpp` backends. It interce
 
 - **Queue migration** — a monitor (1s cadence) moves a request that has waited in a backend queue past `QUEUE_MIGRATION_AFTER` (default 120s) to a fully idle backend that serves the same model, so it starts immediately; the best disk cache is P2P-transferred to the target when needed. Each request migrates at most once, and requests without a transferable disk key (pending-slot-only or cold) need twice the age before they move — for them, migration trades a cheap future restore for an immediate full recompute.
 
-- **P2P cache transfer** — cache files move between backends over four paths (agent→agent push, local↔local direct copy, local→agent upload, agent→local pull). Transfers are async and deduped per (key, target), skipped when the target already holds the file; the receiving side makes space within its own `cache_max_size_gb` budget. This is what makes "route to a backend that doesn't have the cache yet" safe: the serving worker bounded-waits (`CACHE_TRANSFER_WAIT`, default 5s) for an in-flight transfer before falling back to recompute.
+- **P2P cache transfer** — cache files move between backends over four paths (agent→agent push, local↔local direct copy, local→agent upload, agent→local pull), streamed end to end with fixed-size buffers (multi-GB safe) and checkpoint sidecar files included when present. Transfers are async and deduped per (key, target), skipped when the target already holds the file; the receiving side makes space within its own `cache_max_size_gb` budget. This is what makes "route to a backend that doesn't have the cache yet" safe: the serving worker bounded-waits for an in-flight transfer before falling back to recompute — at least `CACHE_TRANSFER_WAIT` (default 5s), scaled up by file size assuming `CACHE_TRANSFER_ASSUMED_MBPS` throughput (default 100 MB/s) so multi-GB entries get a realistic window.
 
 - **Slot management** — per-model, per-backend slot pools with lazy discovery (first request for an unseen model triggers a refresh; if the backend no longer serves the model, the request is requeued for re-matching rather than failing). Free slots are preferred; when all are busy the request simply waits in the queue. Slots whose tracked KV cache already matches the incoming prompt skip restore entirely (the proxy re-validates this against the actually-acquired slot, falling back to a disk restore if the warm state went stale).
 
@@ -68,7 +68,8 @@ All config via environment variables (defaults in `config.go`). No `.env` file s
 | `BACKEND_QUEUE_MAX` | `5` | Max queued (not yet dispatched) requests per backend; overflow goes to the global FIFO queue |
 | `CACHE_HIT_QUEUE_LIMIT` | `2` | Max queued requests routed to a cache-hit backend before falling back to round-robin + P2P transfer |
 | `CACHE_TRANSFER_TIMEOUT` | `300` | Timeout for a single P2P transfer HTTP exchange (seconds) |
-| `CACHE_TRANSFER_WAIT` | `5` | How long a serving worker waits for an in-flight P2P transfer of its cache key before proceeding without a restore (seconds) |
+| `CACHE_TRANSFER_WAIT` | `5` | Minimum time a serving worker waits for an in-flight P2P transfer of its cache key before proceeding without a restore (seconds; scaled up by file size, see below) |
+| `CACHE_TRANSFER_ASSUMED_MBPS` | `100` | Assumed worst-case P2P throughput used to scale the transfer wait by file size (MB/s). Raise on faster networks; 0 disables scaling |
 | `MATCH_SCAN_TIMEOUT` | `15` | Timeout for the matcher's tokenize/disk-scan phase per request (seconds) |
 | `QUEUE_MIGRATION_AFTER` | `120` | How long a request may sit in a backend queue before migrating to an idle backend serving its model (seconds; 2x for requests without a transferable disk key) |
 | `LIVENESS_DIAG_RECORD_INTERVAL` | `60` | Min seconds between `liveness_diag` metrics events per backend unless state changed |
@@ -146,7 +147,7 @@ models:
 
 ## Cache Management
 
-Each backend can be configured with either `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). These options are mutually exclusive. Each backend can also optionally specify `cache_max_size_gb` to control its individual cache ring buffer size (default: `25`).
+Each backend can be configured with either `cache_dir` (local filesystem) or `agent_port` (remote cache-agent). These options are mutually exclusive. A local (`cache_dir`) backend can additionally set `agent_serve_port`: the proxy then serves an embedded cache-agent for that cache dir, so other machines' proxies can treat this backend as a normal `agent_port` backend (no separate `cache-agent.exe` needed on this host). Each backend can also optionally specify `cache_max_size_gb` to control its individual cache ring buffer size (default: `25`).
 
 These settings double as the transport for inter-backend P2P cache transfers: when routing sends a request to a backend that lacks its best cache, the proxy moves the file there using the agents' transfer/upload/fetch endpoints (or direct file copy between local backends).
 
@@ -160,7 +161,7 @@ BACKENDS='[{"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache","cache_max_s
 
 ### Cache Agent
 
-For remote backends, use a lightweight Go HTTP server alongside each `llama.cpp` instance to manage cache files.
+For remote backends, use the standalone Go cache-agent alongside each `llama.cpp` instance to manage cache files over HTTP (size lookups, deletion, eviction, and P2P transfer of cache files — including `<key>.ckpt`/`<key>.ckpt.N` checkpoint sidecars when present).
 
 #### Building
 
@@ -192,13 +193,13 @@ You can mix both styles across backends:
 
 ```bash
 BACKENDS='[
-  {"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache/b1","cache_max_size_gb":50},
+  {"url":"http://10.0.0.1:8000","cache_dir":"/var/kvcache/b1","cache_max_size_gb":50,"agent_serve_port":8083},
   {"url":"http://10.0.0.2:8000","agent_port":8082,"cache_max_size_gb":10},
   {"url":"http://10.0.0.3:8000"}
 ]'
 ```
 
-The first backend uses local filesystem, the second uses the cache agent, and the third has no cache management.
+The first backend uses local filesystem (and exposes it as a cache-agent on port `8083` for other proxies), the second uses a standalone cache agent, and the third has no cache management.
 
 ## Quick Start
 

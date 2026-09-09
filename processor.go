@@ -92,7 +92,8 @@ func resolveRestoreKey(req *ProcRequest, dec *RouteDecision, beID string, canSki
 		return dec.diskRestoreKey
 	}
 	if TransferInFlight(dec.diskRestoreKey, beID) {
-		waitForTransferComplete(req.ctx, dec.diskRestoreKey, beID)
+		waitForTransferComplete(req.ctx, dec.diskRestoreKey, beID,
+			transferWaitFor(int64(backendManager.CacheGetSize(dec.diskRestoreBackend, dec.diskRestoreKey))))
 	}
 	if backendManager.CacheExists(beID, dec.diskRestoreKey) {
 		logInfo("processor", "P2P cache ready on fallback backend '%s' for key %s (request %s)",
@@ -102,12 +103,28 @@ func resolveRestoreKey(req *ProcRequest, dec *RouteDecision, beID string, canSki
 	return ""
 }
 
+// transferWaitFor computes the worker's bounded wait for an in-flight P2P
+// transfer: at least CacheTransferWait, scaled up by file size assuming
+// CacheTransferAssumedMBps so multi-GB entries can actually land before the
+// request falls back to recompute. The wait loop exits as soon as the
+// transfer finishes, so the scale-up never delays a fast transfer.
+func transferWaitFor(sizeBytes int64) time.Duration {
+	wait := time.Duration(CacheTransferWait * float64(time.Second))
+	if sizeBytes > 0 && CacheTransferAssumedMBps > 0 {
+		est := time.Duration(float64(sizeBytes) / (1024*1024*CacheTransferAssumedMBps) * float64(time.Second))
+		if est > wait {
+			wait = est
+		}
+	}
+	return wait
+}
+
 // waitForTransferComplete blocks until the transfer of key to beID finishes
-// or CacheTransferWait seconds elapse (or the client disconnects).
-func waitForTransferComplete(ctx context.Context, key, beID string) {
-	deadline := time.Now().Add(time.Duration(CacheTransferWait * float64(time.Second)))
+// or wait elapses (or the client disconnects).
+func waitForTransferComplete(ctx context.Context, key, beID string, wait time.Duration) {
+	deadline := time.Now().Add(wait)
 	logInfo("processor", "Waiting up to %.1fs for P2P transfer of key %s to backend '%s'",
-		CacheTransferWait, key16(key), beID)
+		wait.Seconds(), key16(key), beID)
 	for TransferInFlight(key, beID) {
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			break

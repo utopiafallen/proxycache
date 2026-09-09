@@ -39,6 +39,7 @@ type BackendInfo struct {
 	AgentClient    *CacheAgentClient
 	CacheDir       string // "" when the backend uses a remote agent
 	CacheMaxSizeGB float64
+	AgentServePort int // >0: expose this local cache dir as a cache-agent on this port
 }
 
 type BackendModelKey struct {
@@ -83,7 +84,9 @@ var lcpSplitRe = regexp.MustCompile(`([-_])`)
 
 // NewBackendManager parses the backend config (same validation as Python:
 // cache_dir and agent_port are mutually exclusive; exactly one required when
-// cache_max_size_gb > 0).
+// cache_max_size_gb > 0). A local backend may additionally set
+// agent_serve_port to expose its cache dir as a cache-agent (P2P source for
+// other proxies); it must not collide with the proxy port or other backends.
 func NewBackendManager(backendConfig []map[string]any) *BackendManager {
 	bm := &BackendManager{
 		Backends:               map[string]*BackendInfo{},
@@ -94,6 +97,7 @@ func NewBackendManager(backendConfig []map[string]any) *BackendManager {
 		BackendLatencyEMA:      map[string]float64{},
 		BackendModelLatencyEMA: map[ModelEMAKey]float64{},
 	}
+	agentPorts := map[int]string{}
 	for _, be := range backendConfig {
 		urlStr, _ := be["url"].(string)
 		u := strings.TrimRight(urlStr, "/")
@@ -109,6 +113,26 @@ func NewBackendManager(backendConfig []map[string]any) *BackendManager {
 		if hasAgentPort && cacheDir != "" {
 			panic(fmt.Sprintf("Backend %s: cache_dir and agent_port are mutually exclusive. "+
 				"Use cache_dir for local cache management or agent_port for remote cache-agent.", urlStr))
+		}
+		agentServePort := 0
+		if v, ok := ToFloat(be["agent_serve_port"]); ok {
+			agentServePort = int(v)
+		}
+		if hasAgentPort && agentServePort > 0 {
+			panic(fmt.Sprintf("Backend %s: agent_port and agent_serve_port are mutually exclusive. "+
+				"agent_port reads a remote cache-agent; agent_serve_port exposes a local cache_dir as one.", urlStr))
+		}
+		if agentServePort > 0 && cacheDir == "" {
+			panic(fmt.Sprintf("Backend %s: agent_serve_port requires cache_dir (there is nothing local to serve).", urlStr))
+		}
+		if agentServePort > 0 {
+			if agentServePort == Port {
+				panic(fmt.Sprintf("Backend %s: agent_serve_port %d collides with the proxy port.", urlStr, agentServePort))
+			}
+			if other, dup := agentPorts[agentServePort]; dup {
+				panic(fmt.Sprintf("Backend %s: agent_serve_port %d already used by backend %s.", urlStr, agentServePort, other))
+			}
+			agentPorts[agentServePort] = urlStr
 		}
 		cacheMaxSizeGB := 25.0
 		if v, ok := ToFloat(be["cache_max_size_gb"]); ok {
@@ -130,6 +154,7 @@ func NewBackendManager(backendConfig []map[string]any) *BackendManager {
 			AgentClient:    agentClient,
 			CacheDir:       cacheDir,
 			CacheMaxSizeGB: cacheMaxSizeGB,
+			AgentServePort: agentServePort,
 		}
 		bm.KeyOrder = append(bm.KeyOrder, key)
 		if bm.firstKey == "" {
@@ -242,10 +267,11 @@ func (bm *BackendManager) GetRefreshTS(modelName, backendKey string) float64 {
 // BackendInfoView is a safe copy of a backend's public config for the health
 // endpoint.
 type BackendInfoView struct {
-	URL       string
-	CacheDir  string
-	HasAgent  bool
-	MaxSizeGB float64
+	URL            string
+	CacheDir       string
+	HasAgent       bool
+	MaxSizeGB      float64
+	AgentServePort int
 }
 
 // GetBackendInfo returns a copy of a backend's public config, or nil if unknown.
@@ -257,10 +283,11 @@ func (bm *BackendManager) GetBackendInfo(key string) *BackendInfoView {
 		return nil
 	}
 	return &BackendInfoView{
-		URL:       be.Client.BaseURL(),
-		CacheDir:  be.CacheDir,
-		HasAgent:  be.AgentClient != nil,
-		MaxSizeGB: be.CacheMaxSizeGB,
+		URL:            be.Client.BaseURL(),
+		CacheDir:       be.CacheDir,
+		HasAgent:       be.AgentClient != nil,
+		MaxSizeGB:      be.CacheMaxSizeGB,
+		AgentServePort: be.AgentServePort,
 	}
 }
 

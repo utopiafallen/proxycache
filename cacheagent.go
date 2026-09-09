@@ -1,5 +1,17 @@
-// cacheagent.go — HTTP client for the remote cache-agent (deletion + file
-// size lookups for backends whose cache lives on a remote host).
+// cacheagent.go — HTTP client for the cache-agent (deletion, file size
+// lookups, P2P transfer orchestration calls) plus the embedded cache-agent
+// server (AgentServer).
+//
+// AgentServer is an embedded copy of the standalone cache-agent binary
+// (cache-agent/main.go — a separate module). It is started for local
+// backends that set "agent_serve_port" so this proxycache can serve as the
+// cache-agent for its own local llama instances (remote proxies then see
+// those backends as ordinary agent_port backends and P2P transfers work).
+// Keep the two implementations in sync.
+//
+// Checkpoint sidecar files (<key>.ckpt, <key>.ckpt.N) are part of a complete
+// cache entry when present: they travel with their key on transfers and are
+// removed with it on delete/eviction.
 
 package proxycache
 
@@ -37,6 +49,24 @@ func NewCacheAgentClient(baseURL string) *CacheAgentClient {
 		client:         &http.Client{Timeout: seconds(SlotTimeout)},
 		transferClient: &http.Client{Timeout: seconds(CacheTransferTimeout)},
 	}
+}
+
+// Sidecars returns the checkpoint sidecar filenames that exist for key
+// (e.g. "key.ckpt", "key.ckpt.0"), via the /cache/files/<key> response.
+// Empty when the file is missing or the agent has no sidecars for it.
+func (a *CacheAgentClient) Sidecars(key string) []string {
+	info := a.GetFileSize(key)
+	if info == nil {
+		return nil
+	}
+	list, _ := info["sidecars"].([]any)
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		if str, ok := s.(string); ok {
+			out = append(out, str)
+		}
+	}
+	return out
 }
 
 // Delete removes a cache file from the agent's CACHE_DIR.
@@ -144,13 +174,36 @@ func (a *CacheAgentClient) Transfer(key, targetURL string, maxBytes int64) bool 
 	return true
 }
 
-// Upload streams file content to the agent's receive endpoint, asking it to
-// free room within the maxBytes budget first. Returns true on success.
-func (a *CacheAgentClient) Upload(key string, data []byte, maxBytes int64) bool {
+// UploadFile streams the file at path to the agent's receive endpoint,
+// asking it to free room within the maxBytes budget first. The file is
+// streamed (fixed-size buffers), never fully buffered in RAM. Content-Length
+// is set explicitly so the target can size its make-space. Returns true on
+// success.
+func (a *CacheAgentClient) UploadFile(key, path string, maxBytes int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		logWarn("cache_agent_client", "Cache upload open failed for %s: %v", truncateKey(key), err)
+		return false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		logWarn("cache_agent_client", "Cache upload stat failed for %s: %v", truncateKey(key), err)
+		return false
+	}
 	q := url.Values{}
 	q.Set("key", key)
-	q.Set("max_bytes", strconv.FormatInt(maxBytes, 10))
-	resp, err := a.transferClient.Post(a.BaseURL+"/cache/receive?"+q.Encode(), "application/octet-stream", bytes.NewReader(data))
+	if maxBytes > 0 {
+		q.Set("max_bytes", strconv.FormatInt(maxBytes, 10))
+	}
+	req, err := http.NewRequest(http.MethodPost, a.BaseURL+"/cache/receive?"+q.Encode(), f)
+	if err != nil {
+		logWarn("cache_agent_client", "Cache upload error on %s for key %s: %s", a.BaseURL, truncateKey(key), err)
+		return false
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = fi.Size()
+	resp, err := a.transferClient.Do(req)
 	if err != nil {
 		logWarn("cache_agent_client", "Cache upload error on %s for key %s: %s", a.BaseURL, truncateKey(key), err)
 		return false
@@ -191,21 +244,34 @@ func (a *CacheAgentClient) MakeSpace(need, maxBytes int64) (bool, int64) {
 	return data.Ok, data.Used
 }
 
-// FetchFile downloads a cache file's content from the agent. Returns an error
-// when the file is missing or the request fails.
-func (a *CacheAgentClient) FetchFile(key string) ([]byte, error) {
+// FetchStream opens a download of the cache file's raw content from the
+// agent and returns the live response body (caller closes it) plus its size
+// (from Content-Length; -1 when unknown). Callers stream it straight to disk.
+func (a *CacheAgentClient) FetchStream(key string) (io.ReadCloser, int64, error) {
 	resp, err := a.transferClient.Get(a.BaseURL + "/cache/file?" + url.Values{"key": {key}}.Encode())
+	if err != nil {
+		return nil, 0, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil, 0, os.ErrNotExist
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		return nil, 0, fmt.Errorf("fetch file: status %d", resp.StatusCode)
+	}
+	return resp.Body, resp.ContentLength, nil
+}
+
+// FetchFile downloads a cache file's full content from the agent. Returns an
+// error when the file is missing or the request fails.
+func (a *CacheAgentClient) FetchFile(key string) ([]byte, error) {
+	body, _, err := a.FetchStream(key)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, os.ErrNotExist
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("fetch file: status %d", resp.StatusCode)
-	}
-	return io.ReadAll(resp.Body)
+	defer body.Close()
+	return io.ReadAll(body)
 }
 
 // Close releases idle connections.
@@ -216,15 +282,16 @@ func (a *CacheAgentClient) Close() {
 	}
 }
 
-// AgentServer is the embedded cache-agent: byte-for-byte the same behavior as
-// the standalone Go cache-agent binary (cache-agent/main.go), embedded so the
-// proxycache binary can serve agents for its own backends.
+// AgentServer is the embedded cache-agent: same behavior as the standalone Go
+// cache-agent binary (cache-agent/main.go), started for local backends that
+// set agent_serve_port so this proxycache serves as the cache-agent for its
+// own local llama instances. Keep the two implementations in sync.
 //
 //	POST /cache/delete?key=<basename>  -> {"ok": bool, "error": string}
-//	GET  /cache/files/<key>            -> {"size": int, "exists": bool}
+//	GET  /cache/files/<key>            -> {"size": int, "exists": bool, "sidecars": [string]}
 //	POST /cache/files/batch            -> {"results": {key: {...}}}
-//	POST /cache/transfer               -> source-side P2P push to a target agent
-//	POST /cache/receive?key=<key>      -> raw file upload (target side)
+//	POST /cache/transfer               -> source-side P2P push (main + sidecars) to a target agent
+//	POST /cache/receive?key=<key>      -> raw file upload (target side; make-space when max_bytes given)
 //	POST /cache/make-space             -> evict oldest files to fit a budget
 //	GET  /cache/file?key=<key>         -> raw file download (source pull)
 type AgentServer struct {
@@ -306,13 +373,12 @@ func (s *AgentServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	// Delete ckpt sidecar files (<key>.ckpt, <key>.ckpt.0, etc.)
 	if entries, err := os.ReadDir(s.CacheDir); err == nil {
-		prefix := key + ".ckpt"
 		for _, entry := range entries {
 			if entry.IsDir() {
 				continue
 			}
 			name := entry.Name()
-			if name == prefix || (len(name) > len(prefix)+1 && strings.HasPrefix(name, prefix+".")) {
+			if isSidecarName(name, key) {
 				sidecar := s.CacheDir + "/" + name
 				if err := os.Remove(sidecar); err == nil {
 					logInfo("cache_agent", "cache delete: sidecar %s", name)
@@ -348,7 +414,7 @@ func (s *AgentServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logInfo("cache_agent", "cache file size: %s size=%d", basename, info.Size())
-	WriteJSON(w, http.StatusOK, map[string]any{"size": info.Size(), "exists": true})
+	WriteJSON(w, http.StatusOK, map[string]any{"size": info.Size(), "exists": true, "sidecars": listLocalSidecars(s.CacheDir, basename)})
 }
 
 func (s *AgentServer) handleBatch(w http.ResponseWriter, r *http.Request) {
@@ -381,10 +447,57 @@ func (s *AgentServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 // transferHTTPClient bounds agent-to-agent transfer calls.
 var transferHTTPClient = &http.Client{Timeout: seconds(CacheTransferTimeout)}
 
+// p2pCopyBufSize is the fixed copy buffer for streaming transfers (no
+// full-file RAM buffering, so multi-GB files cost a few buffers, not one
+// full copy). Larger than needed for throughput — disk/network paths are
+// kernel-buffer-bound, not syscall-bound — but cheap: one 16 MiB buffer per
+// concurrent transfer. (net/http's own per-connection buffers are fixed at
+// 4 KiB internally; the kernel TCP buffers do the real work.)
+const p2pCopyBufSize = 16 << 20 // 16 MiB
+
+// fmtRate formats bytes transferred over a duration as a human rate.
+func fmtRate(n int64, d time.Duration) string {
+	if d <= 0 {
+		return "n/a"
+	}
+	v := float64(n) / d.Seconds() / (1 << 20)
+	if v >= 1024 {
+		return fmt.Sprintf("%.1f GiB/s", v/1024)
+	}
+	return fmt.Sprintf("%.1f MiB/s", v)
+}
+
 var p2pSidecarRe = regexp.MustCompile(`\.ckpt(\.\d+)?$`)
 
-// handleTransfer (source side): pushes `key` to the target agent, asking the
-// target to free room first when max_bytes > 0.
+// isSidecarName reports whether name is a checkpoint sidecar of key
+// (key.ckpt or key.ckpt.N).
+func isSidecarName(name, key string) bool {
+	prefix := key + ".ckpt"
+	return name == prefix || (len(name) > len(prefix)+1 && strings.HasPrefix(name, prefix+".") && p2pSidecarRe.MatchString(name))
+}
+
+// listLocalSidecars returns the names of existing checkpoint sidecar files
+// for key in dir.
+func listLocalSidecars(dir, key string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if isSidecarName(e.Name(), key) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// handleTransfer (source side): pushes key's main file plus any existing
+// checkpoint sidecars to the target agent, asking the target to free room for
+// the full entry first when max_bytes > 0.
 func (s *AgentServer) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
@@ -408,36 +521,67 @@ func (s *AgentServer) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	size := fi.Size()
+	sidecars := listLocalSidecars(s.CacheDir, key)
+	total := size
+	for _, sc := range sidecars {
+		if info, err := os.Stat(s.CacheDir + "/" + sc); err == nil {
+			total += info.Size()
+		}
+	}
+	fail := func(msg string) {
+		logWarn("cache_agent", "cache transfer: %s", msg)
+		WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": msg})
+	}
 	if maxBytes > 0 {
-		ok, _ := agentMakeSpaceHTTP(target, size, maxBytes)
+		ok, _ := agentMakeSpaceHTTP(target, total, maxBytes)
 		if !ok {
-			logWarn("cache_agent", "cache transfer: target %s cannot make space for %d bytes", target, size)
-			WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "target cannot make space"})
+			fail(fmt.Sprintf("target %s cannot make space for %d bytes", target, total))
 			return
 		}
 	}
-	data, err := os.ReadFile(cachePath)
-	if err != nil {
-		WriteJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+	push := func(name string) (bool, string, int64, time.Duration) {
+		f, err := os.Open(s.CacheDir + "/" + name)
+		if err != nil {
+			return false, err.Error(), 0, 0
+		}
+		defer f.Close()
+		fi, _ := f.Stat()
+		start := time.Now()
+		// Explicit Content-Length: a bare *os.File body would go chunked and
+		// the target's receive handler could not see the size for make-space.
+		req, err := http.NewRequest(http.MethodPost, strings.TrimRight(target, "/")+"/cache/receive?"+url.Values{"key": {name}}.Encode(), f)
+		if err != nil {
+			return false, err.Error(), 0, time.Since(start)
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.ContentLength = fi.Size()
+		resp, err := transferHTTPClient.Do(req)
+		if err != nil {
+			return false, err.Error(), 0, time.Since(start)
+		}
+		defer resp.Body.Close()
+		rb, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			return false, fmt.Sprintf("target status %d: %s", resp.StatusCode, strings.TrimSpace(string(rb))), 0, time.Since(start)
+		}
+		return true, "", fi.Size(), time.Since(start)
+	}
+	ok, errMsg, n, d := push(key)
+	logInfo("cache_agent", "cache transfer: pushed %s (%d bytes, %.0fms, %s) to %s", key, n, float64(d.Milliseconds()), fmtRate(n, d), target)
+	if !ok {
+		fail(fmt.Sprintf("push of %s to %s failed: %s", key, target, errMsg))
 		return
 	}
-	resp, err := transferHTTPClient.Post(strings.TrimRight(target, "/")+"/cache/receive?"+url.Values{"key": {key}}.Encode(),
-		"application/octet-stream", bytes.NewReader(data))
-	if err != nil {
-		logWarn("cache_agent", "cache transfer: push to %s failed: %v", target, err)
-		WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
-		return
+	for _, sc := range sidecars {
+		ok, errMsg, n, d := push(sc)
+		logInfo("cache_agent", "cache transfer: pushed %s (%d bytes, %.0fms, %s) to %s", sc, n, float64(d.Milliseconds()), fmtRate(n, d), target)
+		if !ok {
+			fail(fmt.Sprintf("push of sidecar %s to %s failed: %s", sc, target, errMsg))
+			return
+		}
 	}
-	defer resp.Body.Close()
-	rb, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		logWarn("cache_agent", "cache transfer: target %s returned %d: %s",
-			target, resp.StatusCode, truncateString(string(rb), 200))
-		WriteJSON(w, http.StatusOK, map[string]any{"ok": false, "error": fmt.Sprintf("target status %d", resp.StatusCode)})
-		return
-	}
-	logInfo("cache_agent", "cache transfer: pushed %s (%d bytes) to %s", key, size, target)
-	WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "bytes": size})
+	logInfo("cache_agent", "cache transfer: transferred %s (%d bytes total incl. %d sidecar(s)) to %s", key, total, len(sidecars), target)
+	WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "bytes": size, "sidecars": len(sidecars)})
 }
 
 // agentMakeSpaceHTTP asks a target agent to free room for need bytes within the budget.
@@ -466,7 +610,8 @@ func agentMakeSpaceHTTP(target string, need, maxBytes int64) (bool, int64) {
 }
 
 // handleReceive (target side): writes the raw request body to the cache dir
-// atomically (tmp + rename).
+// atomically (tmp + rename). When max_bytes is given and the body length is
+// known, frees room for it within the budget first.
 func (s *AgentServer) handleReceive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
@@ -477,16 +622,30 @@ func (s *AgentServer) handleReceive(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "key parameter is required"})
 		return
 	}
+	var maxBytes int64
+	if v, err := strconv.ParseInt(r.URL.Query().Get("max_bytes"), 10, 64); err == nil {
+		maxBytes = v
+	}
+	if n := r.ContentLength; n > 0 && maxBytes > 0 {
+		ok, _ := s.evictUntil(n, maxBytes)
+		if !ok {
+			WriteJSON(w, http.StatusInsufficientStorage, map[string]any{"ok": false, "error": "insufficient space and no room could be made"})
+			return
+		}
+	}
 	tmp := s.CacheDir + "/" + key + ".p2p.tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
 		WriteJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	n, err := io.Copy(out, r.Body)
+	start := time.Now()
+	buf := make([]byte, p2pCopyBufSize)
+	n, err := io.CopyBuffer(out, r.Body, buf)
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
+	d := time.Since(start)
 	if err != nil {
 		os.Remove(tmp)
 		WriteJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
@@ -497,7 +656,7 @@ func (s *AgentServer) handleReceive(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	logInfo("cache_agent", "cache receive: wrote %s (%d bytes)", key, n)
+	logInfo("cache_agent", "cache receive: wrote %s (%d bytes, %.0fms, %s)", key, n, float64(d.Milliseconds()), fmtRate(n, d))
 	WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "bytes": n})
 }
 
@@ -532,21 +691,10 @@ func cacheDirFiles(dir string) []dirFile {
 	return out
 }
 
-// handleMakeSpace (target side): evicts oldest files (by mtime) until `need`
-// bytes fit within the `max` total budget. Sidecars (.ckpt*) of an evicted
-// key are removed with it.
-func (s *AgentServer) handleMakeSpace(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
-		return
-	}
-	q := r.URL.Query()
-	need, errNeed := strconv.ParseInt(q.Get("need"), 10, 64)
-	maxBytes, errMax := strconv.ParseInt(q.Get("max"), 10, 64)
-	if errNeed != nil || errMax != nil || need <= 0 || maxBytes <= 0 {
-		WriteJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "need and max parameters are required"})
-		return
-	}
+// evictUntil removes oldest files (by mtime) until `need` bytes fit within the
+// maxBytes budget. Sidecars of an evicted key are removed with it (they are
+// never eviction candidates themselves). Returns (fits, used).
+func (s *AgentServer) evictUntil(need, maxBytes int64) (bool, int64) {
 	evicted := 0
 	for {
 		files := cacheDirFiles(s.CacheDir)
@@ -574,7 +722,7 @@ func (s *AgentServer) handleMakeSpace(w http.ResponseWriter, r *http.Request) {
 			logWarn("cache_agent", "cache make-space: failed to remove %s: %v", victim.name, err)
 		}
 		for _, f := range files {
-			if f.name == victim.name+".ckpt" || (strings.HasPrefix(f.name, victim.name+".ckpt.") && p2pSidecarRe.MatchString(f.name)) {
+			if isSidecarName(f.name, victim.name) {
 				if err := os.Remove(s.CacheDir + "/" + f.name); err != nil && !os.IsNotExist(err) {
 					logWarn("cache_agent", "cache make-space: failed to remove sidecar %s: %v", f.name, err)
 				}
@@ -590,7 +738,26 @@ func (s *AgentServer) handleMakeSpace(w http.ResponseWriter, r *http.Request) {
 	}
 	ok := used <= maxBytes-need
 	logInfo("cache_agent", "cache make-space: need=%d max=%d used=%d evicted=%d ok=%v", need, maxBytes, used, evicted, ok)
-	WriteJSON(w, http.StatusOK, map[string]any{"ok": ok, "used": used, "evicted": evicted})
+	return ok, used
+}
+
+// handleMakeSpace (target side): evicts oldest files (by mtime) until `need`
+// bytes fit within the `max` total budget. Sidecars (.ckpt*) of an evicted
+// key are removed with it.
+func (s *AgentServer) handleMakeSpace(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
+		return
+	}
+	q := r.URL.Query()
+	need, errNeed := strconv.ParseInt(q.Get("need"), 10, 64)
+	maxBytes, errMax := strconv.ParseInt(q.Get("max"), 10, 64)
+	if errNeed != nil || errMax != nil || need <= 0 || maxBytes <= 0 {
+		WriteJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "need and max parameters are required"})
+		return
+	}
+	ok, used := s.evictUntil(need, maxBytes)
+	WriteJSON(w, http.StatusOK, map[string]any{"ok": ok, "used": used})
 }
 
 // handleFileContent (source side): streams a cache file's raw content.
@@ -619,8 +786,11 @@ func (s *AgentServer) handleFileContent(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, f)
-	logInfo("cache_agent", "cache file download: %s (%d bytes)", key, fi.Size())
+	start := time.Now()
+	buf := make([]byte, p2pCopyBufSize)
+	_, _ = io.CopyBuffer(w, f, buf)
+	d := time.Since(start)
+	logInfo("cache_agent", "cache file download: %s (%d bytes, %.0fms, %s)", key, fi.Size(), float64(d.Milliseconds()), fmtRate(fi.Size(), d))
 }
 
 // WriteJSON writes a JSON response with the given status code.

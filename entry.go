@@ -12,6 +12,26 @@ import (
 	"time"
 )
 
+// StartEmbeddedAgentServers starts an embedded cache-agent (the same server
+// as the standalone cache-agent binary) for every local backend that set
+// agent_serve_port, so other proxies can treat those backends as ordinary
+// agent_port backends and P2P-transfer caches to/from them. Returns the
+// number of servers started and a cancel func that stops them.
+func StartEmbeddedAgentServers(ctx context.Context) (int, context.CancelFunc) {
+	agentCtx, cancel := context.WithCancel(ctx)
+	started := 0
+	for _, key := range backendManager.Keys() {
+		info := backendManager.Info(key)
+		if info == nil || info.AgentServePort <= 0 || info.CacheDir == "" {
+			continue
+		}
+		srv := NewAgentServer(info.CacheDir, info.AgentServePort)
+		go srv.Start(agentCtx)
+		started++
+	}
+	return started, cancel
+}
+
 func Main() {
 	slotManager.InitFromDisk()
 
@@ -20,6 +40,11 @@ func Main() {
 		backendURLs = append(backendURLs, strFromAny(be["url"]))
 	}
 	logInfo("main", "Starting on port %d with %d backends: %v", Port, len(Backends), backendURLs)
+
+	if n, cancelAgents := StartEmbeddedAgentServers(context.Background()); n > 0 {
+		logInfo("main", "Serving embedded cache-agent for %d local backend(s)", n)
+		defer cancelAgents()
+	}
 
 	backendKeys := backendManager.Keys()
 	if reconciled := kvMeta.Reconcile(backendKeys); reconciled > 0 {
