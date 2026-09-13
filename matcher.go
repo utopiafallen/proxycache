@@ -399,7 +399,10 @@ func (d *RequestDispatcher) drainOverflow() {
 //
 // When the request's best disk key does not already live on the target, a P2P
 // transfer is triggered so the target worker can restore from it (bounded wait;
-// recompute fallback if the transfer loses the race).
+// recompute fallback if the transfer loses the race). A request whose arrival
+// scan found no disk hit at all gets its target's disk re-scanned after the
+// move (rescanMigratedTarget): a backend that was down at arrival may have
+// come back up with a warm cache the arrival scan never saw.
 func (d *RequestDispatcher) migrateStale() {
 	d.mu.Lock()
 	now := time.Now()
@@ -430,6 +433,8 @@ func (d *RequestDispatcher) migrateStale() {
 	moved := 0
 	type xfer struct{ src, dst, key string }
 	var transfers []xfer
+	type rescan struct{ req *ProcRequest; target string }
+	var rescans []rescan
 	for srcID, sw := range d.workers {
 		for i := 0; i < len(sw.queue); i++ {
 			req := sw.queue[i]
@@ -469,19 +474,90 @@ func (d *RequestDispatcher) migrateStale() {
 			}
 			if req.route.diskRestoreKey != "" && req.route.diskRestoreBackend != target {
 				transfers = append(transfers, xfer{req.route.diskRestoreBackend, target, req.route.diskRestoreKey})
+			} else if req.route.diskRestoreKey == "" {
+				// No disk hit at arrival — the target may have come up (with a
+				// warm cache) since. Re-check its disk after the lock drops.
+				rescans = append(rescans, rescan{req, target})
+			}
+			migKey := "none"
+			if k := req.route.diskRestoreKey; k != "" {
+				migKey = key16(k)
 			}
 			logInfo("matcher", "Migrated stale request %s from backend '%s' to idle backend '%s' (queued %.0fs, key=%s)",
-				req.requestID, srcID, target, age.Seconds(), key16OrNil(req.route.diskRestoreKey))
+				req.requestID, srcID, target, age.Seconds(), migKey)
 		}
 	}
 	d.mu.Unlock()
-	// Fire P2P transfers outside the lock (they stat files / spawn goroutines).
+	// Re-scan the disk of targets for cold migrated requests, then fire P2P
+	// transfers — both outside the lock (tokenize HTTP + disk I/O + file stats).
+	// The pump runs after migrateStale returns, so route updates here are always
+	// visible to the moved request's worker.
+	for _, rs := range rescans {
+		d.rescanMigratedTarget(rs.req, rs.target)
+	}
 	for _, xf := range transfers {
 		RequestCacheTransfer(xf.src, xf.dst, xf.key)
 	}
 	if moved > 0 {
 		logInfo("matcher", "Queue migration: moved %d stale request(s) to idle backends", moved)
 	}
+}
+
+// rescanMigratedTarget re-checks the migration target's disk cache for a
+// request whose arrival scan found no disk hit. The arrival decision is stale
+// in one direction: a backend that was down when the request arrived can come
+// back up (with a warm cache) before the request migrates to it, and the
+// arrival scan never saw its disk. When a candidate is found the route
+// decision is updated as if the scan had hit there, so the target worker
+// restores from the local file directly (no transfer needed) and recompute
+// detection / save heuristics treat the request as a normal cache hit.
+// Runs after the dispatcher lock drops (tokenize HTTP + disk I/O) but before
+// the pump dispatches the moved request, so the worker always sees the update.
+func (d *RequestDispatcher) rescanMigratedTarget(req *ProcRequest, target string) {
+	dec := req.route
+	modelName := dec.selected.ModelName
+	if !backendManager.CacheEnabled(target) {
+		return
+	}
+	blocks := dec.backendBlocks[target]
+	ctx, cancel := context.WithTimeout(req.ctx, time.Duration(MatchScanTimeout*float64(time.Second)))
+	defer cancel()
+	if len(blocks) == 0 {
+		// The target was down at arrival, so it was never tokenized. Do it
+		// now — for the scan below, and so the worker's save key uses this
+		// backend's tokenizer instead of falling back to the sizing backend's.
+		client := backendManager.GetClient(target)
+		templated, err := client.ApplyChatTemplate(ctx, req.messages)
+		if err != nil {
+			logWarn("matcher", "Migration rescan: tokenize on target '%s' failed for request %s: %v", target, req.requestID, err)
+			return
+		}
+		tokenIDs, err := client.Tokenize(ctx, templated, true)
+		if err != nil {
+			logWarn("matcher", "Migration rescan: tokenize on target '%s' failed for request %s: %v", target, req.requestID, err)
+			return
+		}
+		blocks = BlockHashesFromTokens(tokenIDs, WordsPerBlock)
+		dec.backendTokenIDs[target] = tokenIDs
+		dec.backendBlocks[target] = blocks
+	}
+	key, ratio, found := kvMeta.FindBestRestoreCandidate(blocks, WordsPerBlock, LCPTh, modelName, target)
+	if !found {
+		return
+	}
+	dec.diskRestoreKey = key
+	dec.diskRestoreBackend = target
+	dec.restoreKey = key
+	dec.restoreBackend = target
+	dec.bestRatio = ratio
+	dec.canonicalName = modelName
+	dt := CacheHitDiskRestore
+	dec.hitType = &dt
+	if dec.backendCacheRatios[target] < ratio {
+		dec.backendCacheRatios[target] = ratio
+	}
+	logInfo("matcher", "Migration rescan: target '%s' holds a local disk cache for request %s (key=%s, ratio %.3f)",
+		target, req.requestID, key16(key), ratio)
 }
 
 func (d *RequestDispatcher) parkOverflow(req *ProcRequest) {

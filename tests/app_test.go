@@ -662,6 +662,89 @@ func TestQueueMigrationColdWaitsDoubleThreshold(t *testing.T) {
 	}
 }
 
+// TestQueueMigrationRescansTargetDisk verifies the migration rescan for
+// requests whose arrival scan found no disk hit: backend A is down when R
+// arrives (so its cache is never scanned) and R queues on B, which has no
+// cache for it. A comes back with a warm disk entry before R's doubled
+// cold-migration age elapses — the dispatcher migrates R there and the worker
+// restores from the target's local entry instead of recomputing.
+func TestQueueMigrationRescansTargetDisk(t *testing.T) {
+	withTempMetaDir(t)
+	withMigrationAfter(t, 1.0) // cold requests need >= 2s to be migrated
+	tokensW := seq(400)            // A's warm prefix (true prefix of tokensR)
+	tokensR := seq(800)            // R's content
+	tokensQ := offsetSeq(400, 100000)
+	mA := newMockLlama(t, "mig-local", 32768, tokensW, 1)
+	mB := newMockLlama(t, "mig-local", 32768, tokensQ, 1)
+	beA := backendKeyFromURL(mA.srv.URL)
+	beB := backendKeyFromURL(mB.srv.URL)
+	dirA := t.TempDir()
+	withTestBackend(t, []map[string]any{
+		{"url": mA.srv.URL, "cache_dir": dirA},
+		{"url": mB.srv.URL, "cache_dir": t.TempDir()},
+	})
+	bm := proxycache.GetBackendManager()
+	markBackendsUp(bm)
+	injectModels(bm, dm("mig-local", 32768, beA, beB))
+
+	// Warmup: establishes a disk cache for tokensW on A while B is down.
+	bm.Mu.Lock()
+	bm.BackendState[beB] = false
+	bm.Mu.Unlock()
+	if w := postChat(t, `{"model": "mig-local", "messages": [{"role": "user", "content": "warm"}]}`); w.Code != http.StatusOK {
+		t.Fatalf("warmup status = %d, want 200", w.Code)
+	}
+	keyW := proxycache.MetaKey("mig-local", tokensW)
+	if err := os.WriteFile(filepath.Join(dirA, keyW), []byte("warm-cache-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Swap liveness: A (warm disk cache) goes down for R's arrival so its disk
+	// is never scanned; B (no cache for R) comes up to absorb the work.
+	bm.Mu.Lock()
+	bm.BackendState[beA] = false
+	bm.BackendState[beB] = true
+	bm.Mu.Unlock()
+
+	// B1: holds B's only slot for 4s — past R's 2s cold-migration threshold.
+	mB.chatDelay = 4 * time.Second
+	doneB1 := make(chan *httptest.ResponseRecorder, 1)
+	go func() { doneB1 <- postChat(t, `{"model": "mig-local", "messages": [{"role": "user", "content": "busy"}]}`) }()
+	waitFor(t, 5*time.Second, func() bool { return mB.chatCount() >= 1 })
+
+	// R: cold everywhere it can see (A down, B's disk empty) -> queued on B.
+	mB.tokens = tokensR
+	doneR := make(chan *httptest.ResponseRecorder, 1)
+	go func() { doneR <- postChat(t, `{"model": "mig-local", "messages": [{"role": "user", "content": "cold"}]}`) }()
+
+	// Wait until R has actually been scanned and enqueued on B (A still down,
+	// so its disk was never seen), only then bring A back up with the warm
+	// cache — otherwise R would just get a direct hit at arrival.
+	waitFor(t, 5*time.Second, func() bool { return proxycache.GetDispatcher().QueueDepth(beB) >= 1 })
+	mA.tokens = tokensR
+	bm.Mu.Lock()
+	bm.BackendState[beA] = true
+	bm.Mu.Unlock()
+
+	wR := <-doneR
+	wB1 := <-doneB1
+	if wR.Code != http.StatusOK || wB1.Code != http.StatusOK {
+		t.Fatalf("statuses: R=%d B1=%d, want 200/200", wR.Code, wB1.Code)
+	}
+	if got := mA.chatCount(); got != 2 {
+		t.Errorf("A chat count = %d, want 2 (warmup + migrated request)", got)
+	}
+	if got := mB.chatCount(); got != 1 {
+		t.Errorf("B chat count = %d, want 1 (the busy request; R should have migrated away)", got)
+	}
+	mA.mu.Lock()
+	restores := len(mA.restores)
+	mA.mu.Unlock()
+	if restores < 1 {
+		t.Error("migrated request did not restore the target's local disk cache")
+	}
+}
+
 // TestRequeueWhenBackendStopsServingModel verifies that a worker whose backend
 // no longer serves the requested model (model disappeared from the registry,
 // e.g. after liveness re-discovery) hands the request back to the global

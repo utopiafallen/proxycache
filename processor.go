@@ -298,11 +298,12 @@ func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, s
 	restored, skipRestoreDiag := doWorkerRestore(beSm, slotID, restoreKey, blocks, prevKV, modelName, beID)
 	backendManager.TouchBackend(beID)
 
-	// For queue-migrated requests with a disk cache hit: did the cache follow
-	// the request to the target? True when the target restored from the (possibly
-	// transferred) disk key or skipped restore on an already-warm slot; false
-	// when the P2P transfer lost the bounded wait and the request recomputed.
-	// nil = not applicable (not migrated, or no disk key to carry).
+	// For queue-migrated requests with a disk cache hit: did usable cache end
+	// up on the target? True when the target restored from the (transferred,
+	// or locally found at migration) disk key or skipped restore on an
+	// already-warm slot; false when the P2P transfer lost the bounded wait
+	// and the request recomputed. nil = not applicable (not migrated, or no
+	// disk hit by processing time).
 	cacheMigrated := any(nil)
 	if req.migratedFrom != "" && dec.diskRestoreKey != "" {
 		cacheMigrated = restoreKey != "" || skipRestoreDiag["skipped"] == true
