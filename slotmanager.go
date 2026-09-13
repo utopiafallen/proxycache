@@ -518,8 +518,9 @@ func (b *BackendSlotManager) scoreEntries(ringList []ringEntry, blocksMap map[st
 }
 
 // AddTransferredEntry registers a cache file that arrived on this backend via
-// P2P transfer so it participates in ring eviction accounting. Must not be
-// called with RingMu held.
+// P2P transfer — a migration is equivalent to saving a new entry on the
+// destination, so registration runs the standard budget eviction
+// (EvictIfNeeded). Must not be called with RingMu held.
 func (b *BackendSlotManager) AddTransferredEntry(key string, size int64) {
 	b.RingMu.Lock()
 	defer b.RingMu.Unlock()
@@ -533,46 +534,6 @@ func (b *BackendSlotManager) AddTransferredEntry(key string, size int64) {
 	logInfo("slot_manager", "Registered transferred cache entry '%s' for backend '%s' (%d bytes)",
 		truncateKey(key), b.BackendID, size)
 	b.EvictIfNeeded()
-}
-
-// MakeSpaceFor evicts worst-scored ring entries until `need` extra bytes fit
-// within the backend's cache budget (or the ring is empty). Used before a P2P
-// transfer lands on this backend.
-func (b *BackendSlotManager) MakeSpaceFor(need int64) {
-	b.RingMu.Lock()
-	defer b.RingMu.Unlock()
-	if need <= 0 {
-		return
-	}
-	maxBytes := float64(backendManager.GetCacheMaxSizeGB(b.BackendID)) * 1024 * 1024 * 1024
-	now := NowFloat()
-	blocksMap, validRing := b.pruneOrphans()
-	b.CacheRing = validRing
-	for b.totalBytes+need > int64(maxBytes) && len(b.CacheRing) > 0 {
-		scoredList := b.scoreEntries(b.CacheRing, blocksMap, now)
-		if len(scoredList) == 0 {
-			break
-		}
-		worst := scoredList[0]
-		idx := -1
-		for i := range b.CacheRing {
-			if b.CacheRing[i].Key == worst.key {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			delete(blocksMap, worst.key)
-			continue
-		}
-		entry := b.CacheRing[idx]
-		b.totalBytes -= entry.Size
-		delete(blocksMap, entry.Key)
-		b.CacheRing = append(b.CacheRing[:idx], b.CacheRing[idx+1:]...)
-		logInfo("slot_manager", "P2P make-space: evicted '%s' for backend '%s' (%d bytes, score=%.0f, remaining=%d)",
-			truncateKey(entry.Key), b.BackendID, entry.Size, worst.score, b.totalBytes)
-		b.deleteEntry(entry.Key, "p2p_make_space", fmt.Sprintf("(%d bytes)", entry.Size))
-	}
 }
 
 // InitFromDisk rebuilds the in-memory ring buffer from disk.

@@ -62,11 +62,11 @@ When a request ends up scheduled on a backend that does not hold its best cache,
 
 - Deduped per (key, dst) via an in-flight map; skipped when dst already holds the file.
 - Four backend-type combos: agent→agent push (`/cache/transfer`), local→local direct copy, local→agent upload (`/cache/receive`), agent→local pull (`/cache/file`).
-- Checkpoint sidecars (`<key>.ckpt`, `<key>.ckpt.N`) are part of a complete entry when present: all four paths transfer them with the main file (any sidecar failure fails the transfer); delete/eviction removes them with their key. Presence is architecture-dependent — entries without sidecars are normal.
-- Receiving side makes space within its `cache_max_size_gb` budget (oldest-mtime first): uploads self-enforce from content length; agent pushes and local paths ask the target explicitly.
+- Checkpoint sidecars (`<key>.ckpt`, `<key>.ckpt.N`) are part of a complete entry when present: all four paths transfer them with the main file (any sidecar failure fails the transfer); delete removes them with their key. Presence is architecture-dependent — entries without sidecars are normal.
+- Agents never make space for incoming files themselves: they have no view of kv-meta, so autonomous deletion would desynchronize meta from disk. The destination proxycache enforces `cache_max_size_gb` through the standard ring flow instead — a migration is a new entry on the destination, and `AddTransferredEntry()` runs `EvictIfNeeded()` after registration (deleting via `/cache/delete` on agent backends + removing the meta).
 - Transfers stream end to end with fixed 16 MiB buffers (no full-file RAM buffering — multi-GB safe); upload/push senders set explicit `Content-Length` (bare `*os.File` bodies go chunked and hide the size). One HTTP stream per file, one sender (different keys/targets transfer concurrently via their own goroutines) — sufficient to saturate LAN links, whose bottleneck is the network; only ECMP/LAG multipath or high-BDP WAN paths would benefit from parallel chunked streams. Agent implementations log per-file bytes/elapsed/rate; the proxy logs totals + rate and records `cache_transfer` events (bytes, sidecars, ms).
 - Two server implementations of the same API: the standalone binary (`cache-agent/`, separate module, what runs on remote hosts) and the embedded `AgentServer` (cacheagent.go), started per local backend that sets `agent_serve_port` (`StartEmbeddedAgentServers()` in entry.go) so this proxy acts as the cache-agent for its own local llama instances. Keep them in sync; agent/transfer tests run against the real standalone binary (skip if not built).
-- On success: meta rewritten for the target + `AddTransferredEntry()` registers it in the target's ring so disk scans/eviction treat it like a native entry.
+- On success: meta rewritten for the target + `AddTransferredEntry()` registers it in the target's ring and runs the standard budget eviction, so disk scans treat it like a native entry.
 
 ## Cache Key Computation
 
@@ -172,7 +172,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
  - **Queue depth, not in-flight count, drives the hit limit**: `SelectBackend` sees only queued items; in-flight workers (up to the free-slot count per backend) don't count against `CacheHitQueueLimit`. That's why a busy hit backend still accepts 2 queued followers.
 - **`slotKVState` is keyed by `slotID`** (per `BackendSlotManager` instance, not globally). Access via `GetSlotManager().Get(backendID).GetKVState(slotID)`.
 - **`Invalidate()` clears `slotKVState`**: Called on cancellation/failure in `StreamState.cleanup()` before `Release()`.
-- **Ring buffer eviction is per-backend**: Uses `cache_max_size_gb` per backend (default 25 GB). Evicts age-first, then LRU. `MakeSpaceFor(need)` reuses the same scoring to free room for an incoming P2P transfer.
+- **Ring buffer eviction is per-backend**: Uses `cache_max_size_gb` per backend (default 25 GB). Evicts age-first, then LRU. Triggers on saves and on P2P landings (`AddTransferredEntry` runs it after registration — a migration is a new entry on the destination). Agents never evict autonomously; the proxy deletes via `/cache/delete` for agent backends and removes the meta itself.
 - **Pending slot scan uses per-backend blocks**: The scan runs inside the per-backend loop in `match`, so `blocks` always matches the current backend's tokenizer output.
 - **Pending slot hit clears the primary `restoreKey` but not the disk candidate**: a disk hit on backend A followed by a pending-slot hit must clear the primary key (a stale key causes a failed restore), while the best disk key is retained separately so a fallback routing can still P2P-transfer it.
 - **Requeued requests must not be finished early**: `processWorkerRequest` tracks the requeued flag; finishing (which cancels the derived ctx) before the overflow drain re-routes the request makes the drain discard it as disconnected.
@@ -204,8 +204,7 @@ Query via `GET /metrics/diagnostics?liveness_diag=true`.
 | `doWorkerRestore()` | `processor.go` | Flush skipped save, skip-restore check, issue restore |
 | `RequestCacheTransfer()` | `transfer.go` | Async, deduped P2P transfer across the four backend-type combos |
 | `ShouldSkipRestore()` | `slotmanager.go` | Skip restore if LCP ratio >= threshold (and block diff within pct), single-slot backend, and valid prev state |
-| `AddTransferredEntry()` | `slotmanager.go` | Register a P2P-received file in the ring (dedupe by key) |
-| `MakeSpaceFor()` | `slotmanager.go` | Proactively evict until an incoming transfer fits the budget |
+| `AddTransferredEntry()` | `slotmanager.go` | Register a P2P-received file in the ring (dedupe by key) and run standard budget eviction |
 | `Invalidate()` | `slotmanager.go` | Clear `slotKVState` for a slot |
 | `GetKVState()` / `SetKVState()` | `slotmanager.go` | Get/set slot KV block tracking |
 | `SaveAfter()` | `slotmanager.go` | Save KV cache to disk, write meta file, update ring buffer (in-place on known key), update `slotKVState` |

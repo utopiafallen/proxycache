@@ -430,38 +430,6 @@ func TestSlotManagerAddTransferredEntry(t *testing.T) {
 	}
 }
 
-func TestSlotManagerMakeSpaceFor(t *testing.T) {
-	withTempMetaDir(t)
-	// ~1 KB budget so small entries trigger eviction.
-	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:8000", "cache_dir": t.TempDir(), "cache_max_size_gb": 0.000001}})
-	beID := "127.0.0.1-8000"
-	bsm := proxycache.NewBackendSlotManager(beID)
-	for _, k := range []string{"kA", "kB", "kC"} {
-		proxycache.GetKVMeta().WriteMeta(k, 10, blk(k, 2), 100, "m", beID, 300)
-		bsm.AddTransferredEntry(k, 300)
-	}
-	if got := bsm.GetTotalBytes(); got != 900 {
-		t.Fatalf("total bytes = %d, want 900", got)
-	}
-	// Need 500 more bytes of headroom: evict until total + 500 <= ~1074,
-	// i.e. total <= ~574 -> the two oldest entries go (kA, then kB).
-	bsm.MakeSpaceFor(500)
-	if got := bsm.GetRingSize(); got != 1 {
-		t.Errorf("ring size after make-space = %d, want 1", got)
-	}
-	if got := bsm.GetTotalBytes(); got != 300 {
-		t.Errorf("total bytes after make-space = %d, want 300", got)
-	}
-	for _, k := range []string{"kA", "kB"} {
-		if meta := proxycache.GetKVMeta().ReadMeta(k, beID); meta != nil {
-			t.Errorf("evicted entry %s still has meta, want deleted", k)
-		}
-	}
-	if meta := proxycache.GetKVMeta().ReadMeta("kC", beID); meta == nil {
-		t.Errorf("surviving entry kC lost its meta")
-	}
-}
-
 func newSaveServer(t *testing.T, nWritten int, fail bool) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -63,7 +63,11 @@ func TestCacheAgentClientConnectError(t *testing.T) {
 	}
 }
 
-func TestCacheAgentClientUploadEnforcesBudget(t *testing.T) {
+// TestCacheAgentClientUploadNeverSelfEvicts pins the safety contract: the
+// agent stores uploads as-is and never deletes existing files on its own —
+// it has no view of kv-meta, so budget enforcement belongs to the owning
+// proxycache's ring eviction (explicit /cache/delete calls).
+func TestCacheAgentClientUploadNeverSelfEvicts(t *testing.T) {
 	dir := t.TempDir()
 	urlStr, _ := startCacheAgent(t, dir)
 	client := proxycache.NewCacheAgentClient(urlStr)
@@ -75,22 +79,14 @@ func TestCacheAgentClientUploadEnforcesBudget(t *testing.T) {
 	if err := os.WriteFile(upPath, make([]byte, 5), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// 10 used, need 5, budget 12 → resident (10 > 12-5) is evicted, upload fits.
-	if !client.UploadFile("upload", upPath, 12) {
-		t.Fatal("UploadFile within budget returned false")
+	if !client.UploadFile("upload", upPath) {
+		t.Fatal("UploadFile returned false")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "upload")); err != nil {
 		t.Errorf("uploaded file missing on target: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "resident")); !os.IsNotExist(err) {
-		t.Error("resident should have been evicted to fit the upload")
-	}
-	// 5 used, need 5, budget 4 → cannot fit even after full eviction → rejected, nothing written.
-	if client.UploadFile("big", upPath, 4) {
-		t.Error("UploadFile over budget should return false (507)")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "big")); !os.IsNotExist(err) {
-		t.Error("over-budget upload must not be written")
+	if _, err := os.Stat(filepath.Join(dir, "resident")); err != nil {
+		t.Errorf("agent must not evict existing files on its own: %v", err)
 	}
 }
 

@@ -71,7 +71,7 @@ func TestAgentP2PTransferPush(t *testing.T) {
 	}
 	client := proxycache.NewCacheAgentClient(srcURL)
 	defer client.Close()
-	if !client.Transfer(key, dstURL, 0) {
+	if !client.Transfer(key, dstURL) {
 		t.Fatal("Transfer returned false")
 	}
 	data, err := os.ReadFile(filepath.Join(dstDir, key))
@@ -103,7 +103,7 @@ func TestAgentP2PTransferPushSidecars(t *testing.T) {
 	}
 	client := proxycache.NewCacheAgentClient(srcURL)
 	defer client.Close()
-	if !client.Transfer(key, dstURL, 0) {
+	if !client.Transfer(key, dstURL) {
 		t.Fatal("Transfer returned false")
 	}
 	for name, want := range map[string]string{key: "main-payload", key + ".ckpt": "ckpt-a", key + ".ckpt.0": "ckpt-b"} {
@@ -125,105 +125,8 @@ func TestAgentP2PTransferPushSidecars(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcDir, key2), []byte("bare"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !client.Transfer(key2, dstURL, 0) {
+	if !client.Transfer(key2, dstURL) {
 		t.Fatal("Transfer of key without sidecars returned false")
-	}
-}
-
-func TestAgentMakeSpaceEvictsOldest(t *testing.T) {
-	dstDir := t.TempDir()
-	names := []string{"old1", "old2", "old3"}
-	for i, name := range names {
-		p := filepath.Join(dstDir, name)
-		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		mt := time.Now().Add(-time.Duration(3-i) * time.Hour)
-		if err := os.Chtimes(p, mt, mt); err != nil {
-			t.Fatal(err)
-		}
-	}
-	dstURL, _ := startCacheAgent(t, dstDir)
-	client := proxycache.NewCacheAgentClient(dstURL)
-	defer client.Close()
-
-	// Budget 10 bytes, need 9: must evict down to a single 1-byte file.
-	ok, used := client.MakeSpace(9, 10)
-	if !ok {
-		t.Fatalf("MakeSpace ok=false")
-	}
-	if used != 1 {
-		t.Errorf("used after make-space = %d, want 1", used)
-	}
-	for _, name := range []string{"old1", "old2"} {
-		if _, err := os.Stat(filepath.Join(dstDir, name)); !os.IsNotExist(err) {
-			t.Errorf("oldest file %s should be evicted", name)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(dstDir, "old3")); err != nil {
-		t.Errorf("newest file old3 should survive: %v", err)
-	}
-
-	// A transfer now fits without further eviction.
-	srcDir := t.TempDir()
-	srcURL, _ := startCacheAgent(t, srcDir)
-	key := "newkey"
-	if err := os.WriteFile(filepath.Join(srcDir, key), []byte("yyyyyyyy"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	sclient := proxycache.NewCacheAgentClient(srcURL)
-	defer sclient.Close()
-	if !sclient.Transfer(key, dstURL, 10) {
-		t.Fatal("Transfer into constrained target failed")
-	}
-	if _, err := os.Stat(filepath.Join(dstDir, key)); err != nil {
-		t.Errorf("transferred key missing on target: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dstDir, "old3")); err != nil {
-		t.Errorf("old3 should still be present after fit transfer: %v", err)
-	}
-}
-
-func TestAgentMakeSpaceRemovesSidecarWithKey(t *testing.T) {
-	dstDir := t.TempDir()
-	// Oldest entry has a sidecar; evicting it must remove both.
-	p1 := filepath.Join(dstDir, "oldkey")
-	if err := os.WriteFile(p1, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dstDir, "oldkey.ckpt"), []byte("side"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	p2 := filepath.Join(dstDir, "newkey")
-	if err := os.WriteFile(p2, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	mtOld := time.Now().Add(-2 * time.Hour)
-	mtNew := time.Now()
-	if err := os.Chtimes(p1, mtOld, mtOld); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chtimes(filepath.Join(dstDir, "oldkey.ckpt"), mtOld, mtOld); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chtimes(p2, mtNew, mtNew); err != nil {
-		t.Fatal(err)
-	}
-	dstURL, _ := startCacheAgent(t, dstDir)
-	client := proxycache.NewCacheAgentClient(dstURL)
-	defer client.Close()
-
-	ok, used := client.MakeSpace(9, 10)
-	if !ok {
-		t.Fatalf("MakeSpace ok=false")
-	}
-	if used != 1 {
-		t.Errorf("used after make-space = %d, want 1", used)
-	}
-	for _, name := range []string{"oldkey", "oldkey.ckpt"} {
-		if _, err := os.Stat(filepath.Join(dstDir, name)); !os.IsNotExist(err) {
-			t.Errorf("%s should have been evicted together with its key", name)
-		}
 	}
 }
 
@@ -232,7 +135,7 @@ func TestAgentTransferMissingSource(t *testing.T) {
 	dstURL, _ := startCacheAgent(t, t.TempDir())
 	client := proxycache.NewCacheAgentClient(srcURL)
 	defer client.Close()
-	if client.Transfer("no-such-key", dstURL, 0) {
+	if client.Transfer("no-such-key", dstURL) {
 		t.Error("Transfer of missing file should return false")
 	}
 	if _, err := client.FetchFile("no-such-key"); err == nil {
@@ -350,6 +253,72 @@ func TestProxyTransferLocalToAgent(t *testing.T) {
 	}
 	if meta := proxycache.GetKVMeta().ReadMeta(key, be2); meta == nil {
 		t.Error("no meta registered on agent target backend")
+	}
+}
+
+// TestProxyTransferEvictsOnAgentDestination verifies that when a P2P transfer
+// lands on an agent-managed backend whose ring is over budget, the owning
+// proxycache (NOT the agent) evicts through the standard ring flow: the
+// victim file is removed via /cache/delete and its meta file deleted by the
+// proxy. The agent itself never deletes anything on its own.
+func TestProxyTransferEvictsOnAgentDestination(t *testing.T) {
+	withTempMetaDir(t)
+	dir1 := t.TempDir()
+	agentDir := t.TempDir()
+	m1 := newMockLlama(t, "xfer4-model", 32768, seq(10), 1)
+	agentURL, agentAddr := startCacheAgent(t, agentDir)
+	_, agentPort, err := net.SplitHostPort(agentAddr)
+	if err != nil {
+		t.Fatalf("bad agent addr %q: %v", agentAddr, err)
+	}
+	_ = agentURL
+	be1 := backendKeyFromURL(m1.srv.URL)
+	// ~1 KB budget: existing 900 B + incoming 200 B exceeds it, while the
+	// incoming entry alone fits — eviction must remove exactly "oldkey".
+	withTestBackend(t, []map[string]any{
+		{"url": m1.srv.URL, "cache_dir": dir1},
+		{"url": "http://127.0.0.1:2", "agent_port": agentPort, "cache_max_size_gb": 0.000001},
+	})
+	markBackendsUp(proxycache.GetBackendManager())
+	be2 := backendKeyFromURL("http://127.0.0.1:2")
+
+	oldKey := "oldkey"
+	oldSize := int64(900)
+	if err := os.WriteFile(filepath.Join(agentDir, oldKey), bytes.Repeat([]byte("o"), int(oldSize)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	proxycache.GetKVMeta().WriteMeta(oldKey, 10, blk("old", 2), proxycache.WordsPerBlock, "xfer4-model", be2, int(oldSize))
+	proxycache.GetSlotManager().Get(be2).AddTransferredEntry(oldKey, oldSize)
+
+	tokens := seq(10)
+	key := proxycache.MetaKey("xfer4-model", tokens)
+	blocks := proxycache.BlockHashesFromTokens(tokens, proxycache.WordsPerBlock)
+	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer4-model", be1, 200)
+	if err := os.WriteFile(filepath.Join(dir1, key), bytes.Repeat([]byte("n"), 200), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !proxycache.RequestCacheTransfer(be1, be2, key) {
+		t.Fatal("RequestCacheTransfer returned false")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		_, e := os.Stat(filepath.Join(agentDir, key))
+		return e == nil && proxycache.GetSlotManager().Get(be2).GetRingSize() == 1
+	})
+	if _, err := os.Stat(filepath.Join(agentDir, key)); err != nil {
+		t.Fatalf("transferred key missing on agent target: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, oldKey)); !os.IsNotExist(err) {
+		t.Errorf("evicted entry %s still present on agent: %v", oldKey, err)
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta(oldKey, be2); meta != nil {
+		t.Errorf("evicted entry %s still has meta, want deleted by proxy", oldKey)
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta(key, be2); meta == nil {
+		t.Error("no meta registered on agent target backend")
+	}
+	if got := proxycache.GetSlotManager().Get(be2).GetTotalBytes(); got != 200 {
+		t.Errorf("target ring total bytes = %d, want 200", got)
 	}
 }
 

@@ -1,8 +1,13 @@
 // transfer.go — P2P cache file transfer between backends. When the matcher
 // routes a cache-hit request to a backend that does not hold the cache, it
 // asks (async) for the cache file to migrate from the hit backend to the
-// serving backend so a restore is possible when the request runs. The
-// receiving side may evict old cache entries to make space.
+// serving backend so a restore is possible when the request runs.
+//
+// The receiving agents never evict on their own: once a transfer lands, the
+// destination's AddTransferredEntry() registration runs the standard ring
+// eviction flow (EvictIfNeeded), which enforces cache_max_size_gb by issuing
+// explicit deletes for keys the proxy picked (meta stays in sync). A P2P
+// migration is therefore equivalent to saving a new entry on the destination.
 //
 // Four backend-type combinations are supported:
 //
@@ -73,10 +78,6 @@ func RequestCacheTransfer(srcBe, dstBe, key string) bool {
 	return true
 }
 
-func maxCacheBytes(backendID string) int64 {
-	return int64(backendManager.GetCacheMaxSizeGB(backendID) * 1024 * 1024 * 1024)
-}
-
 func runCacheTransfer(srcBe, dstBe, key string) {
 	t0 := time.Now()
 	srcMeta := kvMeta.ReadMeta(key, srcBe)
@@ -129,14 +130,13 @@ func runCacheTransfer(srcBe, dstBe, key string) {
 	var detail string
 	switch {
 	case srcInfo.AgentClient != nil && dstInfo.AgentClient != nil:
-		// The source agent pushes the main file plus sidecars and sizes the
-		// target make-space for the full entry itself.
-		ok = srcInfo.AgentClient.Transfer(key, dstInfo.AgentClient.BaseURL, maxCacheBytes(dstBe))
+		// True P2P: the source agent pushes the main file plus sidecars. The
+		// destination proxy evicts through its ring after registration.
+		ok = srcInfo.AgentClient.Transfer(key, dstInfo.AgentClient.BaseURL)
 		if !ok {
 			detail = "agent-to-agent transfer reported failure"
 		}
 	case srcInfo.AgentClient == nil && dstInfo.AgentClient == nil:
-		slotManager.Get(dstBe).MakeSpaceFor(int64(size) + sidecarSize)
 		ok = copyCacheFileLocal(srcInfo.CacheDir, dstInfo.CacheDir, key)
 		if ok {
 			for _, sc := range sidecars {
@@ -150,11 +150,10 @@ func runCacheTransfer(srcBe, dstBe, key string) {
 			detail = "local copy failed"
 		}
 	case srcInfo.AgentClient == nil:
-		// The target agent makes space per file from its content length.
-		ok = dstInfo.AgentClient.UploadFile(key, filepath.Join(srcInfo.CacheDir, key), maxCacheBytes(dstBe))
+		ok = dstInfo.AgentClient.UploadFile(key, filepath.Join(srcInfo.CacheDir, key))
 		if ok {
 			for _, sc := range sidecars {
-				if !dstInfo.AgentClient.UploadFile(sc, filepath.Join(srcInfo.CacheDir, sc), maxCacheBytes(dstBe)) {
+				if !dstInfo.AgentClient.UploadFile(sc, filepath.Join(srcInfo.CacheDir, sc)) {
 					ok = false
 					detail = "upload of sidecar " + sc + " failed"
 					break
@@ -169,7 +168,6 @@ func runCacheTransfer(srcBe, dstBe, key string) {
 			fail(err.Error())
 			return
 		}
-		slotManager.Get(dstBe).MakeSpaceFor(int64(size) + sidecarSize)
 		ok = streamToCacheFile(dstInfo.CacheDir, key, body)
 		body.Close()
 		if ok {
