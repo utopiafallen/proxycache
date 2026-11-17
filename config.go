@@ -96,7 +96,7 @@ var (
 	// cache) need twice this age before they are moved — migrating them
 	// trades a cheap future restore for an immediate full recompute, which
 	// only wins when the wait has really gone bad.
-	QueueMigrationAfter = EnvFloat("QUEUE_MIGRATION_AFTER", 120)
+	QueueMigrationAfter = EnvFloat("QUEUE_MIGRATION_AFTER", 30)
 )
 
 func init() {
