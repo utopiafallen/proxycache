@@ -920,6 +920,23 @@ func (bm *BackendManager) refreshSlotCountsCtx(ctx context.Context) (map[string]
 			if !known {
 				continue
 			}
+			if !bm.CacheEnabled(backendKey) {
+				// Cache-less backend (cache_max_size_gb=0, e.g. ninfer): no KV
+				// slots to enumerate — /slots would 404 and the model would
+				// never get a pool, so its requests could never dispatch. One
+				// pseudo-slot bounds concurrency and gives the pending-hit
+				// scan (message-derived block state) something to track.
+				if slotCounts[backendKey] == nil {
+					slotCounts[backendKey] = map[string]int{}
+				}
+				slotCounts[backendKey][canonicalName] = 1
+				logInfo("backend_manager", "Model '%s' on backend '%s' has 1 pseudo-slot (cache disabled)", canonicalName, backendKey)
+				bm.Mu.Lock()
+				bm.RefreshState[BackendModelKey{canonicalName, backendKey}] = RefreshEntry{NowFloat(), true, 1}
+				bm.Mu.Unlock()
+				refreshedAny = true
+				continue
+			}
 			client := bm.GetClient(backendKey)
 
 			// get_slots_info: connection errors and non-400 HTTP errors are

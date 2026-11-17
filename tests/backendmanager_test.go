@@ -337,6 +337,65 @@ func TestDiscoverModelsNonRouterMode(t *testing.T) {
 	}
 }
 
+func TestDiscoverModelsNonRouterContextWindow(t *testing.T) {
+	payload := map[string]any{"data": []any{map[string]any{
+		"id":             "qwen3.8-27b",
+		"context_window": float64(262144),
+		"max_model_len":  float64(262144),
+	}}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxycache.WriteJSON(w, 200, payload)
+	}))
+	defer srv.Close()
+	client := proxycache.NewLlamaClient(srv.URL)
+	models, err := client.DiscoverModels(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(models) != 1 || models[0].Name != "qwen3.8-27b" || models[0].NCtx != 262144 {
+		t.Errorf("got %+v, want n_ctx=262144", models)
+	}
+}
+
+func TestDiscoverModelsNonRouterMaxModelLen(t *testing.T) {
+	payload := map[string]any{"data": []any{map[string]any{
+		"id":            "model-l",
+		"max_model_len": float64(8192),
+	}}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxycache.WriteJSON(w, 200, payload)
+	}))
+	defer srv.Close()
+	client := proxycache.NewLlamaClient(srv.URL)
+	models, err := client.DiscoverModels(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(models) != 1 || models[0].NCtx != 8192 {
+		t.Errorf("got %+v, want n_ctx=8192", models)
+	}
+}
+
+func TestDiscoverModelsNonRouterMetaPrecedesContextWindow(t *testing.T) {
+	payload := map[string]any{"data": []any{map[string]any{
+		"id":             "model-m",
+		"meta":           map[string]any{"n_ctx": 4096},
+		"context_window": float64(65536),
+	}}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxycache.WriteJSON(w, 200, payload)
+	}))
+	defer srv.Close()
+	client := proxycache.NewLlamaClient(srv.URL)
+	models, err := client.DiscoverModels(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(models) != 1 || models[0].NCtx != 4096 {
+		t.Errorf("got %+v, want n_ctx=4096 (meta.n_ctx wins)", models)
+	}
+}
+
 func TestDiscoverModelsCtxNotInArgs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxycache.WriteJSON(w, 200, map[string]any{"data": []any{

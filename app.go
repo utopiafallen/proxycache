@@ -232,9 +232,14 @@ func recordChatError(requestID, model, backend string, slotID int, t0 float64, r
 	})
 }
 
-func restorePrevKV(beSm *BackendSlotManager, slotID int, prevKV []string, modelName, backendID string) {
+// restorePrevKV restores the slot's tracked KV state (and conversation tag)
+// to what it was before the failed request, so the next request can match it.
+func restorePrevKV(beSm *BackendSlotManager, slotID int, prevKV []string, prevConv string, modelName, backendID string) {
 	if prevKV != nil {
 		beSm.SetKVState(slotID, prevKV)
+	}
+	beSm.SetSlotConversation(slotID, prevConv)
+	if prevKV != nil {
 		logInfo("app", "Restored slot %d KV state for model '%s' on backend '%s'", slotID, modelName, backendID)
 	}
 }
@@ -313,6 +318,10 @@ func ChatHandler(w http.ResponseWriter, r *http.Request) {
 	if clientModel == "" {
 		clientModel = ModelID
 	}
+	// conversation_id is an optional top-level field sent by clients that want
+	// conversation continuity: it is stored with the KV meta on save, and later
+	// requests carrying it are routed to a backend holding that conversation.
+	conversationID := strFromAny(requestJSON["conversation_id"])
 	requestID := newRequestID()
 	promptPreview := ExtractPromptPreview(requestJSON)
 	reqClass := ClassifyRequest(messages, requestJSON)
@@ -332,20 +341,21 @@ func ChatHandler(w http.ResponseWriter, r *http.Request) {
 	d.Start()
 	reqCtx, reqCancel := context.WithCancel(r.Context())
 	req := &ProcRequest{
-		w:             w,
-		r:             r,
-		ctx:           reqCtx,
-		cancel:        reqCancel,
-		requestJSON:   requestJSON,
-		messages:      messages,
-		stream:        stream,
-		clientModel:   clientModel,
-		requestID:     requestID,
-		promptPreview: promptPreview,
-		reqClass:      reqClass,
-		t0:            t0,
-		ip:            ip,
-		done:          make(chan struct{}),
+		w:              w,
+		r:              r,
+		ctx:            reqCtx,
+		cancel:         reqCancel,
+		requestJSON:    requestJSON,
+		messages:       messages,
+		stream:         stream,
+		clientModel:    clientModel,
+		conversationID: conversationID,
+		requestID:      requestID,
+		promptPreview:  promptPreview,
+		reqClass:       reqClass,
+		t0:             t0,
+		ip:             ip,
+		done:           make(chan struct{}),
 	}
 	if !d.Submit(req) {
 		recordEarlyError(requestID, clientModel, t0)
@@ -553,6 +563,7 @@ type StreamState struct {
 	hitType            *CacheHitType
 	restoreKey         string
 	restoreBackend     string
+	conversationID     string
 	t0                 float64
 	requestJSON        map[string]any
 	requestID          string
@@ -732,6 +743,10 @@ func (ss *StreamState) run() {
 }
 
 func (ss *StreamState) save() (bool, int) {
+	// Cache-less backends have no disk KV store; nothing to save or skip-track.
+	if !backendManager.CacheEnabled(ss.backendID) {
+		return false, 0
+	}
 	recomputeHappened := false
 	if ss.hitType != nil && ss.restoreBackend != "" {
 		cachedTokens := ss.sseCachedTokens
@@ -758,32 +773,34 @@ func (ss *StreamState) save() (bool, int) {
 	if ShouldSkipSaveHeuristic(ss.nTokens, backendManager.GetBackendNCtx(ss.modelName, ss.backendID), ss.messages, ss.requestJSON) {
 		logInfo("app", "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): heuristic skip", ss.modelName, ss.backendID, ss.slotID, ss.keyShort)
 		ss.beSm.MarkSaveSkipped(ss.slotID, &SaveSkipEntry{
-			Key:          ss.key,
-			Model:        ss.modelName,
-			Blocks:       ss.blocks,
-			NTokens:      ss.nTokens,
-			HitType:      ss.hitType,
-			ServingRatio: servingBeRatio,
-			Recompute:    recomputeHappened,
-			Legacy:       false,
+			Key:            ss.key,
+			Model:          ss.modelName,
+			Blocks:         ss.blocks,
+			NTokens:        ss.nTokens,
+			HitType:        ss.hitType,
+			ServingRatio:   servingBeRatio,
+			Recompute:      recomputeHappened,
+			Legacy:         false,
+			ConversationID: ss.conversationID,
 		})
 		return false, 0
 	}
 	if !ShouldSaveCache(servingBeRatio, recomputeHappened) {
 		logInfo("app", "Skipping cache save for model '%s' on backend '%s' slot %d (key %s): restore ratio %.3f >= threshold (no recompute, cache was useful)", ss.modelName, ss.backendID, ss.slotID, ss.keyShort, servingBeRatio)
 		ss.beSm.MarkSaveSkipped(ss.slotID, &SaveSkipEntry{
-			Key:          ss.key,
-			Model:        ss.modelName,
-			Blocks:       ss.blocks,
-			NTokens:      ss.nTokens,
-			HitType:      ss.hitType,
-			ServingRatio: servingBeRatio,
-			Recompute:    recomputeHappened,
-			Legacy:       false,
+			Key:            ss.key,
+			Model:          ss.modelName,
+			Blocks:         ss.blocks,
+			NTokens:        ss.nTokens,
+			HitType:        ss.hitType,
+			ServingRatio:   servingBeRatio,
+			Recompute:      recomputeHappened,
+			Legacy:         false,
+			ConversationID: ss.conversationID,
 		})
 		return false, 0
 	}
-	ok, cacheSize := ss.beSm.SaveAfter(ss.modelName, ss.slotID, ss.key, ss.blocks, ss.nTokens)
+	ok, cacheSize := ss.beSm.SaveAfter(ss.modelName, ss.slotID, ss.key, ss.blocks, ss.nTokens, ss.conversationID)
 	logInfo("app", "SAVE: model_name='%s', key='%s', backend='%s', model_id_in_meta='%s'", ss.modelName, key16(ss.key), ss.backendID, ss.modelName)
 	return ok, cacheSize
 }
@@ -912,6 +929,8 @@ func serveStream(
 	routingReason string,
 	promptPreview string,
 	oldKV []string,
+	oldConv string,
+	conversationID string,
 	t0 float64,
 	messages []map[string]any,
 ) {
@@ -931,14 +950,14 @@ func serveStream(
 		}
 		if errors.Is(err, ErrConn) {
 			logError("app", "Backend connection error for client %s, model '%s' on backend '%s' slot %d (key %s): %v", clientIP(r), modelName, beID, slotID, key16(key), err)
-			restorePrevKV(beSm, slotID, oldKV, modelName, beID)
+			restorePrevKV(beSm, slotID, oldKV, oldConv, modelName, beID)
 			beSm.Release(slotID)
 			recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
 			WriteJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "backend connection failed"})
 			return
 		}
 		logError("app", "Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %v", clientIP(r), modelName, beID, slotID, key16(key), err)
-		restorePrevKV(beSm, slotID, oldKV, modelName, beID)
+		restorePrevKV(beSm, slotID, oldKV, oldConv, modelName, beID)
 		beSm.Release(slotID)
 		recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
 		WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -948,7 +967,7 @@ func serveStream(
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		restorePrevKV(beSm, slotID, oldKV, modelName, beID)
+		restorePrevKV(beSm, slotID, oldKV, oldConv, modelName, beID)
 		recordChatError(requestID, modelName, beID, slotID, t0, routingReason)
 		beSm.Release(slotID)
 		WriteJSON(w, resp.StatusCode, map[string]any{"error": string(errBody)})
@@ -984,6 +1003,7 @@ func serveStream(
 		hitType:            hitType,
 		restoreKey:         restoreKey,
 		restoreBackend:     restoreBackend,
+		conversationID:     conversationID,
 		t0:                 t0,
 		requestJSON:        requestJSON,
 		requestID:          requestID,

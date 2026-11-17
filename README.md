@@ -21,7 +21,7 @@ proxycache sits between clients and one or more `llama.cpp` backends. It interce
 
 - **Request dispatcher** — a single goroutine scans each incoming request (per-backend tokenization plus disk and in-flight-slot cache scan across all matching backends), routes it, and enqueues it on the chosen backend's FIFO queue. The same goroutine's *pump* then dispatches each queue head to a fresh worker while a slot is free — the slot pool is the concurrency limiter, so a backend with N free slots runs up to N requests in flight (single-slot backends degrade to one at a time). A request whose chosen backend's queue is full (default 5) parks in a global FIFO overflow queue and is re-matched as capacity frees.
 
-- **Cache-aware routing** — a request with a cache hit goes to the backend holding the cache while its queue depth stays below `CACHE_HIT_QUEUE_LIMIT` (default 2); otherwise it is distributed round-robin across the other matching backends, which triggers an async P2P transfer of the cache file so the chosen backend has it when the request runs. The proxy also scans in-flight (pending) slots for matches, letting subsequent requests reuse a slot's KV state before the cache is persisted to disk. Routing diagnostics capture the full per-backend scan trace for post-hoc analysis.
+- **Cache-aware routing** — a request with a cache hit goes to the backend holding the cache while its queue depth stays below `CACHE_HIT_QUEUE_LIMIT` (default 2); otherwise it is distributed round-robin across the other matching backends, which triggers an async P2P transfer of the cache file so the chosen backend has it when the request runs. Requests carrying a `conversation_id` get a stronger rule: the backend that holds that conversation's cache is preferred over any plain LCP hit (see Conversation ID below). The proxy also scans in-flight (pending) slots for matches, letting subsequent requests reuse a slot's KV state before the cache is persisted to disk. Routing diagnostics capture the full per-backend scan trace for post-hoc analysis.
 
 - **Queue migration** — a monitor (1s cadence) moves a request that has waited in a backend queue past `QUEUE_MIGRATION_AFTER` (default 120s) to a fully idle backend that serves the same model, so it starts immediately; the best disk cache is P2P-transferred to the target when needed. Each request migrates at most once, and requests without a transferable disk key (pending-slot-only or cold) need twice the age before they move — for them, migration trades a cheap future restore for an immediate full recompute.
 
@@ -43,6 +43,20 @@ proxycache sits between clients and one or more `llama.cpp` backends. It interce
 
 The proxy supports both streaming (SSE) and non-streaming responses.
 
+### Conversation ID
+
+Clients may include an optional top-level `conversation_id` string in the request body:
+
+```json
+{"model": "qwen3.6-32b", "messages": [...], "conversation_id": "my-thread-42"}
+```
+
+When present, the proxy persists it in the cache metadata written at save time and uses it for routing:
+
+- **Conversation beats LCP.** A request carrying `conversation_id` C routes to a backend holding C's cache (a disk entry tagged C, or a warm slot whose last request was C) even if another backend has a stronger plain LCP match. Among conversation backends, the shortest queue wins, ties broken by longest LCP; the backend is only preferred while its queue depth stays below `CACHE_HIT_QUEUE_LIMIT`, and if no conversation backend is eligible the usual routing runs with the conversation's own cache selected as the P2P transfer target.
+- **One cache entry per conversation.** When a request with `conversation_id` C triggers a save, the proxy first deletes every other cached entry of C (same model) on *all* backends, then writes the new one — the previous turn's state is superseded, keeping one disk entry per (conversation, model) and freeing its budget before the new save lands.
+- **Requests without the field are unaffected** — plain LCP routing and round-robin behave exactly as before. (Cache-less backends get a similar, approximate affinity by hashing the raw messages.)
+
 ## Configuration
 
 All config via environment variables (defaults in `config.go`). No `.env` file support. The binary ignores command-line flags — set the `PORT` env var to change the listen port.
@@ -50,11 +64,11 @@ All config via environment variables (defaults in `config.go`). No `.env` file s
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8081` | Proxy listen port |
-| `BACKENDS` | `[]` | JSON array of backend configs (see below). Empty defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`. Each backend must specify exactly one of `cache_dir` or `agent_port`. |
+| `BACKENDS` | `[]` | JSON array of backend configs (see below). Empty defaults to `[{"url":"http://127.0.0.1:8000","cache_dir":"/tmp/llama-cache"}]`. Each backend must specify exactly one of `cache_dir` or `agent_port`, unless cache management is disabled with `"cache_max_size_gb": 0` (see below). |
 | `BACKEND_MODE` | `llama-cpp` | `llama-cpp` or `llama-swap` (changes `/slots` URL paths) |
 | `META_DIR` | `./kv_meta` | Local metadata directory (organized by backend subdirectories) |
 | `WORDS_PER_BLOCK` | `100` | Words per block for LCP matching |
-| `LCP_TH` | `0.2` | LCP similarity threshold for cache match (0–1) |
+| `LCP_TH` | `0.4` | LCP similarity threshold for cache match (0–1) |
 | `KV_CACHE_SKIP_THRESHOLD` | `0.9` | Skip restore if slot KV cache matches >= this ratio (and the block-count difference is within `KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT`) |
 | `KV_CACHE_SKIP_MAX_BLOCK_DIFF_PCT` | `0.1` | Max relative block-count difference for a skip-restore to apply |
 | `CACHE_SAVE_RATIO_THRESHOLD` | `0.8` | Skip cache save if restore ratio >= this and no recompute (ring-budget protection: don't grow the cache when disk already covers the content) |
@@ -186,6 +200,16 @@ BACKENDS='[{"url":"http://10.0.0.1:8000","agent_port":8082}]'
 ```
 
 When `agent_port` is set, cache operations use the agent's HTTP endpoints. When `cache_dir` is set, cache operations use the local filesystem directly. A backend without either has no cache management.
+
+### Cache-less backends
+
+For OpenAI-compatible servers that expose no llama.cpp-specific endpoints (no `/tokenize`, `/apply-template`, or `/slots` — e.g. ninfer), disable cache management with `"cache_max_size_gb": 0`:
+
+```bash
+BACKENDS='[{"url":"http://10.0.0.1:1234","cache_max_size_gb":0}]'
+```
+
+No `cache_dir` or `agent_port` is required in this mode. The proxy skips all llama.cpp-specific calls and manages nothing on disk; the server's own prompt cache (if any) is used opaquely. Routing still gets conversation affinity: the proxy approximates KV state by hashing the raw request messages, so follow-up turns of a conversation are routed back to the backend that served the previous turn. One pseudo-slot is registered per model, so at most one request is in flight on the backend at a time. The context window is read from `context_window`/`max_model_len` in `/v1/models`.
 
 ### Mixed configuration
 

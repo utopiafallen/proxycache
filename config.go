@@ -39,7 +39,7 @@ func initBackends() {
 
 var (
 	WordsPerBlock               = EnvInt("WORDS_PER_BLOCK", 100)
-	LCPTh                       = EnvFloat("LCP_TH", 0.2)
+	LCPTh                       = EnvFloat("LCP_TH", 0.4)
 	MetaDir                     = filepath.Join(mustGetwd(), EnvStr("META_DIR", "kv_meta"))
 	RequestTimeout              = EnvFloat("REQUEST_TIMEOUT", 600)
 	ModelID                     = EnvStr("MODEL_ID", "llama.cpp")

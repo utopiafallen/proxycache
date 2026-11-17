@@ -36,14 +36,15 @@ type ringEntry struct {
 // slot is next used. Six fields mirror the Python tuple:
 // (key, blocks, n_tokens, hit_type, serving_be_ratio, recompute_happened).
 type SaveSkipEntry struct {
-	Key          string
-	Model        string // canonical model name of the cached content
-	Blocks       []string
-	NTokens      int
-	HitType      *CacheHitType
-	ServingRatio float64
-	Recompute    bool
-	Legacy       bool // 3-tuple legacy entry — always save on flush
+	Key            string
+	Model          string // canonical model name of the cached content
+	ConversationID string // conversation_id of the request that produced this content ("" if none)
+	Blocks         []string
+	NTokens        int
+	HitType        *CacheHitType
+	ServingRatio   float64
+	Recompute      bool
+	Legacy         bool // 3-tuple legacy entry — always save on flush
 }
 
 // BackendSlotManager tracks slot state for one backend.
@@ -54,16 +55,17 @@ type SaveSkipEntry struct {
 type BackendSlotManager struct {
 	BackendID string
 
-	PoolMu sync.Mutex // protects slotPools, inUse, lastUsed, slotKVState, slotSaveSkipped, SlotAcquiredAt, slotDurationEMA
+	PoolMu sync.Mutex // protects slotPools, inUse, lastUsed, slotKVState, slotConversation, slotSaveSkipped, SlotAcquiredAt, slotDurationEMA
 	RingMu sync.Mutex // protects CacheRing, totalBytes
 
-	slotPools       map[string][]int // model -> sorted ascending slot IDs
-	inUse           map[int]bool
-	lastUsed        map[int]float64
-	slotKVState     map[int][]string
-	slotSaveSkipped map[int]*SaveSkipEntry
-	SlotAcquiredAt  map[int]float64
-	slotDurationEMA float64
+	slotPools        map[string][]int // model -> sorted ascending slot IDs
+	inUse            map[int]bool
+	lastUsed         map[int]float64
+	slotKVState      map[int][]string
+	slotConversation map[int]string // slot -> conversation_id of the last request that established its KV state
+	slotSaveSkipped  map[int]*SaveSkipEntry
+	SlotAcquiredAt   map[int]float64
+	slotDurationEMA  float64
 
 	CacheRing  []ringEntry // insertion order
 	totalBytes int64
@@ -71,15 +73,16 @@ type BackendSlotManager struct {
 
 func NewBackendSlotManager(backendID string) *BackendSlotManager {
 	return &BackendSlotManager{
-		BackendID:       backendID,
-		slotPools:       map[string][]int{},
-		inUse:           map[int]bool{},
-		lastUsed:        map[int]float64{},
-		slotKVState:     map[int][]string{},
-		slotSaveSkipped: map[int]*SaveSkipEntry{},
-		SlotAcquiredAt:  map[int]float64{},
-		CacheRing:       []ringEntry{},
-		totalBytes:      0,
+		BackendID:        backendID,
+		slotPools:        map[string][]int{},
+		inUse:            map[int]bool{},
+		lastUsed:         map[int]float64{},
+		slotKVState:      map[int][]string{},
+		slotConversation: map[int]string{},
+		slotSaveSkipped:  map[int]*SaveSkipEntry{},
+		SlotAcquiredAt:   map[int]float64{},
+		CacheRing:        []ringEntry{},
+		totalBytes:       0,
 	}
 }
 
@@ -117,6 +120,7 @@ func (b *BackendSlotManager) EnsurePool(modelName string, nSlots int) {
 				delete(b.lastUsed, s)
 				delete(b.inUse, s)
 				delete(b.slotKVState, s)
+				delete(b.slotConversation, s)
 				delete(b.slotSaveSkipped, s)
 			}
 		}
@@ -198,7 +202,7 @@ func (b *BackendSlotManager) Release(slotID int) (float64, bool) {
 	return duration, true
 }
 
-// Invalidate clears the KV cache state for a slot.
+// Invalidate clears the KV cache state (and conversation tag) for a slot.
 func (b *BackendSlotManager) Invalidate(slotID int) {
 	b.PoolMu.Lock()
 	defer b.PoolMu.Unlock()
@@ -206,6 +210,7 @@ func (b *BackendSlotManager) Invalidate(slotID int) {
 		delete(b.slotKVState, slotID)
 		logInfo("slot_manager", "Invalidated KV cache tracking for backend '%s' slot %d", b.BackendID, slotID)
 	}
+	delete(b.slotConversation, slotID)
 }
 
 // GetKVState returns the tracked block hashes for a slot (nil if absent).
@@ -220,6 +225,38 @@ func (b *BackendSlotManager) SetKVState(slotID int, blocks []string) {
 	b.PoolMu.Lock()
 	defer b.PoolMu.Unlock()
 	b.slotKVState[slotID] = blocks
+}
+
+// SetSlotConversation records the conversation_id of the last request that
+// established the slot's tracked KV state; "" clears the tag (a request
+// without a conversation_id leaves the slot's content unattributed). The
+// matcher uses the tag to recognize a warm slot as a conversation match.
+func (b *BackendSlotManager) SetSlotConversation(slotID int, conversationID string) {
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
+	if conversationID == "" {
+		delete(b.slotConversation, slotID)
+	} else {
+		b.slotConversation[slotID] = conversationID
+	}
+}
+
+// GetSlotConversation returns the slot's conversation tag ("" if unset).
+func (b *BackendSlotManager) GetSlotConversation(slotID int) string {
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
+	return b.slotConversation[slotID]
+}
+
+// GetSlotConversations returns a copy of the slot->conversation_id map.
+func (b *BackendSlotManager) GetSlotConversations() map[int]string {
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
+	out := make(map[int]string, len(b.slotConversation))
+	for k, v := range b.slotConversation {
+		out[k] = v
+	}
+	return out
 }
 
 // GetKVStates returns a copy of the slot->blocks map.
@@ -332,11 +369,16 @@ func (b *BackendSlotManager) Restore(slotID int, key, modelName string, touchRin
 }
 
 // SaveAfter saves the slot's KV cache to disk after a completed response.
-// Returns (ok, size).
-func (b *BackendSlotManager) SaveAfter(modelName string, slotID int, key string, blocks []string, nTokens int) (bool, int) {
+// conversationID is the request's top-level conversation_id ("" if absent):
+// it is stored in the meta file, and before the save lands, every other
+// on-disk entry for that conversation+model is superseded (deleted) — the new
+// save is canonical for the conversation, and deleting first keeps the freed
+// budget available for the (usually larger) new entry. Returns (ok, size).
+func (b *BackendSlotManager) SaveAfter(modelName string, slotID int, key string, blocks []string, nTokens int, conversationID string) (bool, int) {
 	if !backendManager.CacheEnabled(b.BackendID) {
 		return false, 0
 	}
+	SweepConversationEntries(modelName, conversationID, key)
 	client := backendManager.GetClient(b.BackendID)
 	ok, size, err := client.SaveSlot(context.Background(), slotID, key, modelName)
 	if err != nil {
@@ -354,7 +396,7 @@ func (b *BackendSlotManager) SaveAfter(modelName string, slotID int, key string,
 
 	if ok && size > 0 {
 		b.RingMu.Lock()
-		kvMeta.WriteMeta(key, nTokens, blocks, WordsPerBlock, modelName, b.BackendID, size)
+		kvMeta.WriteMeta(key, nTokens, blocks, WordsPerBlock, modelName, b.BackendID, conversationID, size)
 		replaced := false
 		for i := range b.CacheRing {
 			if b.CacheRing[i].Key == key {
@@ -441,7 +483,10 @@ func (b *BackendSlotManager) EvictIfNeeded() {
 	}
 }
 
-// deleteEntry removes a cache file (and its sidecars) plus its meta file.
+// deleteEntry removes a cache file (and its sidecars) plus its meta file on
+// this backend. Meta deletion is per-backend: the same key may legitimately
+// exist on other backends (P2P transfer copies) and only this backend may
+// remove its own meta.
 func (b *BackendSlotManager) deleteEntry(key, logMsg, logExtra string) {
 	ok := backendManager.CacheDelete(b.BackendID, key)
 	if ok {
@@ -449,7 +494,66 @@ func (b *BackendSlotManager) deleteEntry(key, logMsg, logExtra string) {
 	} else {
 		logWarn("slot_manager", "%s_agent_fail: %s", logMsg, truncateKey(key))
 	}
-	kvMeta.DeleteMetaFile(key)
+	kvMeta.DeleteMetaFile(b.BackendID, key)
+}
+
+// RemoveEntry removes a cache entry from this backend: the ring entry (with
+// its size deducted from totalBytes) plus the cache file, sidecars, and meta
+// file. Unlike EvictIfNeeded it targets a specific key regardless of budget
+// pressure — used by the conversation supersede sweep. Returns true if the
+// key was in the ring. Must not be called with RingMu held.
+func (b *BackendSlotManager) RemoveEntry(key string) bool {
+	b.RingMu.Lock()
+	found := false
+	for i := range b.CacheRing {
+		if b.CacheRing[i].Key == key {
+			b.totalBytes -= b.CacheRing[i].Size
+			b.CacheRing = append(b.CacheRing[:i], b.CacheRing[i+1:]...)
+			found = true
+			break
+		}
+	}
+	b.RingMu.Unlock()
+	b.deleteEntry(key, "conversation_supersede", "")
+	return found
+}
+
+// SweepConversationEntries deletes every other on-disk cache entry tagged
+// with conversationID for modelName on every backend, called before the new
+// save lands. The new save is canonical for the conversation: if the content
+// changed since the previous turn, the stale entries are exactly what should
+// go (they are unlikely to be reused); if it extended, they are subsumed.
+// Gating is (conversation_id, model_id, wpb) — a mid-conversation model
+// switch keeps its own entries, and blocks are not compared across backends
+// because they are tokenizer-specific. keepKey is the new save's key, which
+// may already have a meta (re-save of identical content) and is preserved.
+func SweepConversationEntries(modelName, conversationID, keepKey string) {
+	if conversationID == "" {
+		return
+	}
+	for _, beID := range backendManager.Keys() {
+		if !backendManager.CacheEnabled(beID) {
+			continue
+		}
+		for _, meta := range kvMeta.ScanAllMeta(beID) {
+			if metaString(meta, "conversation_id") != conversationID {
+				continue
+			}
+			if metaString(meta, "model_id") != modelName {
+				continue
+			}
+			if int(MetaFloat(meta, "wpb")) != WordsPerBlock {
+				continue
+			}
+			key := metaString(meta, "key")
+			if key == "" || key == keepKey {
+				continue
+			}
+			slotManager.Get(beID).RemoveEntry(key)
+			logInfo("slot_manager", "Superseded conversation cache %s (model '%s', conversation '%s') on backend '%s'",
+				truncateKey(key), modelName, conversationID, beID)
+		}
+	}
 }
 
 type ringScored struct {

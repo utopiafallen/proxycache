@@ -89,12 +89,12 @@ func TestAgentP2PTransferPushSidecars(t *testing.T) {
 	dstURL, _ := startCacheAgent(t, dstDir)
 	key := "skey"
 	files := map[string]string{
-		key:           "main-payload",
-		key + ".ckpt":  "ckpt-a",
+		key:             "main-payload",
+		key + ".ckpt":   "ckpt-a",
 		key + ".ckpt.0": "ckpt-b",
 		// Not sidecars of this key — must NOT travel with it.
-		key + ".ckptx":    "unrelated",
-		"otherkey.ckpt":   "someone-elses",
+		key + ".ckptx":  "unrelated",
+		"otherkey.ckpt": "someone-elses",
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(srcDir, name), []byte(content), 0o644); err != nil {
@@ -161,7 +161,7 @@ func TestProxyTransferLocalToLocal(t *testing.T) {
 	tokens := seq(10)
 	key := proxycache.MetaKey("xfer-model", tokens)
 	blocks := proxycache.BlockHashesFromTokens(tokens, proxycache.WordsPerBlock)
-	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer-model", be1, 42)
+	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer-model", be1, "", 42)
 	if err := os.WriteFile(filepath.Join(dir1, key), []byte("src-cache"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestProxyTransferLocalToAgent(t *testing.T) {
 	tokens := seq(10)
 	key := proxycache.MetaKey("xfer2-model", tokens)
 	blocks := proxycache.BlockHashesFromTokens(tokens, proxycache.WordsPerBlock)
-	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer2-model", be1, 42)
+	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer2-model", be1, "", 42)
 	if err := os.WriteFile(filepath.Join(dir1, key), []byte("src-cache-2"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -287,13 +287,13 @@ func TestProxyTransferEvictsOnAgentDestination(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, oldKey), bytes.Repeat([]byte("o"), int(oldSize)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	proxycache.GetKVMeta().WriteMeta(oldKey, 10, blk("old", 2), proxycache.WordsPerBlock, "xfer4-model", be2, int(oldSize))
+	proxycache.GetKVMeta().WriteMeta(oldKey, 10, blk("old", 2), proxycache.WordsPerBlock, "xfer4-model", be2, "", int(oldSize))
 	proxycache.GetSlotManager().Get(be2).AddTransferredEntry(oldKey, oldSize)
 
 	tokens := seq(10)
 	key := proxycache.MetaKey("xfer4-model", tokens)
 	blocks := proxycache.BlockHashesFromTokens(tokens, proxycache.WordsPerBlock)
-	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer4-model", be1, 200)
+	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer4-model", be1, "", 200)
 	if err := os.WriteFile(filepath.Join(dir1, key), bytes.Repeat([]byte("n"), 200), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestProxyTransferAgentToLocal(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, key+".ckpt"), []byte("agent-sidecar"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer3-model", be1, 11)
+	proxycache.GetKVMeta().WriteMeta(key, 10, blocks, proxycache.WordsPerBlock, "xfer3-model", be1, "", 11)
 
 	if !proxycache.RequestCacheTransfer(be1, be2, key) {
 		t.Fatal("RequestCacheTransfer returned false")
@@ -365,7 +365,7 @@ func TestProxyTransferAgentToLocal(t *testing.T) {
 	if err != nil || string(data) != "agent-cache" {
 		t.Fatalf("transferred file = %q (err=%v), want agent-cache", data, err)
 	}
-	data, err = os.ReadFile(filepath.Join(dir2, key + ".ckpt"))
+	data, err = os.ReadFile(filepath.Join(dir2, key+".ckpt"))
 	if err != nil || string(data) != "agent-sidecar" {
 		t.Errorf("transferred sidecar = %q (err=%v), want agent-sidecar", data, err)
 	}
@@ -427,7 +427,7 @@ func TestLocalBackendServesAgentPort(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, key)); !os.IsNotExist(err) {
 		t.Error("Delete through embedded agent did not remove the file")
 	}
-	if _, err := os.Stat(filepath.Join(dir, key + ".ckpt")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, key+".ckpt")); !os.IsNotExist(err) {
 		t.Error("Delete through embedded agent did not remove the sidecar")
 	}
 }

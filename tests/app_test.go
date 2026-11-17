@@ -285,8 +285,8 @@ func TestChatAnyWithCacheHit(t *testing.T) {
 	injectModels(proxycache.GetBackendManager(), dm("model-a", 32768, beA), dm("model-b", 16384, beB))
 	reqBlocks := proxycache.BlockHashesFromTokens(tokens, proxycache.WordsPerBlock)
 	blocksB := append(append([]string{}, reqBlocks[:2]...), "uniq_b_3", "uniq_b_4")
-	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("model-a", tokens), 10, reqBlocks, proxycache.WordsPerBlock, "model-a", beA, 1024)
-	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("model-b", tokens), 10, blocksB, proxycache.WordsPerBlock, "model-b", beB, 1024)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("model-a", tokens), 10, reqBlocks, proxycache.WordsPerBlock, "model-a", beA, "", 1024)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("model-b", tokens), 10, blocksB, proxycache.WordsPerBlock, "model-b", beB, "", 1024)
 	w := postChat(t, `{"model": "any", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -433,7 +433,7 @@ func setupBusyRestoreBackend(t *testing.T, m1, m2 *mockLlama, model string) (str
 	markBackendsUp(proxycache.GetBackendManager())
 	reqTokens := seq(800)
 	reqBlocks := proxycache.BlockHashesFromTokens(reqTokens, proxycache.WordsPerBlock)
-	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey(model, reqTokens), 800, reqBlocks, proxycache.WordsPerBlock, model, be1, 2048)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey(model, reqTokens), 800, reqBlocks, proxycache.WordsPerBlock, model, be1, "", 2048)
 	beSm1 := proxycache.GetSlotManager().Get(be1)
 	beSm1.EnsurePool(model, 1)
 	if s := beSm1.TryAcquire(model); s != 0 {
@@ -465,7 +465,7 @@ func TestCacheHitQueueLimitFallbackP2P(t *testing.T) {
 	injectModels(proxycache.GetBackendManager(), dm("hitq-model", 32768, be1, be2))
 	reqBlocks := proxycache.BlockHashesFromTokens(tokens, proxycache.WordsPerBlock)
 	hitKey := proxycache.MetaKey("hitq-model", tokens)
-	proxycache.GetKVMeta().WriteMeta(hitKey, 800, reqBlocks, proxycache.WordsPerBlock, "hitq-model", be1, 2048)
+	proxycache.GetKVMeta().WriteMeta(hitKey, 800, reqBlocks, proxycache.WordsPerBlock, "hitq-model", be1, "", 2048)
 	if err := os.WriteFile(filepath.Join(dir1, hitKey), []byte("kv-cache-bytes"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +580,9 @@ func TestQueueMigrationToIdleBackend(t *testing.T) {
 	mA.tokens = tokensQ
 	mA.chatDelay = 3 * time.Second
 	doneA1 := make(chan *httptest.ResponseRecorder, 1)
-	go func() { doneA1 <- postChat(t, `{"model": "mig-model", "messages": [{"role": "user", "content": "busy"}]}`) }()
+	go func() {
+		doneA1 <- postChat(t, `{"model": "mig-model", "messages": [{"role": "user", "content": "busy"}]}`)
+	}()
 	waitFor(t, 5*time.Second, func() bool { return mA.chatCount() >= 1 })
 
 	// R: disk hit on A while A is busy -> queued on A, then migrated to idle B.
@@ -589,7 +591,9 @@ func TestQueueMigrationToIdleBackend(t *testing.T) {
 	bm.BackendState[beB] = true
 	bm.Mu.Unlock()
 	doneR := make(chan *httptest.ResponseRecorder, 1)
-	go func() { doneR <- postChat(t, `{"model": "mig-model", "messages": [{"role": "user", "content": "hit"}]}`) }()
+	go func() {
+		doneR <- postChat(t, `{"model": "mig-model", "messages": [{"role": "user", "content": "hit"}]}`)
+	}()
 
 	wR := <-doneR
 	wA1 := <-doneA1
@@ -641,13 +645,17 @@ func TestQueueMigrationColdWaitsDoubleThreshold(t *testing.T) {
 	mA.tokens = tokensP
 	mA.chatDelay = 1500 * time.Millisecond
 	doneA1 := make(chan *httptest.ResponseRecorder, 1)
-	go func() { doneA1 <- postChat(t, `{"model": "cold-model", "messages": [{"role": "user", "content": "busy"}]}`) }()
+	go func() {
+		doneA1 <- postChat(t, `{"model": "cold-model", "messages": [{"role": "user", "content": "busy"}]}`)
+	}()
 	waitFor(t, 5*time.Second, func() bool { return mA.chatCount() >= 1 })
 
 	// R: cold (no cache anywhere), queued on A while B stays down.
 	mA.tokens = tokensR
 	doneR := make(chan *httptest.ResponseRecorder, 1)
-	go func() { doneR <- postChat(t, `{"model": "cold-model", "messages": [{"role": "user", "content": "cold"}]}`) }()
+	go func() {
+		doneR <- postChat(t, `{"model": "cold-model", "messages": [{"role": "user", "content": "cold"}]}`)
+	}()
 
 	wR := <-doneR
 	wA1 := <-doneA1
@@ -671,8 +679,8 @@ func TestQueueMigrationColdWaitsDoubleThreshold(t *testing.T) {
 func TestQueueMigrationRescansTargetDisk(t *testing.T) {
 	withTempMetaDir(t)
 	withMigrationAfter(t, 1.0) // cold requests need >= 2s to be migrated
-	tokensW := seq(400)            // A's warm prefix (true prefix of tokensR)
-	tokensR := seq(800)            // R's content
+	tokensW := seq(400)        // A's warm prefix (true prefix of tokensR)
+	tokensR := seq(800)        // R's content
 	tokensQ := offsetSeq(400, 100000)
 	mA := newMockLlama(t, "mig-local", 32768, tokensW, 1)
 	mB := newMockLlama(t, "mig-local", 32768, tokensQ, 1)
@@ -709,13 +717,17 @@ func TestQueueMigrationRescansTargetDisk(t *testing.T) {
 	// B1: holds B's only slot for 4s — past R's 2s cold-migration threshold.
 	mB.chatDelay = 4 * time.Second
 	doneB1 := make(chan *httptest.ResponseRecorder, 1)
-	go func() { doneB1 <- postChat(t, `{"model": "mig-local", "messages": [{"role": "user", "content": "busy"}]}`) }()
+	go func() {
+		doneB1 <- postChat(t, `{"model": "mig-local", "messages": [{"role": "user", "content": "busy"}]}`)
+	}()
 	waitFor(t, 5*time.Second, func() bool { return mB.chatCount() >= 1 })
 
 	// R: cold everywhere it can see (A down, B's disk empty) -> queued on B.
 	mB.tokens = tokensR
 	doneR := make(chan *httptest.ResponseRecorder, 1)
-	go func() { doneR <- postChat(t, `{"model": "mig-local", "messages": [{"role": "user", "content": "cold"}]}`) }()
+	go func() {
+		doneR <- postChat(t, `{"model": "mig-local", "messages": [{"role": "user", "content": "cold"}]}`)
+	}()
 
 	// Wait until R has actually been scanned and enqueued on B (A still down,
 	// so its disk was never seen), only then bring A back up with the warm
@@ -802,7 +814,7 @@ func TestStalePendingSlotFallsBackToDisk(t *testing.T) {
 	injectModels(proxycache.GetBackendManager(), dm("stale-model", 32768, be))
 	blocks := proxycache.BlockHashesFromTokens(tokens, proxycache.WordsPerBlock)
 	key := proxycache.MetaKey("stale-model", tokens)
-	proxycache.GetKVMeta().WriteMeta(key, 800, blocks, proxycache.WordsPerBlock, "stale-model", be, 2048)
+	proxycache.GetKVMeta().WriteMeta(key, 800, blocks, proxycache.WordsPerBlock, "stale-model", be, "", 2048)
 	if err := os.WriteFile(filepath.Join(dir, key), []byte("kv-cache-bytes"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -893,7 +905,7 @@ func TestSkippedSaveFlushedOnClobberEvictedAncestor(t *testing.T) {
 
 	// Simulate ring eviction of the ancestor (the mock writes no physical
 	// cache files, so dropping the meta is what breaks scan coverage).
-	if !proxycache.GetKVMeta().DeleteMetaFile(keyA0) {
+	if !proxycache.GetKVMeta().DeleteMetaFile(be, keyA0) {
 		t.Fatalf("failed to delete ancestor meta")
 	}
 
@@ -1091,6 +1103,108 @@ func TestPumpDiscardDoesNotLeakSlot(t *testing.T) {
 	}
 }
 
+// TestConversationRoutingAndSupersede verifies the conversation_id feature
+// end to end: a request carrying a conversation_id routes to the backend that
+// holds that conversation's cache even when another backend has a higher-LCP
+// entry from a different conversation; the post-response save supersedes
+// (deletes) the previous turn's conversation entry before the new save lands;
+// and the slot's conversation tag keeps follow-ups sticky.
+func TestConversationRoutingAndSupersede(t *testing.T) {
+	withTempMetaDir(t)
+	reqTokens := seq(800) // 8 blocks
+	mA := newMockLlama(t, "conv-model", 32768, reqTokens, 1)
+	mB := newMockLlama(t, "conv-model", 32768, reqTokens, 1)
+	beA := backendKeyFromURL(mA.srv.URL)
+	beB := backendKeyFromURL(mB.srv.URL)
+	withTestBackend(t, []map[string]any{
+		{"url": mA.srv.URL, "cache_dir": t.TempDir()},
+		{"url": mB.srv.URL, "cache_dir": t.TempDir()},
+	})
+	bm := proxycache.GetBackendManager()
+	markBackendsUp(bm)
+	injectModels(bm, dm("conv-model", 32768, beA, beB))
+
+	// Backend A holds conversation conv-123's previous turn: 4 of 8 blocks
+	// match (ratio 0.5).
+	candTokensA := append(append([]int{}, seq(400)...), offsetSeq(400, 10000)...)
+	candBlocksA := proxycache.BlockHashesFromTokens(candTokensA, proxycache.WordsPerBlock)
+	keyA := proxycache.MetaKey("conv-model", candTokensA)
+	proxycache.GetKVMeta().WriteMeta(keyA, 800, candBlocksA, proxycache.WordsPerBlock, "conv-model", beA, "conv-123", 2048)
+	// Backend B holds an untagged entry with 7 of 8 blocks (ratio 0.875) —
+	// the stronger plain LCP hit, but not this conversation's.
+	candTokensB := append(append([]int{}, seq(700)...), offsetSeq(100, 20000)...)
+	candBlocksB := proxycache.BlockHashesFromTokens(candTokensB, proxycache.WordsPerBlock)
+	keyB := proxycache.MetaKey("conv-model", candTokensB)
+	proxycache.GetKVMeta().WriteMeta(keyB, 800, candBlocksB, proxycache.WordsPerBlock, "conv-model", beB, "", 2048)
+
+	// Request for conv-123: routes to A (conversation always beats the plain
+	// LCP hit on B) and restores A's conversation entry.
+	w := postChat(t, `{"model": "conv-model", "messages": [{"role": "user", "content": "hello"}], "conversation_id": "conv-123"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if mA.chatCount() != 1 {
+		t.Errorf("A chat count = %d, want 1 (conversation backend)", mA.chatCount())
+	}
+	if mB.chatCount() != 0 {
+		t.Errorf("B chat count = %d, want 0 (higher LCP, different conversation)", mB.chatCount())
+	}
+	mA.mu.Lock()
+	restores := len(mA.restores)
+	mA.mu.Unlock()
+	if restores != 1 {
+		t.Errorf("A restore count = %d, want 1 (restore the conversation entry)", restores)
+	}
+
+	// The post-response save (ratio 0.5 <= 0.8) supersedes the previous
+	// turn's conversation entry on A before the new save lands, and tags the
+	// new meta with the conversation_id.
+	keyNew := proxycache.MetaKey("conv-model", reqTokens)
+	if meta := proxycache.GetKVMeta().ReadMeta(keyA, beA); meta != nil {
+		t.Error("previous turn's conversation entry not superseded by the new save")
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta(keyNew, beA); meta == nil {
+		t.Error("new save missing on A")
+	} else if meta["conversation_id"] != "conv-123" {
+		t.Errorf("new save conversation_id = %v, want conv-123", meta["conversation_id"])
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta(keyB, beB); meta == nil {
+		t.Error("untagged entry on B was deleted by the conversation sweep")
+	}
+
+	// Follow-up for the same conversation: warm slot + conversation tag keep
+	// it on A; restore ratio 1.0 skips its own save.
+	w = postChat(t, `{"model": "conv-model", "messages": [{"role": "user", "content": "hello"}], "conversation_id": "conv-123"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("follow-up status = %d, want 200", w.Code)
+	}
+	if mA.chatCount() != 2 {
+		t.Errorf("A chat count = %d, want 2", mA.chatCount())
+	}
+	if mB.chatCount() != 0 {
+		t.Errorf("B chat count = %d, want 0", mB.chatCount())
+	}
+	mA.mu.Lock()
+	saves := len(mA.saves)
+	mA.mu.Unlock()
+	if saves != 1 {
+		t.Errorf("A save count = %d, want 1 (first turn only; follow-up's 1.0 restore ratio skips its save)", saves)
+	}
+
+	// Without a conversation_id the request still takes the plain LCP route —
+	// A now holds the full-prompt entry (ratio 1.0).
+	w = postChat(t, `{"model": "conv-model", "messages": [{"role": "user", "content": "hello"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("plain status = %d, want 200", w.Code)
+	}
+	if mA.chatCount() != 3 {
+		t.Errorf("A chat count = %d, want 3 (plain LCP hit on its full entry)", mA.chatCount())
+	}
+	if mB.chatCount() != 0 {
+		t.Errorf("B chat count = %d, want 0", mB.chatCount())
+	}
+}
+
 func TestChatSaveSkippedWhenRatioAboveThreshold(t *testing.T) {
 	withTempMetaDir(t)
 	reqTokens := seq(800)
@@ -1109,7 +1223,7 @@ func TestChatSaveSkippedWhenRatioAboveThreshold(t *testing.T) {
 	reqBlocks := proxycache.BlockHashesFromTokens(reqTokens, proxycache.WordsPerBlock)
 	candBlocks := append(append([]string{}, reqBlocks[:7]...), "different_block")
 	candTokens := append(append([]int{}, seq(700)...), offsetSeq(100, 10000)...)
-	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("test-model", candTokens), 800, candBlocks, proxycache.WordsPerBlock, "test-model", be, 2048)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("test-model", candTokens), 800, candBlocks, proxycache.WordsPerBlock, "test-model", be, "", 2048)
 	w := postChat(t, `{"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -1140,7 +1254,7 @@ func TestChatSavePerformedWhenRatioBelowThreshold(t *testing.T) {
 	reqBlocks := proxycache.BlockHashesFromTokens(reqTokens, proxycache.WordsPerBlock)
 	candBlocks := append(append([]string{}, reqBlocks[:4]...), blk("cand9", 4)...)
 	candTokens := append(append([]int{}, seq(400)...), offsetSeq(400, 10000)...)
-	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("test-model", candTokens), 800, candBlocks, proxycache.WordsPerBlock, "test-model", be, 2048)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("test-model", candTokens), 800, candBlocks, proxycache.WordsPerBlock, "test-model", be, "", 2048)
 	w := postChat(t, `{"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)

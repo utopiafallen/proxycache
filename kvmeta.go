@@ -162,6 +162,7 @@ type metaFile struct {
 	Key              string   `json:"key"`
 	ModelID          string   `json:"model_id"`
 	Backend          string   `json:"backend"`
+	ConversationID   string   `json:"conversation_id,omitempty"`
 	NTokens          int      `json:"n_tokens"`
 	WPB              int      `json:"wpb"`
 	Blocks           []string `json:"blocks"`
@@ -171,11 +172,15 @@ type metaFile struct {
 }
 
 // WriteMeta writes/overwrites the meta file for a key.
-func (kv *KVMetaManager) WriteMeta(key string, nTokens int, blocks []string, wpb int, modelID, backendID string, cacheSize int) {
+// conversationID is the request's top-level conversation_id, stored so that
+// later requests for the same conversation can match and supersede it; ""
+// omits the field.
+func (kv *KVMetaManager) WriteMeta(key string, nTokens int, blocks []string, wpb int, modelID, backendID, conversationID string, cacheSize int) {
 	meta := metaFile{
 		Key:              key,
 		ModelID:          modelID,
 		Backend:          backendID,
+		ConversationID:   conversationID,
 		NTokens:          nTokens,
 		WPB:              wpb,
 		Blocks:           blocks,
@@ -228,26 +233,17 @@ func (w stringsWriter) Write(p []byte) (int, error) {
 	return w.s.Write(p)
 }
 
-// DeleteMetaFile deletes the meta file for a key across all backends.
-// Returns true if a file was deleted.
-func (kv *KVMetaManager) DeleteMetaFile(key string) bool {
-	if st, err := os.Stat(MetaDir); err != nil || !st.IsDir() {
+// DeleteMetaFile deletes the meta file for a key on ONE specific backend.
+// Meta files are never deleted across backends in one call: after P2P
+// transfers the same key can legitimately live on several backends, and only
+// the backend that no longer wants the entry may remove its meta (and cache
+// file). Returns true if a file was deleted.
+func (kv *KVMetaManager) DeleteMetaFile(backendID, key string) bool {
+	path := kv.MetaFilePath(key, backendID)
+	if err := os.Remove(path); err != nil {
 		return false
 	}
-	entries, err := os.ReadDir(MetaDir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		candidate := filepath.Join(MetaDir, e.Name(), key+MetaSuffix)
-		if _, err := os.Stat(candidate); err == nil {
-			if err := os.Remove(candidate); err != nil {
-				return false
-			}
-			return true
-		}
-	}
-	return false
+	return true
 }
 
 // IncrementRecomputePenalty increments the recompute_penalty counter on a meta file.
@@ -346,6 +342,63 @@ func (kv *KVMetaManager) FindBestRestoreCandidate(reqBlocks []string, wpb int, t
 		return bestKey, bestRatio, true
 	}
 	return "", 0, false
+}
+
+// MetaCandidates holds the per-backend scan results for one request: the
+// best overall disk restore candidate (penalty-scored, ratio >= th) and,
+// when a conversation_id is supplied, the best disk entry tagged with it.
+// The conversation match has no ratio gate — the conversation tag itself is
+// the match; a low-ratio conversation entry is still preferred over a
+// higher-ratio entry from a different conversation.
+type MetaCandidates struct {
+	BestKey   string
+	BestRatio float64
+	BestFound bool
+	ConvKey   string
+	ConvRatio float64
+	ConvFound bool
+}
+
+// FindBestCandidates scans the backend's meta files once and returns both
+// the best overall restore candidate and the best entry for conversationID.
+func (kv *KVMetaManager) FindBestCandidates(reqBlocks []string, wpb int, th float64, modelID, backendID, conversationID string) MetaCandidates {
+	metas := kv.ScanAllMeta(backendID)
+	out := MetaCandidates{}
+	var bestScore float64
+
+	for _, meta := range metas {
+		if metaString(meta, "model_id") != modelID {
+			continue
+		}
+		if metaString(meta, "backend") != backendID {
+			continue
+		}
+		if int(MetaFloat(meta, "wpb")) != wpb {
+			continue
+		}
+		candBlocks := metaStringSlice(meta, "blocks")
+		if len(candBlocks) > len(reqBlocks) {
+			continue
+		}
+		lcp := LCPBlocks(reqBlocks, candBlocks)
+		ratio := float64(lcp) / mathMaxFloat(1, float64(len(reqBlocks)))
+		if conversationID != "" && metaString(meta, "conversation_id") == conversationID {
+			if ratio > out.ConvRatio {
+				out.ConvKey = metaString(meta, "key")
+				out.ConvRatio = ratio
+				out.ConvFound = true
+			}
+		}
+		penalty := MetaFloat(meta, "recompute_penalty")
+		score := ratio * mathMaxFloat(0, 1-0.1*penalty)
+		if ratio >= th && score > bestScore {
+			bestScore = score
+			out.BestRatio = ratio
+			out.BestKey = metaString(meta, "key")
+			out.BestFound = true
+		}
+	}
+	return out
 }
 
 // GetCacheSize returns the cache size in bytes for a key, or 0 if not found.

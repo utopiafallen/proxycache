@@ -6,6 +6,7 @@ package proxycache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"strconv"
 	"strings"
 )
@@ -70,4 +71,43 @@ func MetaKey(canonicalName string, tokenIDs []int) string {
 		parts[i] = strconv.Itoa(t)
 	}
 	return PrefixKeySha256(canonicalName + "\n" + strings.Join(parts, ","))
+}
+
+// MessageBlocks derives approximate block hashes directly from the raw request
+// messages, for backends that expose neither /tokenize nor /apply-template
+// (e.g. ninfer). Each message is canonicalized to compact JSON (map keys are
+// sorted by encoding/json, so the output is deterministic), the concatenation
+// is split on whitespace into words, and every group of wpb words is hashed
+// the same way as BlockHashesFromTokens so the resulting sequences can be
+// LCP-compared.
+//
+// This is an approximation of the backend's real token stream. It is only used
+// to track per-slot KV state for pending-hit affinity routing on backends with
+// cache management disabled (cache_max_size_gb=0) — never for cache keys or
+// disk restore. Appending a new message leaves earlier blocks unchanged, so a
+// growing conversation keeps a stable block prefix.
+func MessageBlocks(messages []map[string]any, wpb int) []string {
+	if wpb <= 0 || len(messages) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	for _, m := range messages {
+		b, err := json.Marshal(m)
+		if err != nil {
+			continue
+		}
+		sb.Write(b)
+		sb.WriteByte('\n')
+	}
+	words := strings.Fields(sb.String())
+	hashes := make([]string, 0, (len(words)+wpb-1)/wpb)
+	for i := 0; i < len(words); i += wpb {
+		end := i + wpb
+		if end > len(words) {
+			end = len(words)
+		}
+		h := sha256.Sum256([]byte(strings.Join(words[i:end], " ")))
+		hashes = append(hashes, hex.EncodeToString(h[:]))
+	}
+	return hashes
 }

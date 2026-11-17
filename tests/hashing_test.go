@@ -105,3 +105,54 @@ func TestMetaKey(t *testing.T) {
 		}
 	}
 }
+
+func TestMessageBlocks(t *testing.T) {
+	if got := proxycache.MessageBlocks(nil, 3); got != nil {
+		t.Errorf("MessageBlocks(nil) = %v, want nil", got)
+	}
+	if got := proxycache.MessageBlocks([]map[string]any{{"role": "user"}}, 0); got != nil {
+		t.Errorf("MessageBlocks(wpb=0) = %v, want nil", got)
+	}
+
+	// Exact vector: Go's json.Marshal sorts map keys, so the message
+	// {"content":"hello world","role":"user"} yields two whitespace words.
+	msgs := []map[string]any{{"role": "user", "content": "hello world"}}
+	if got := proxycache.MessageBlocks(msgs, 2); !reflect.DeepEqual(got, []string{
+		"03f4c19b586148b9b2f0b6870ef6e97296b6013a416daa720630accf502651d3",
+	}) {
+		t.Errorf("MessageBlocks(wpb=2) = %v", got)
+	}
+	if got := proxycache.MessageBlocks(msgs, 1); !reflect.DeepEqual(got, []string{
+		"05be7a106a7059ff86fc510df5599ec650ef17196cde48abb7bc7124ef3e5ac9",
+		"6891d0b077fb89f9f5ee6d3f33915de8953664c8d3a5042644559063bec7a7ec",
+	}) {
+		t.Errorf("MessageBlocks(wpb=1) = %v", got)
+	}
+
+	// Map key order must not matter (encoding/json sorts keys).
+	msgsShuffled := []map[string]any{{"content": "hello world", "role": "user"}}
+	if a, b := proxycache.MessageBlocks(msgs, 7), proxycache.MessageBlocks(msgsShuffled, 7); !reflect.DeepEqual(a, b) {
+		t.Errorf("key order changed blocks: %v vs %v", a, b)
+	}
+
+	// Prefix stability: appending a message must not disturb the earlier
+	// blocks (at most the trailing partial block can re-align).
+	m1 := map[string]any{"role": "user", "content": "tell me a long story about dragons and castles and many other things"}
+	m2 := map[string]any{"role": "assistant", "content": "once upon a time there was a dragon who lived in a castle by the sea"}
+	m3 := map[string]any{"role": "user", "content": "what happened next?"}
+	blocks2 := proxycache.MessageBlocks([]map[string]any{m1, m2}, 3)
+	blocks3 := proxycache.MessageBlocks([]map[string]any{m1, m2, m3}, 3)
+	if len(blocks3) <= len(blocks2) {
+		t.Fatalf("expected longer block list after append: %d -> %d", len(blocks2), len(blocks3))
+	}
+	if lcp := proxycache.LCPBlocks(blocks2, blocks3); lcp < len(blocks2)-1 {
+		t.Errorf("prefix not stable: LCP=%d of %d blocks", lcp, len(blocks2))
+	}
+
+	// A changed earlier message must break the prefix from its words on.
+	m1b := map[string]any{"role": "user", "content": "tell me a short story about cats instead"}
+	blocksChanged := proxycache.MessageBlocks([]map[string]any{m1b, m2}, 3)
+	if lcp := proxycache.LCPBlocks(blocks2, blocksChanged); lcp == len(blocks2) {
+		t.Errorf("changing m1 left all %d blocks identical", len(blocks2))
+	}
+}

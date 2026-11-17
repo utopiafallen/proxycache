@@ -111,7 +111,7 @@ func resolveRestoreKey(req *ProcRequest, dec *RouteDecision, beID string, canSki
 func transferWaitFor(sizeBytes int64) time.Duration {
 	wait := time.Duration(CacheTransferWait * float64(time.Second))
 	if sizeBytes > 0 && CacheTransferAssumedMBps > 0 {
-		est := time.Duration(float64(sizeBytes) / (1024*1024*CacheTransferAssumedMBps) * float64(time.Second))
+		est := time.Duration(float64(sizeBytes) / (1024 * 1024 * CacheTransferAssumedMBps) * float64(time.Second))
 		if est > wait {
 			wait = est
 		}
@@ -165,7 +165,7 @@ func flushSkippedSave(beSm *BackendSlotManager, slotID int, blocks []string, can
 	if !save {
 		return
 	}
-	beSm.SaveAfter(modelName, slotID, entry.Key, entry.Blocks, entry.NTokens)
+	beSm.SaveAfter(modelName, slotID, entry.Key, entry.Blocks, entry.NTokens, entry.ConversationID)
 	// SaveAfter re-tracks the saved (older) blocks; restore this request's.
 	beSm.SetKVState(slotID, blocks)
 	logInfo("processor", "Flushed skipped cache %s for model '%s' on backend '%s' slot %d before clobber (disk coverage degraded)",
@@ -278,6 +278,7 @@ func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, s
 	} else {
 		prevKV = beSm.GetKVState(slotID)
 	}
+	prevConv := beSm.GetSlotConversation(slotID)
 
 	blocks := dec.backendBlocks[beID]
 	if len(blocks) == 0 {
@@ -288,11 +289,15 @@ func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, s
 	// slot was picked. prevKV is the state captured before SetKVState.
 	canSkip := beSm.ShouldSkipRestore(slotID, blocks, prevKV, true)
 	beSm.SetKVState(slotID, blocks)
+	beSm.SetSlotConversation(slotID, req.conversationID)
 
 	// If this slot holds a previously-skipped save for content we are about
 	// to clobber, persist it now — before the restore/prefill below destroys
-	// the physical KV cache.
-	flushSkippedSave(beSm, slotID, blocks, canSkip, modelName, beID)
+	// the physical KV cache. Cache-less backends never accumulate skipped-save
+	// entries, so skip the (pointless) disk/agent lookups for them.
+	if backendManager.CacheEnabled(beID) {
+		flushSkippedSave(beSm, slotID, blocks, canSkip, modelName, beID)
+	}
 
 	restoreKey := resolveRestoreKey(req, dec, beID, canSkip)
 	restored, skipRestoreDiag := doWorkerRestore(beSm, slotID, restoreKey, blocks, prevKV, modelName, beID)
@@ -333,6 +338,8 @@ func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, s
 
 	var routingReason string
 	switch {
+	case dec.selectionReason == "conversation_hit":
+		routingReason = "conversation_hit"
 	case dec.hitType != nil && *dec.hitType == CacheHitSkip && beID == dec.restoreBackend:
 		routingReason = "pending_slot_hit"
 	case dec.hitType != nil && *dec.hitType == CacheHitDiskRestore && beID == dec.restoreBackend:
@@ -382,7 +389,7 @@ func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, s
 		serveStream(req.w, req.r, req.requestJSON, body, beID, slotID, modelName, key, reqBlocks,
 			dec.promptTokens, dec.bestRatio, dec.hitType, effRestoreKey, effRestoreBackend,
 			dec.backendCacheRatios, req.reqClass.Score, req.requestID, routingReason,
-			req.promptPreview, prevKV, req.t0, req.messages)
+			req.promptPreview, prevKV, prevConv, req.conversationID, req.t0, req.messages)
 		return
 	}
 
@@ -408,6 +415,7 @@ func processNonStream(
 ) {
 	beID := beSm.BackendID
 	prevKV := beSm.GetKVState(slotID)
+	prevConv := beSm.GetSlotConversation(slotID)
 	released := false
 	defer func() {
 		if !released {
@@ -427,7 +435,7 @@ func processNonStream(
 		if errors.Is(err, ErrConn) {
 			logError("processor", "Backend connection error for client %s, model '%s' on backend '%s' slot %d (key %s): %v",
 				req.ip, modelName, beID, slotID, key16(key), err)
-			restorePrevKV(beSm, slotID, prevKV, modelName, beID)
+			restorePrevKV(beSm, slotID, prevKV, prevConv, modelName, beID)
 			beSm.Release(slotID)
 			released = true
 			recordChatError(req.requestID, modelName, beID, slotID, req.t0, routingReason)
@@ -436,13 +444,13 @@ func processNonStream(
 		}
 		logError("processor", "Chat error for client %s, model '%s' on backend '%s' slot %d (key %s): %v",
 			req.ip, modelName, beID, slotID, key16(key), err)
-		restorePrevKV(beSm, slotID, prevKV, modelName, beID)
+		restorePrevKV(beSm, slotID, prevKV, prevConv, modelName, beID)
 		recordChatError(req.requestID, modelName, beID, slotID, req.t0, routingReason)
 		WriteJSON(req.w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	if out == nil {
-		restorePrevKV(beSm, slotID, prevKV, modelName, beID)
+		restorePrevKV(beSm, slotID, prevKV, prevConv, modelName, beID)
 		recordChatError(req.requestID, modelName, beID, slotID, req.t0, routingReason)
 		WriteJSON(req.w, http.StatusBadGateway, map[string]any{"error": "provider non-JSON body"})
 		return
@@ -482,22 +490,28 @@ func processNonStream(
 	}
 
 	servingBeRatio := dec.backendCacheRatios[beID]
-	skipEntry := &SaveSkipEntry{
-		Key:          key,
-		Model:        modelName,
-		Blocks:       blocks,
-		NTokens:      dec.promptTokens,
-		HitType:      dec.hitType,
-		ServingRatio: servingBeRatio,
-		Recompute:    recomputeHappened,
-		Legacy:       false,
-	}
-	if ShouldSkipSaveHeuristic(dec.promptTokens, backendManager.GetBackendNCtx(modelName, beID), req.messages, req.requestJSON) {
-		beSm.MarkSaveSkipped(slotID, skipEntry)
-	} else if ShouldSaveCache(servingBeRatio, recomputeHappened) {
-		saveOK, cacheSize = beSm.SaveAfter(modelName, slotID, key, blocks, dec.promptTokens)
-	} else {
-		beSm.MarkSaveSkipped(slotID, skipEntry)
+	// Cache-less backends (cache_max_size_gb=0) have no disk KV store to save
+	// into, so skip the whole save decision (SaveAfter would be a no-op and
+	// MarkSaveSkipped entries could never flush).
+	if backendManager.CacheEnabled(beID) {
+		skipEntry := &SaveSkipEntry{
+			Key:            key,
+			Model:          modelName,
+			Blocks:         blocks,
+			NTokens:        dec.promptTokens,
+			HitType:        dec.hitType,
+			ServingRatio:   servingBeRatio,
+			Recompute:      recomputeHappened,
+			Legacy:         false,
+			ConversationID: req.conversationID,
+		}
+		if ShouldSkipSaveHeuristic(dec.promptTokens, backendManager.GetBackendNCtx(modelName, beID), req.messages, req.requestJSON) {
+			beSm.MarkSaveSkipped(slotID, skipEntry)
+		} else if ShouldSaveCache(servingBeRatio, recomputeHappened) {
+			saveOK, cacheSize = beSm.SaveAfter(modelName, slotID, key, blocks, dec.promptTokens, req.conversationID)
+		} else {
+			beSm.MarkSaveSkipped(slotID, skipEntry)
+		}
 	}
 
 	latency := latencyMS(req.t0)

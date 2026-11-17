@@ -84,9 +84,11 @@ func runCacheTransfer(srcBe, dstBe, key string) {
 	size := backendManager.CacheGetSize(srcBe, key)
 	blocks := kvMeta.GetBlocks(key, srcBe)
 	modelID := ""
+	conversationID := ""
 	nTokens := 0
 	if srcMeta != nil {
 		modelID = metaString(srcMeta, "model_id")
+		conversationID = metaString(srcMeta, "conversation_id")
 		nTokens = int(MetaFloat(srcMeta, "n_tokens"))
 	}
 	var sidecars []string
@@ -192,7 +194,7 @@ func runCacheTransfer(srcBe, dstBe, key string) {
 	}
 
 	if ok {
-		kvMeta.WriteMeta(key, nTokens, blocks, WordsPerBlock, modelID, dstBe, size)
+		kvMeta.WriteMeta(key, nTokens, blocks, WordsPerBlock, modelID, dstBe, conversationID, size)
 		slotManager.Get(dstBe).AddTransferredEntry(key, int64(size))
 		d := time.Since(t0)
 		recordTransferEvent(srcBe, dstBe, key, size, len(sidecars), t0, true, "")

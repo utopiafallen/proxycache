@@ -12,7 +12,7 @@ import (
 func TestWriteMetaReadWrite(t *testing.T) {
 	withTempMetaDir(t)
 	blocks := []string{"b1", "b2", "b3"}
-	proxycache.GetKVMeta().WriteMeta("key-abc", 10, blocks, 64, "model-x", "be1", 4096)
+	proxycache.GetKVMeta().WriteMeta("key-abc", 10, blocks, 64, "model-x", "be1", "", 4096)
 	path := filepath.Join(proxycache.MetaDir, "be1", "key-abc"+proxycache.MetaSuffix)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("meta file not written at %s", path)
@@ -60,9 +60,9 @@ func TestWriteMetaReadWrite(t *testing.T) {
 func TestListKeysSorted(t *testing.T) {
 	withTempMetaDir(t)
 	for _, k := range []string{"zeta", "alpha", "mid"} {
-		proxycache.GetKVMeta().WriteMeta(k, 1, []string{"x"}, 64, "m", "be1", 0)
+		proxycache.GetKVMeta().WriteMeta(k, 1, []string{"x"}, 64, "m", "be1", "", 0)
 	}
-	proxycache.GetKVMeta().WriteMeta("other", 1, []string{"x"}, 64, "m", "be2", 0)
+	proxycache.GetKVMeta().WriteMeta("other", 1, []string{"x"}, 64, "m", "be2", "", 0)
 	if err := os.WriteFile(filepath.Join(proxycache.MetaDir, "be1", "notes.txt"), []byte("hi"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -86,8 +86,8 @@ func TestListKeysSorted(t *testing.T) {
 
 func TestScanAllMetaNewestFirst(t *testing.T) {
 	dir := withTempMetaDir(t)
-	proxycache.GetKVMeta().WriteMeta("old-key", 1, []string{"a"}, 64, "m", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta("new-key", 1, []string{"a"}, 64, "m", "be1", 0)
+	proxycache.GetKVMeta().WriteMeta("old-key", 1, []string{"a"}, 64, "m", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta("new-key", 1, []string{"a"}, 64, "m", "be1", "", 0)
 	old := time.Now().Add(-100 * time.Second)
 	if err := os.Chtimes(filepath.Join(dir, "be1", "old-key"+proxycache.MetaSuffix), old, old); err != nil {
 		t.Fatal(err)
@@ -121,8 +121,8 @@ func TestReconcileMetaRemovesOrphans(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cacheDir, "valid_cache_key"), []byte("cache data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	proxycache.GetKVMeta().WriteMeta("valid_cache_key", 10, []string{}, 100, "test", key, 8)
-	proxycache.GetKVMeta().WriteMeta("orphan_cache_key", 10, []string{}, 100, "test", key, 8)
+	proxycache.GetKVMeta().WriteMeta("valid_cache_key", 10, []string{}, 100, "test", key, "", 8)
+	proxycache.GetKVMeta().WriteMeta("orphan_cache_key", 10, []string{}, 100, "test", key, "", 8)
 	if err := os.WriteFile(filepath.Join(proxycache.MetaDir, key, "corrupted_cache_key"+proxycache.MetaSuffix), []byte("not json {{{"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -143,24 +143,28 @@ func TestReconcileMetaRemovesOrphans(t *testing.T) {
 
 func TestDeleteMetaFile(t *testing.T) {
 	withTempMetaDir(t)
-	proxycache.GetKVMeta().WriteMeta("k1", 5, []string{"a"}, 64, "m", "be1", 100)
-	if !proxycache.GetKVMeta().DeleteMetaFile("k1") {
+	proxycache.GetKVMeta().WriteMeta("k1", 5, []string{"a"}, 64, "m", "be1", "", 100)
+	proxycache.GetKVMeta().WriteMeta("k1", 5, []string{"a"}, 64, "m", "be2", "", 100)
+	if !proxycache.GetKVMeta().DeleteMetaFile("be1", "k1") {
 		t.Error("DeleteMetaFile should return true when file exists")
 	}
 	if proxycache.GetKVMeta().ReadMeta("k1", "be1") != nil {
 		t.Error("meta still readable after delete")
 	}
-	if proxycache.GetKVMeta().DeleteMetaFile("k1") {
+	if proxycache.GetKVMeta().ReadMeta("k1", "be2") == nil {
+		t.Error("delete on be1 must not touch the same key on be2 (P2P copies are legitimate)")
+	}
+	if proxycache.GetKVMeta().DeleteMetaFile("be1", "k1") {
 		t.Error("second DeleteMetaFile should return false")
 	}
-	if proxycache.GetKVMeta().DeleteMetaFile("never-existed") {
+	if proxycache.GetKVMeta().DeleteMetaFile("be1", "never-existed") {
 		t.Error("DeleteMetaFile for missing key should return false")
 	}
 }
 
 func TestIncrementRecomputePenalty(t *testing.T) {
 	withTempMetaDir(t)
-	proxycache.GetKVMeta().WriteMeta("k", 5, []string{"a"}, 64, "m", "be1", 0)
+	proxycache.GetKVMeta().WriteMeta("k", 5, []string{"a"}, 64, "m", "be1", "", 0)
 	proxycache.GetKVMeta().IncrementRecomputePenalty("k", "be1")
 	proxycache.GetKVMeta().IncrementRecomputePenalty("k", "be1")
 	meta := proxycache.GetKVMeta().ReadMeta("k", "be1")
@@ -178,7 +182,7 @@ func TestIncrementRecomputePenalty(t *testing.T) {
 
 func TestIncrementRecomputePenaltyConcurrent(t *testing.T) {
 	withTempMetaDir(t)
-	proxycache.GetKVMeta().WriteMeta("k", 5, []string{"a"}, 64, "m", "be1", 0)
+	proxycache.GetKVMeta().WriteMeta("k", 5, []string{"a"}, 64, "m", "be1", "", 0)
 	const n = 20
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -215,7 +219,7 @@ func TestWriteMetaConcurrentWithReads(t *testing.T) {
 			for b := range blocks {
 				blocks[b] = filepath.Join("blk", "x")
 			}
-			proxycache.GetKVMeta().WriteMeta("hot", 1000, blocks, 100, "m", "be1", i)
+			proxycache.GetKVMeta().WriteMeta("hot", 1000, blocks, 100, "m", "be1", "", i)
 		}
 	}()
 	for i := 0; i < 200; i++ {
@@ -236,11 +240,11 @@ func TestWriteMetaConcurrentWithReads(t *testing.T) {
 func TestFindRestoreCandidate(t *testing.T) {
 	withTempMetaDir(t)
 	req := []string{"blk1", "blk2", "blk3", "blk4", "blk5"}
-	proxycache.GetKVMeta().WriteMeta("full", 100, req, 100, "m", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta("partial", 100, []string{"blk1", "blk2", "x"}, 100, "m", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta("low", 100, []string{"blk1", "x", "x"}, 100, "m", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta("wrongwpb", 100, req, 200, "m", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta("toolong", 100, []string{"blk1", "blk2", "blk3", "blk4", "blk5", "blk6"}, 100, "m", "be1", 0)
+	proxycache.GetKVMeta().WriteMeta("full", 100, req, 100, "m", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta("partial", 100, []string{"blk1", "blk2", "x"}, 100, "m", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta("low", 100, []string{"blk1", "x", "x"}, 100, "m", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta("wrongwpb", 100, req, 200, "m", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta("toolong", 100, []string{"blk1", "blk2", "blk3", "blk4", "blk5", "blk6"}, 100, "m", "be1", "", 0)
 
 	k, ratio, ok := proxycache.GetKVMeta().FindRestoreCandidate("full", 100, 0.2, req, "be1")
 	if !ok || k != "full" || ratio != 1.0 {
@@ -271,12 +275,12 @@ func TestFindRestoreCandidate(t *testing.T) {
 func TestFindBestRestoreCandidate(t *testing.T) {
 	dir := withTempMetaDir(t)
 	req := []string{"blk1", "blk2", "blk3"}
-	proxycache.GetKVMeta().WriteMeta("best", 100, req, 100, "m1", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta("penalized", 100, req, 100, "m1", "be1", 0)
+	proxycache.GetKVMeta().WriteMeta("best", 100, req, 100, "m1", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta("penalized", 100, req, 100, "m1", "be1", "", 0)
 	proxycache.GetKVMeta().IncrementRecomputePenalty("penalized", "be1")
-	proxycache.GetKVMeta().WriteMeta("other-model", 100, req, 100, "m2", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta("other-backend", 100, req, 100, "m1", "be2", 0)
-	proxycache.GetKVMeta().WriteMeta("wrong-wpb", 100, req, 200, "m1", "be1", 0)
+	proxycache.GetKVMeta().WriteMeta("other-model", 100, req, 100, "m2", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta("other-backend", 100, req, 100, "m1", "be2", "", 0)
+	proxycache.GetKVMeta().WriteMeta("wrong-wpb", 100, req, 200, "m1", "be1", "", 0)
 
 	k, ratio, ok := proxycache.GetKVMeta().FindBestRestoreCandidate(req, 100, 0.2, "m1", "be1")
 	if !ok || k != "best" || ratio != 1.0 {
@@ -308,8 +312,8 @@ func TestCacheHitSelectsBestRatio(t *testing.T) {
 	tokens := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
 	keyA := proxycache.MetaKey("model-a", tokens)
 	keyB := proxycache.MetaKey("model-b", tokens)
-	proxycache.GetKVMeta().WriteMeta(keyA, 10, []string{"blk1", "blk2", "blk3", "blk4", "blk5"}, 100, "model-a", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta(keyB, 10, []string{"blk1", "x", "x", "x", "x"}, 100, "model-b", "be2", 0)
+	proxycache.GetKVMeta().WriteMeta(keyA, 10, []string{"blk1", "blk2", "blk3", "blk4", "blk5"}, 100, "model-a", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta(keyB, 10, []string{"blk1", "x", "x", "x", "x"}, 100, "model-b", "be2", "", 0)
 	reqBlocks := []string{"blk1", "blk2", "blk3", "blk4", "blk5"}
 	bestRatio := 0.0
 	bestCanonical := ""
@@ -335,8 +339,8 @@ func TestCacheHitAcrossCanonicalModels(t *testing.T) {
 		dm("qwen3.6-8b", 8192, "be2"),
 	)
 	tokens := []int{1, 2, 3}
-	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("qwen3.6-32b", tokens), 3, []string{"blk1", "blk2", "x"}, 100, "qwen3.6-32b", "be1", 0)
-	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("qwen3.6-8b", tokens), 3, []string{"blk1", "blk2", "blk3"}, 100, "qwen3.6-8b", "be2", 0)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("qwen3.6-32b", tokens), 3, []string{"blk1", "blk2", "x"}, 100, "qwen3.6-32b", "be1", "", 0)
+	proxycache.GetKVMeta().WriteMeta(proxycache.MetaKey("qwen3.6-8b", tokens), 3, []string{"blk1", "blk2", "blk3"}, 100, "qwen3.6-8b", "be2", "", 0)
 	reqBlocks := []string{"blk1", "blk2", "blk3"}
 	bestRatio := 0.0
 	bestCanonical := ""
@@ -365,19 +369,76 @@ func TestGetCacheSizeMetaAndFallback(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cacheDir, "k-meta"), []byte("12345678"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	proxycache.GetKVMeta().WriteMeta("k-meta", 10, []string{}, 100, "m", key, 4096)
+	proxycache.GetKVMeta().WriteMeta("k-meta", 10, []string{}, 100, "m", key, "", 4096)
 	if got := proxycache.GetKVMeta().GetCacheSize(key, "k-meta"); got != 4096 {
 		t.Errorf("GetCacheSize(meta) = %d, want 4096", got)
 	}
 	if err := os.WriteFile(filepath.Join(cacheDir, "k-file"), []byte("12345678"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	proxycache.GetKVMeta().WriteMeta("k-file", 10, []string{}, 100, "m", key, 0)
+	proxycache.GetKVMeta().WriteMeta("k-file", 10, []string{}, 100, "m", key, "", 0)
 	if got := proxycache.GetKVMeta().GetCacheSize(key, "k-file"); got != 8 {
 		t.Errorf("GetCacheSize(file fallback) = %d, want 8", got)
 	}
 	if got := proxycache.GetKVMeta().GetCacheSize(key, "k-nope"); got != 0 {
 		t.Errorf("GetCacheSize(missing) = %d, want 0", got)
+	}
+}
+
+func TestWriteMetaConversationID(t *testing.T) {
+	withTempMetaDir(t)
+	proxycache.GetKVMeta().WriteMeta("c1", 10, []string{"a"}, 64, "m", "be1", "conv-42", 100)
+	meta := proxycache.GetKVMeta().ReadMeta("c1", "be1")
+	if meta == nil {
+		t.Fatal("ReadMeta(c1) = nil")
+	}
+	if meta["conversation_id"] != "conv-42" {
+		t.Errorf("conversation_id = %v, want conv-42", meta["conversation_id"])
+	}
+	// An empty conversation_id omits the field entirely.
+	proxycache.GetKVMeta().WriteMeta("c2", 10, []string{"a"}, 64, "m", "be1", "", 100)
+	meta = proxycache.GetKVMeta().ReadMeta("c2", "be1")
+	if meta == nil {
+		t.Fatal("ReadMeta(c2) = nil")
+	}
+	if _, ok := meta["conversation_id"]; ok {
+		t.Error("conversation_id should be omitted when empty")
+	}
+}
+
+func TestFindBestCandidates(t *testing.T) {
+	withTempMetaDir(t)
+	req := []string{"blk1", "blk2", "blk3", "blk4"}
+	// Tagged conv-A: 2 of 4 blocks match (ratio 0.5).
+	proxycache.GetKVMeta().WriteMeta("conv-a", 100, []string{"blk1", "blk2", "x", "x"}, 100, "m", "be1", "conv-A", 0)
+	// Untagged: 3 of 4 blocks match (ratio 0.75) — best overall.
+	proxycache.GetKVMeta().WriteMeta("plain", 100, []string{"blk1", "blk2", "blk3", "x"}, 100, "m", "be1", "", 0)
+	// Tagged conv-A with a worse ratio (0.25) — not the conv winner.
+	proxycache.GetKVMeta().WriteMeta("conv-a-worse", 100, []string{"blk1", "x", "x", "x"}, 100, "m", "be1", "conv-A", 0)
+	// A different conversation (0.25) — must not match conv-A.
+	proxycache.GetKVMeta().WriteMeta("conv-b", 100, []string{"blk1", "x", "x", "x"}, 100, "m", "be1", "conv-B", 0)
+
+	mc := proxycache.GetKVMeta().FindBestCandidates(req, 100, 0.4, "m", "be1", "conv-A")
+	if !mc.BestFound || mc.BestKey != "plain" || mc.BestRatio != 0.75 {
+		t.Errorf("best = (%q, %v, %v), want (plain, 0.75, true)", mc.BestKey, mc.BestRatio, mc.BestFound)
+	}
+	if !mc.ConvFound || mc.ConvKey != "conv-a" || mc.ConvRatio != 0.5 {
+		t.Errorf("conv = (%q, %v, %v), want (conv-a, 0.5, true)", mc.ConvKey, mc.ConvRatio, mc.ConvFound)
+	}
+
+	// No conversation supplied: no conv candidate, best unchanged.
+	mc = proxycache.GetKVMeta().FindBestCandidates(req, 100, 0.4, "m", "be1", "")
+	if mc.ConvFound {
+		t.Error("ConvFound without conversation_id should be false")
+	}
+	if !mc.BestFound || mc.BestKey != "plain" {
+		t.Errorf("best = (%q, %v), want (plain, true)", mc.BestKey, mc.BestFound)
+	}
+
+	// A conversation with no tagged entry: ConvFound false.
+	mc = proxycache.GetKVMeta().FindBestCandidates(req, 100, 0.4, "m", "be1", "conv-none")
+	if mc.ConvFound {
+		t.Error("ConvFound for unknown conversation should be false")
 	}
 }
 
@@ -387,7 +448,7 @@ func TestGetLastUsedTime(t *testing.T) {
 	withTestBackend(t, []map[string]any{{"url": "http://10.0.0.1:8000", "cache_dir": cacheDir}})
 	key := "10.0.0.1-8000"
 
-	proxycache.GetKVMeta().WriteMeta("k1", 10, []string{}, 100, "m", key, 0)
+	proxycache.GetKVMeta().WriteMeta("k1", 10, []string{}, 100, "m", key, "", 0)
 	meta := proxycache.GetKVMeta().ReadMeta("k1", key)
 	ts := proxycache.MetaFloat(meta, "last_written")
 	if got := proxycache.GetKVMeta().GetLastUsedTime("k1", key); got != ts {

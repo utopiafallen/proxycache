@@ -640,6 +640,15 @@ func (c *LlamaClient) DiscoverModels(ctx context.Context) ([]DiscoveredModelInfo
 							nCtx = v
 						}
 					}
+					if nCtx == DefaultNCtx {
+						// OpenAI-style listings (e.g. ninfer) report the window at
+						// the top level instead of in meta.
+						if v, ok := argInt(entry["context_window"]); ok {
+							nCtx = v
+						} else if v, ok := argInt(entry["max_model_len"]); ok {
+							nCtx = v
+						}
+					}
 					if name != "" {
 						return []DiscoveredModelInfo{{Name: name, NCtx: nCtx}}, nil
 					}

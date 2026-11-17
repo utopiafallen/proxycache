@@ -413,8 +413,8 @@ func TestSlotManagerAddTransferredEntry(t *testing.T) {
 	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:8000", "cache_dir": t.TempDir()}})
 	beID := "127.0.0.1-8000"
 	bsm := proxycache.NewBackendSlotManager(beID)
-	proxycache.GetKVMeta().WriteMeta("kA", 10, blk("a", 2), 100, "m", beID, 300)
-	proxycache.GetKVMeta().WriteMeta("kB", 10, blk("b", 2), 100, "m", beID, 200)
+	proxycache.GetKVMeta().WriteMeta("kA", 10, blk("a", 2), 100, "m", beID, "", 300)
+	proxycache.GetKVMeta().WriteMeta("kB", 10, blk("b", 2), 100, "m", beID, "", 200)
 	bsm.AddTransferredEntry("kA", 300)
 	bsm.AddTransferredEntry("kB", 200)
 	if got := bsm.GetRingSize(); got != 2 {
@@ -467,7 +467,7 @@ func TestSaveAfterSuccess(t *testing.T) {
 
 	bsm := proxycache.NewBackendSlotManager(key)
 	blocks := blk("a", 4)
-	ok, size := bsm.SaveAfter("M", 0, "k1", blocks, 100)
+	ok, size := bsm.SaveAfter("M", 0, "k1", blocks, 100, "")
 	if !ok || size != 123 {
 		t.Fatalf("SaveAfter = (%v, %d), want (true, 123)", ok, size)
 	}
@@ -526,7 +526,7 @@ func TestSaveAfterNetworkFailure(t *testing.T) {
 	key := "127.0.0.1-1"
 	bsm := proxycache.NewBackendSlotManager(key)
 	blocks := blk("a", 4)
-	ok, size := bsm.SaveAfter("M", 0, "k1", blocks, 100)
+	ok, size := bsm.SaveAfter("M", 0, "k1", blocks, 100, "")
 	if ok || size != 0 {
 		t.Errorf("SaveAfter on dead backend = (%v, %d), want (false, 0)", ok, size)
 	}
@@ -546,7 +546,7 @@ func TestSaveAfterDisabled(t *testing.T) {
 	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:1", "cache_max_size_gb": 0}})
 	key := "127.0.0.1-1"
 	bsm := proxycache.NewBackendSlotManager(key)
-	ok, size := bsm.SaveAfter("M", 0, "k1", blk("a", 4), 100)
+	ok, size := bsm.SaveAfter("M", 0, "k1", blk("a", 4), 100, "")
 	if ok || size != 0 {
 		t.Errorf("SaveAfter with cache disabled = (%v, %d), want (false, 0)", ok, size)
 	}
@@ -571,7 +571,7 @@ func TestRestore(t *testing.T) {
 	withTestBackend(t, []map[string]any{{"url": srv.URL, "cache_dir": t.TempDir()}})
 
 	bsm := proxycache.NewBackendSlotManager(key)
-	if ok, _ := bsm.SaveAfter("M", 0, "k1", blk("a", 2), 20); !ok || bsm.GetRingSize() != 1 {
+	if ok, _ := bsm.SaveAfter("M", 0, "k1", blk("a", 2), 20, ""); !ok || bsm.GetRingSize() != 1 {
 		t.Fatal("setup: SaveAfter failed or ring empty")
 	}
 	bsm.RingMu.Lock()
@@ -642,7 +642,7 @@ func TestRingNoEvictionUnderLimit(t *testing.T) {
 
 	bsm := proxycache.NewBackendSlotManager(key)
 	for _, k := range []string{"kA", "kB", "kC"} {
-		if ok, size := bsm.SaveAfter("M", 0, k, blk("a", 8), 800); !ok || size != 400 {
+		if ok, size := bsm.SaveAfter("M", 0, k, blk("a", 8), 800, ""); !ok || size != 400 {
 			t.Fatalf("SaveAfter(%s) = (%v, %d)", k, ok, size)
 		}
 	}
@@ -666,7 +666,7 @@ func saveThreeEntries(t *testing.T, srvURL string, key string) *proxycache.Backe
 		{"kB", blk("a", 10)},
 		{"kC", blk("c", 8)},
 	} {
-		if ok, _ := bsm.SaveAfter("M", 0, tc.key, tc.blocks, 800); !ok {
+		if ok, _ := bsm.SaveAfter("M", 0, tc.key, tc.blocks, 800, ""); !ok {
 			t.Fatalf("setup: SaveAfter(%s) failed", tc.key)
 		}
 	}
@@ -774,8 +774,8 @@ func TestInitFromDisk(t *testing.T) {
 	withTestBackend(t, []map[string]any{{"url": "http://127.0.0.1:1", "cache_dir": t.TempDir()}})
 	key := "127.0.0.1-1"
 
-	proxycache.GetKVMeta().WriteMeta("k1", 50, blk("z", 4), 100, "M", key, 777)
-	proxycache.GetKVMeta().WriteMeta("k2", 50, blk("y", 4), 100, "M", key, 0)
+	proxycache.GetKVMeta().WriteMeta("k1", 50, blk("z", 4), 100, "M", key, "", 777)
+	proxycache.GetKVMeta().WriteMeta("k2", 50, blk("y", 4), 100, "M", key, "", 0)
 
 	sm := proxycache.NewSlotManager()
 	sm.InitFromDisk()
@@ -824,6 +824,68 @@ func TestSlotStatus(t *testing.T) {
 	}
 }
 
+func TestRemoveEntryAndConversationSweep(t *testing.T) {
+	withTempMetaDir(t)
+	srv1 := newSaveServer(t, 100, false)
+	defer srv1.Close()
+	srv2 := newSaveServer(t, 100, false)
+	defer srv2.Close()
+	key1 := backendKeyFromURL(srv1.URL)
+	key2 := backendKeyFromURL(srv2.URL)
+	withTestBackend(t, []map[string]any{
+		{"url": srv1.URL, "cache_dir": t.TempDir()},
+		{"url": srv2.URL, "cache_dir": t.TempDir()},
+	})
+
+	sm := proxycache.GetSlotManager()
+	// Turn 1: conversation conv-1's state is saved on backend 1.
+	bsm1 := sm.Get(key1)
+	if ok, _ := bsm1.SaveAfter("M", 0, "k-old", blk("a", 4), 100, "conv-1"); !ok {
+		t.Fatal("setup: first SaveAfter failed")
+	}
+	// Turn 2 (same conversation) lands on backend 2: the pre-save sweep must
+	// delete the old conversation entry from backend 1 before the new save
+	// (and its budget claim) lands.
+	bsm2 := sm.Get(key2)
+	if ok, _ := bsm2.SaveAfter("M", 0, "k-new", blk("a", 8), 200, "conv-1"); !ok {
+		t.Fatal("setup: second SaveAfter failed")
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta("k-old", key1); meta != nil {
+		t.Error("old conversation entry on backend 1 not superseded")
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta("k-new", key2); meta == nil {
+		t.Fatal("new save meta missing on backend 2")
+	} else if meta["conversation_id"] != "conv-1" {
+		t.Errorf("new save conversation_id = %v, want conv-1", meta["conversation_id"])
+	}
+	if got := bsm1.GetRingSize(); got != 0 {
+		t.Errorf("backend 1 ring size = %d, want 0 (superseded entry removed)", got)
+	}
+	if got := bsm1.GetTotalBytes(); got != 0 {
+		t.Errorf("backend 1 total bytes = %d, want 0 (ring bookkeeping consistent)", got)
+	}
+	if got := bsm2.GetRingSize(); got != 1 {
+		t.Errorf("backend 2 ring size = %d, want 1 (only the new save)", got)
+	}
+
+	// A save without a conversation_id never sweeps.
+	if ok, _ := bsm2.SaveAfter("M", 0, "k-plain", blk("b", 4), 100, ""); !ok {
+		t.Fatal("SaveAfter (no conversation) failed")
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta("k-new", key2); meta == nil {
+		t.Error("conversation entry deleted by a conversation-less save")
+	}
+
+	// Direct RemoveEntry of a key not in the ring still removes the meta.
+	proxycache.GetKVMeta().WriteMeta("k-stray", 10, blk("c", 2), 100, "M", key2, "", 50)
+	if bsm2.RemoveEntry("k-stray") {
+		t.Error("RemoveEntry for a non-ring key = true, want false")
+	}
+	if meta := proxycache.GetKVMeta().ReadMeta("k-stray", key2); meta != nil {
+		t.Error("stray meta not removed by RemoveEntry")
+	}
+}
+
 func TestRingOldestNewestOrder(t *testing.T) {
 	withTempMetaDir(t)
 	srv := newSaveServer(t, 10, false)
@@ -835,11 +897,11 @@ func TestRingOldestNewestOrder(t *testing.T) {
 	if _, _, ok := bsm.RingOldestNewest(); ok {
 		t.Error("RingOldestNewest on empty ring = ok, want false")
 	}
-	if ok, _ := bsm.SaveAfter("M", 0, "k1", blk("a", 1), 10); !ok {
+	if ok, _ := bsm.SaveAfter("M", 0, "k1", blk("a", 1), 10, ""); !ok {
 		t.Fatal("setup: SaveAfter(k1) failed")
 	}
 	time.Sleep(20 * time.Millisecond)
-	if ok, _ := bsm.SaveAfter("M", 0, "k2", blk("b", 1), 10); !ok {
+	if ok, _ := bsm.SaveAfter("M", 0, "k2", blk("b", 1), 10, ""); !ok {
 		t.Fatal("setup: SaveAfter(k2) failed")
 	}
 	oldest, newest, ok := bsm.RingOldestNewestKeys()

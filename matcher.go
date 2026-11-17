@@ -18,10 +18,14 @@
 //	    first request for a model whose pool does not exist yet gets a worker
 //	    that performs lazy discovery (refresh + ServesModel gate).
 //
-// Routing rule: a request with a cache hit goes to the hit backend while its
-// queue depth stays below CacheHitQueueLimit; otherwise it is distributed
-// round-robin across the other matching backends (starting after the hit
-// backend), which triggers an async P2P cache transfer to the chosen backend.
+// Routing rule: a request whose conversation_id matches a backend's cache or
+// warm slot goes to that backend (shortest queue, ties broken by longest LCP)
+// while its queue depth stays below CacheHitQueueLimit — a conversation match
+// always beats a plain LCP match. Otherwise a request with a cache hit goes to
+// the hit backend while its queue depth stays below CacheHitQueueLimit;
+// otherwise it is distributed round-robin across the other matching backends
+// (starting after the hit backend), which triggers an async P2P cache transfer
+// to the chosen backend.
 
 package proxycache
 
@@ -38,19 +42,20 @@ import (
 
 // ProcRequest carries one chat request through the pipeline.
 type ProcRequest struct {
-	w             http.ResponseWriter
-	r             *http.Request
-	ctx           context.Context // derived from r.Context(); cancelled on client disconnect or abort
-	cancel        context.CancelFunc
-	requestJSON   map[string]any
-	messages      []map[string]any
-	stream        bool
-	clientModel   string
-	requestID     string
-	promptPreview string
-	reqClass      RequestClass
-	t0            float64
-	ip            string
+	w              http.ResponseWriter
+	r              *http.Request
+	ctx            context.Context // derived from r.Context(); cancelled on client disconnect or abort
+	cancel         context.CancelFunc
+	requestJSON    map[string]any
+	messages       []map[string]any
+	stream         bool
+	clientModel    string
+	conversationID string
+	requestID      string
+	promptPreview  string
+	reqClass       RequestClass
+	t0             float64
+	ip             string
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -99,6 +104,8 @@ type RouteDecision struct {
 	scanDiagnostics    []map[string]any
 	backendCacheRatios map[string]float64
 	p2pTriggered       bool
+	convEntries        map[string]*ConvCandidate // per-backend best conversation_id entry (nil when the request carries none)
+	selectionReason    string                    // SelectBackend's reason ("conversation_hit", "cache_hit", ...)
 }
 
 // HitInfo identifies the best cache hit found during a scan (nil = no hit).
@@ -312,7 +319,7 @@ func (d *RequestDispatcher) run() {
 		case <-d.activity:
 		case <-ticker.C:
 		}
-		drain:
+	drain:
 		for {
 			select {
 			case req := <-d.incoming:
@@ -433,7 +440,10 @@ func (d *RequestDispatcher) migrateStale() {
 	moved := 0
 	type xfer struct{ src, dst, key string }
 	var transfers []xfer
-	type rescan struct{ req *ProcRequest; target string }
+	type rescan struct {
+		req    *ProcRequest
+		target string
+	}
 	var rescans []rescan
 	for srcID, sw := range d.workers {
 		for i := 0; i < len(sw.queue); i++ {
@@ -602,7 +612,11 @@ func (d *RequestDispatcher) failEarly(req *ProcRequest, status int, msg string) 
 
 func routingLogExtra(decision *RouteDecision) string {
 	if decision.p2pTriggered {
-		return fmt.Sprintf("p2p key=%s", key16(decision.restoreKey))
+		key := decision.restoreKey
+		if key == "" {
+			key = decision.diskRestoreKey
+		}
+		return fmt.Sprintf("p2p key=%s", key16(key))
 	}
 	return "direct"
 }
@@ -632,30 +646,51 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 	scanCtx, cancel := context.WithTimeout(req.ctx, time.Duration(MatchScanTimeout*float64(time.Second)))
 	defer cancel()
 
-	// Size the prompt on the first live backend of the first option.
+	// Size the prompt on the first live cache-enabled backend of the first
+	// option (exact tokenization). When no such backend is live, size
+	// approximately from the raw messages — cache-less backends (e.g. ninfer)
+	// expose no /apply-template or /tokenize endpoint to call.
 	firstBeID := ""
 	for _, beID := range firstOpt.Backends {
-		if bm.GetBackendState(beID) {
+		if bm.GetBackendState(beID) && bm.CacheEnabled(beID) {
 			firstBeID = beID
 			break
+		}
+	}
+	approximateSizing := false
+	if firstBeID == "" {
+		for _, beID := range firstOpt.Backends {
+			if bm.GetBackendState(beID) {
+				firstBeID = beID
+				approximateSizing = true
+				break
+			}
 		}
 	}
 	if firstBeID == "" {
 		d.failEarly(req, http.StatusServiceUnavailable, "backend unreachable")
 		return nil, false
 	}
-	firstClient := bm.GetClient(firstBeID)
-	templated, err := firstClient.ApplyChatTemplate(scanCtx, req.messages)
-	if err != nil {
-		d.handleTokenizeError(req, err)
-		return nil, false
+
+	var promptTokens int
+	var firstTokenIDs []int
+	if approximateSizing {
+		promptTokens = len(MessageBlocks(req.messages, WordsPerBlock)) * WordsPerBlock
+		logInfo("matcher", "Approximate prompt sizing: ~%d tokens for model '%s' (no live cache-enabled backend)", promptTokens, req.clientModel)
+	} else {
+		firstClient := bm.GetClient(firstBeID)
+		templated, err := firstClient.ApplyChatTemplate(scanCtx, req.messages)
+		if err != nil {
+			d.handleTokenizeError(req, err)
+			return nil, false
+		}
+		firstTokenIDs, err = firstClient.Tokenize(scanCtx, templated, true)
+		if err != nil {
+			d.handleTokenizeError(req, err)
+			return nil, false
+		}
+		promptTokens = len(firstTokenIDs)
 	}
-	firstTokenIDs, err := firstClient.Tokenize(scanCtx, templated, true)
-	if err != nil {
-		d.handleTokenizeError(req, err)
-		return nil, false
-	}
-	promptTokens := len(firstTokenIDs)
 
 	minCtx := options[0].NCtx
 	for _, opt := range options[1:] {
@@ -683,6 +718,16 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 	bestDiskBackend := ""
 	bestDiskRatio := 0.0
 
+	// Conversation tracking: the request's top-level conversation_id is
+	// matched against conversation-tagged disk entries and warm slots.
+	var convEntries map[string]*ConvCandidate
+	var convDiskKey, convDiskBackend string
+	var convDiskRatio float64
+	if req.conversationID != "" {
+		convEntries = map[string]*ConvCandidate{}
+		decision.convEntries = convEntries
+	}
+
 	for _, opt := range options {
 		for _, beID := range opt.Backends {
 			optClient := bm.GetClient(beID)
@@ -696,9 +741,23 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 				continue
 			}
 			var optTokenIDs []int
-			optTemplated, tErr := optClient.ApplyChatTemplate(scanCtx, req.messages)
-			if tErr == nil {
-				optTokenIDs, tErr = optClient.Tokenize(scanCtx, optTemplated, true)
+			var optBlocks []string
+			var optTemplated string
+			var tErr error
+			if bm.CacheEnabled(beID) {
+				optTemplated, tErr = optClient.ApplyChatTemplate(scanCtx, req.messages)
+				if tErr == nil {
+					optTokenIDs, tErr = optClient.Tokenize(scanCtx, optTemplated, true)
+				}
+				if tErr == nil {
+					optBlocks = BlockHashesFromTokens(optTokenIDs, WordsPerBlock)
+				}
+			} else {
+				// Cache-less backend (e.g. ninfer): no tokenize endpoint.
+				// Approximate the KV state from the raw messages so pending-hit
+				// routing still works (affinity only — not a real token stream).
+				optBlocks = MessageBlocks(req.messages, WordsPerBlock)
+				diagEntry["approximate"] = true
 			}
 			if tErr != nil {
 				if errors.Is(tErr, ErrConn) {
@@ -713,75 +772,115 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 				req.finish()
 				return nil, false
 			}
-			optBlocks := BlockHashesFromTokens(optTokenIDs, WordsPerBlock)
 			decision.backendTokenIDs[beID] = optTokenIDs
 			decision.backendBlocks[beID] = optBlocks
 			diagEntry["n_blocks"] = len(optBlocks)
-			diagEntry["n_tokens"] = len(optTokenIDs)
+			if len(optTokenIDs) > 0 {
+				diagEntry["n_tokens"] = len(optTokenIDs)
+			} else {
+				diagEntry["n_tokens"] = nil
+			}
 
 			if bm.CacheEnabled(beID) {
-				if candKey, candRatio, found := kvMeta.FindBestRestoreCandidate(optBlocks, WordsPerBlock, LCPTh, opt.Name, beID); found {
-					diagEntry["cache_file_key"] = key16(candKey)
-					diagEntry["cache_file_ratio"] = round4(candRatio)
-					if bestDiskKey == "" || candRatio > bestDiskRatio {
-						bestDiskKey = candKey
+				mc := kvMeta.FindBestCandidates(optBlocks, WordsPerBlock, LCPTh, opt.Name, beID, req.conversationID)
+				if mc.BestFound {
+					diagEntry["cache_file_key"] = key16(mc.BestKey)
+					diagEntry["cache_file_ratio"] = round4(mc.BestRatio)
+					if bestDiskKey == "" || mc.BestRatio > bestDiskRatio {
+						bestDiskKey = mc.BestKey
 						bestDiskBackend = beID
-						bestDiskRatio = candRatio
+						bestDiskRatio = mc.BestRatio
 					}
-					if hit == nil || candRatio > decision.bestRatio {
-						decision.bestRatio = candRatio
-						decision.restoreKey = candKey
+					if hit == nil || mc.BestRatio > decision.bestRatio {
+						decision.bestRatio = mc.BestRatio
+						decision.restoreKey = mc.BestKey
 						decision.restoreBackend = beID
 						decision.canonicalName = opt.Name
 						dt := CacheHitDiskRestore
 						decision.hitType = &dt
 						hit = &HitInfo{Backend: beID, Canonical: opt.Name}
 						logInfo("matcher", "Cache hit: key '%s' (model '%s', backend '%s', ratio %.3f)",
-							key16(candKey), opt.Name, beID, candRatio)
+							key16(mc.BestKey), opt.Name, beID, mc.BestRatio)
 					}
 				} else {
 					diagEntry["cache_file_ratio"] = nil
 				}
-
-				beSm := slotManager.Get(beID)
-				pendingRatios := []map[string]any{}
-				for slotID, kvBlocks := range beSm.GetKVStates() {
-					if len(optBlocks) < len(kvBlocks)-1 {
-						pendingRatios = append(pendingRatios, map[string]any{
-							"slot": slotID, "lcp_blocks": 0, "slot_blocks": len(kvBlocks), "ratio": 0.0,
-						})
-						continue
-					}
-					lcp := 0
-					var ratio float64
-					if len(optBlocks) > 0 {
-						lcp = LCPBlocks(optBlocks, kvBlocks)
-						ratio = float64(lcp) / float64(len(optBlocks))
-					}
-					pendingRatios = append(pendingRatios, map[string]any{
-						"slot": slotID, "lcp_blocks": lcp, "slot_blocks": len(kvBlocks), "ratio": round4(ratio),
-					})
-					if ratio >= LCPTh && (hit == nil || ratio >= decision.bestRatio) {
-						decision.bestRatio = ratio
-						decision.restoreKey = ""
-						decision.restoreBackend = beID
-						decision.canonicalName = opt.Name
-						dt := CacheHitSkip
-						decision.hitType = &dt
-						hit = &HitInfo{Backend: beID, Canonical: opt.Name}
-						logInfo("matcher", "Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
-							opt.Name, beID, slotID, ratio)
+				if convEntries != nil {
+					if mc.ConvFound {
+						diagEntry["conv_key"] = key16(mc.ConvKey)
+						diagEntry["conv_ratio"] = round4(mc.ConvRatio)
+						if ce := convEntries[beID]; ce == nil || mc.ConvRatio > ce.Ratio {
+							convEntries[beID] = &ConvCandidate{Ratio: mc.ConvRatio, Key: mc.ConvKey, Model: opt.Name}
+						}
+						if mc.ConvRatio > convDiskRatio {
+							convDiskRatio = mc.ConvRatio
+							convDiskKey = mc.ConvKey
+							convDiskBackend = beID
+						}
+					} else {
+						diagEntry["conv_key"] = nil
+						diagEntry["conv_ratio"] = nil
 					}
 				}
-				diagEntry["pending_slots"] = pendingRatios
 			} else {
 				diagEntry["cache_file_ratio"] = nil
-				diagEntry["pending_slots"] = []map[string]any{}
+				if convEntries != nil {
+					diagEntry["conv_key"] = nil
+					diagEntry["conv_ratio"] = nil
+				}
 			}
+
+			// Pending-slot scan runs for cache-less backends too, against their
+			// approximate message blocks.
+			beSm := slotManager.Get(beID)
+			slotConvs := beSm.GetSlotConversations()
+			pendingRatios := []map[string]any{}
+			for slotID, kvBlocks := range beSm.GetKVStates() {
+				if len(optBlocks) < len(kvBlocks)-1 {
+					pendingRatios = append(pendingRatios, map[string]any{
+						"slot": slotID, "lcp_blocks": 0, "slot_blocks": len(kvBlocks), "ratio": 0.0,
+						"conversation": slotConvs[slotID],
+					})
+					continue
+				}
+				lcp := 0
+				var ratio float64
+				if len(optBlocks) > 0 {
+					lcp = LCPBlocks(optBlocks, kvBlocks)
+					ratio = float64(lcp) / float64(len(optBlocks))
+				}
+				pendingRatios = append(pendingRatios, map[string]any{
+					"slot": slotID, "lcp_blocks": lcp, "slot_blocks": len(kvBlocks), "ratio": round4(ratio),
+					"conversation": slotConvs[slotID],
+				})
+				if ratio >= LCPTh && (hit == nil || ratio >= decision.bestRatio) {
+					decision.bestRatio = ratio
+					decision.restoreKey = ""
+					decision.restoreBackend = beID
+					decision.canonicalName = opt.Name
+					dt := CacheHitSkip
+					decision.hitType = &dt
+					hit = &HitInfo{Backend: beID, Canonical: opt.Name}
+					logInfo("matcher", "Pending slot cache hit: model '%s', backend '%s', slot %d, ratio %.3f",
+						opt.Name, beID, slotID, ratio)
+				}
+				// Conversation-tagged pending hit: a warm slot whose last
+				// conversation is this request's conversation — the strongest
+				// conversation match (nothing to restore).
+				if convEntries != nil && ratio >= LCPTh && slotConvs[slotID] == req.conversationID {
+					if ce := convEntries[beID]; ce == nil || ratio > ce.Ratio {
+						convEntries[beID] = &ConvCandidate{Ratio: ratio, Model: opt.Name}
+					}
+				}
+			}
+			diagEntry["pending_slots"] = pendingRatios
 			scanDiagnostics = append(scanDiagnostics, diagEntry)
 
 			beBest := 0.0
 			if v, okV := diagEntry["cache_file_ratio"].(float64); okV {
+				beBest = v
+			}
+			if v, okV := diagEntry["conv_ratio"].(float64); okV && v > beBest {
 				beBest = v
 			}
 			if psList, okV := diagEntry["pending_slots"].([]map[string]any); okV {
@@ -799,6 +898,15 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 	decision.scanDiagnostics = scanDiagnostics
 	decision.diskRestoreKey = bestDiskKey
 	decision.diskRestoreBackend = bestDiskBackend
+	// Conversation override: when the request carries a conversation_id and a
+	// conversation entry exists on some live backend, the conversation's best
+	// disk entry is the restore/transfer key — the conversation's state moves
+	// with the request even when another conversation's entry has a higher LCP
+	// ratio.
+	if convEntries != nil && convDiskKey != "" {
+		decision.diskRestoreKey = convDiskKey
+		decision.diskRestoreBackend = convDiskBackend
+	}
 
 	// Candidates: flattened (backend, model) pairs, deduped, live backends only.
 	cands := []CandidateBackend{}
@@ -831,7 +939,7 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 	startIdx = d.rrIndex[req.clientModel]
 	d.mu.Unlock()
 
-	idx, reason := SelectBackend(cands, hit, pendingOf, startIdx)
+	idx, reason := SelectBackend(cands, hit, decision.convEntries, pendingOf, startIdx)
 	if idx < 0 {
 		logInfo("matcher", "No backend queue has room for request %s (%s)", req.requestID, reason)
 		return decision, true
@@ -841,6 +949,29 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 	d.rrIndex[req.clientModel] = (idx + 1) % len(cands)
 	d.mu.Unlock()
 	decision.selected = cands[idx]
+	decision.selectionReason = reason
+	if reason == "conversation_hit" {
+		if ce := decision.convEntries[cands[idx].BackendID]; ce != nil {
+			decision.bestRatio = ce.Ratio
+			decision.canonicalName = ce.Model
+			decision.restoreBackend = cands[idx].BackendID
+			dt := CacheHitDiskRestore
+			if ce.Key == "" {
+				dt = CacheHitSkip // warm slot from the same conversation
+			}
+			decision.restoreKey = ce.Key
+			decision.hitType = &dt
+			if decision.backendCacheRatios[cands[idx].BackendID] < ce.Ratio {
+				decision.backendCacheRatios[cands[idx].BackendID] = ce.Ratio
+			}
+			convKey := "none"
+			if ce.Key != "" {
+				convKey = key16(ce.Key)
+			}
+			logInfo("matcher", "Conversation hit: conversation '%s' on backend '%s' (request %s): key=%s, ratio %.3f, queue depth %d",
+				req.conversationID, cands[idx].BackendID, req.requestID, convKey, ce.Ratio, pendingOf(cands[idx].BackendID))
+		}
+	}
 
 	// Cache hit that cannot be served where the cache lives: migrate the
 	// best disk cache to the selected backend so it is ready when the request
@@ -880,24 +1011,79 @@ func (d *RequestDispatcher) handleTokenizeError(req *ProcRequest, err error) {
 
 // --- Backend selection (pure decision, exported for tests) ---
 
+// ConvCandidate is one backend's strongest match for the request's
+// conversation_id: the best of that backend's conversation-tagged disk entry
+// and its warm pending slots. Key is the disk entry's cache key; it is ""
+// when the strongest source is a pending slot (nothing to restore from disk
+// on that backend).
+type ConvCandidate struct {
+	Ratio float64
+	Key   string
+	Model string // canonical model name of the best source
+}
+
 // SelectBackend picks the index of a candidate backend for a request given
 // current per-backend queue depths. It returns (-1, reason) when no candidate
 // has room.
 //
-//  1. If there is a cache hit and the hit backend's queue depth is below
+//  1. Conversation pass: when the request carries a conversation_id and some
+//     candidate backends hold a match for it (conv), a conversation match
+//     always beats plain LCP matches regardless of ratio. Among conversation
+//     backends whose queue depth is below CacheHitQueueLimit the shortest
+//     queue wins, ties broken by longest LCP.
+//  2. If there is a cache hit and the hit backend's queue depth is below
 //     CacheHitQueueLimit, the hit backend wins (preferring the candidate pair
 //     whose model matches the hit).
-//  2. Otherwise pick the candidate on the least-loaded backend (lowest queue
+//  3. Otherwise pick the candidate on the least-loaded backend (lowest queue
 //     depth) so idle backends absorb new work first, breaking exact depth ties
 //     in round-robin order from the first non-hit candidate at/after startIdx;
 //     the saturated hit backend is only considered in a second pass when every
 //     other candidate's queue is at the cap.
-func SelectBackend(cands []CandidateBackend, hit *HitInfo, pendingOf func(backendID string) int, startIdx int) (int, string) {
+func SelectBackend(cands []CandidateBackend, hit *HitInfo, conv map[string]*ConvCandidate, pendingOf func(backendID string) int, startIdx int) (int, string) {
 	n := len(cands)
 	if n == 0 {
 		return -1, "no_candidates"
 	}
 	hasHit := hit != nil && hit.Backend != ""
+
+	if len(conv) > 0 {
+		start := startIdx % n
+		winBe := ""
+		winDepth := 0
+		winRatio := 0.0
+		for k := 0; k < n; k++ {
+			i := (start + k) % n
+			cc, ok := conv[cands[i].BackendID]
+			if !ok {
+				continue
+			}
+			depth := pendingOf(cands[i].BackendID)
+			if depth >= CacheHitQueueLimit {
+				continue
+			}
+			if winBe == "" || depth < winDepth || (depth == winDepth && cc.Ratio > winRatio) {
+				winBe = cands[i].BackendID
+				winDepth = depth
+				winRatio = cc.Ratio
+			}
+		}
+		if winBe != "" {
+			cc := conv[winBe]
+			firstOnWin := -1
+			for i, c := range cands {
+				if c.BackendID != winBe {
+					continue
+				}
+				if c.ModelName == cc.Model {
+					return i, "conversation_hit"
+				}
+				if firstOnWin == -1 {
+					firstOnWin = i
+				}
+			}
+			return firstOnWin, "conversation_hit"
+		}
+	}
 
 	if hasHit && pendingOf(hit.Backend) < CacheHitQueueLimit {
 		firstOnHitBackend := -1
