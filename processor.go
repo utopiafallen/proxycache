@@ -338,7 +338,7 @@ func processWorkerRequest(d *RequestDispatcher, beID string, req *ProcRequest, s
 
 	var routingReason string
 	switch {
-	case dec.selectionReason == "conversation_hit":
+	case dec.selectionReason == "conversation_hit" || dec.selectionReason == "conversation_hit_idle_migration":
 		routingReason = "conversation_hit"
 	case dec.hitType != nil && *dec.hitType == CacheHitSkip && beID == dec.restoreBackend:
 		routingReason = "pending_slot_hit"

@@ -442,17 +442,19 @@ func setupBusyRestoreBackend(t *testing.T, m1, m2 *mockLlama, model string) (str
 	return be1, be2
 }
 
-// TestCacheHitQueueLimitFallbackP2P verifies the core new routing rule: a
-// cache-hit request goes to the hit backend while its queue depth stays under
-// CACHE_HIT_QUEUE_LIMIT (2); the next request falls back to another backend,
-// which triggers an async P2P transfer of the cache file.
+// TestCacheHitQueueLimitFallbackP2P verifies the routing rule with an idle
+// backend around: a cache-hit request whose hit backend is slot-busy is sent
+// to the idle backend immediately (with an async P2P transfer of the cache
+// file) instead of queueing on the hit backend. Later requests for the same
+// content then follow the migrated backend's now-warm slot (pending hit) and
+// queue there while its queue depth stays under CACHE_HIT_QUEUE_LIMIT (2).
 func TestCacheHitQueueLimitFallbackP2P(t *testing.T) {
 	withTempMetaDir(t)
 	tokens := seq(800)
 	m1 := newMockLlama(t, "hitq-model", 32768, tokens, 1)
 	m2 := newMockLlama(t, "hitq-model", 32768, tokens, 1)
-	m1.chatDelay = 300 * time.Millisecond
-	m2.chatDelay = 300 * time.Millisecond
+	m1.chatDelay = time.Second
+	m2.chatDelay = time.Second
 	dir1 := t.TempDir()
 	dir2 := t.TempDir()
 	be1 := backendKeyFromURL(m1.srv.URL)
@@ -483,28 +485,29 @@ func TestCacheHitQueueLimitFallbackP2P(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return m1.chatCount() == 1 })
 
 	wg.Add(1)
-	go send() // r2: queued on the hit backend (depth 1)
-	waitFor(t, 5*time.Second, func() bool { return proxycache.GetDispatcher().QueueDepth(be1) == 1 })
+	go send() // r2: hit backend slot-busy, be2 idle -> immediate migration to be2 + P2P
+	waitFor(t, 5*time.Second, func() bool { return m2.chatCount() == 1 })
 
 	wg.Add(1)
-	go send() // r3: queued on the hit backend (depth 2 = limit)
-	waitFor(t, 5*time.Second, func() bool { return proxycache.GetDispatcher().QueueDepth(be1) == 2 })
+	go send() // r3: be2's slot is now warm for this content (pending hit) -> be2, queued behind r2
+	waitFor(t, 5*time.Second, func() bool { return proxycache.GetDispatcher().QueueDepth(be2) == 1 })
 
 	wg.Add(1)
-	go send() // r4: hit backend at limit -> fallback to be2 + P2P transfer
+	go send() // r4: pending hit -> be2, queued (depth 2 = limit)
+	waitFor(t, 5*time.Second, func() bool { return proxycache.GetDispatcher().QueueDepth(be2) == 2 })
 	wg.Wait()
 	for i := 0; i < 4; i++ {
 		if c := <-codes; c != http.StatusOK {
 			t.Errorf("request %d status = %d, want 200", i+1, c)
 		}
 	}
-	if m1.chatCount() != 3 {
-		t.Errorf("hit backend chat count = %d, want 3", m1.chatCount())
+	if m1.chatCount() != 1 {
+		t.Errorf("hit backend chat count = %d, want 1 (only r1 ran before the migration)", m1.chatCount())
 	}
-	if m2.chatCount() != 1 {
-		t.Errorf("fallback backend chat count = %d, want 1", m2.chatCount())
+	if m2.chatCount() != 3 {
+		t.Errorf("immediately migrated backend chat count = %d, want 3 (r2 migrated, r3/r4 following the warm slot)", m2.chatCount())
 	}
-	// P2P transfer must have copied the cache file to the fallback backend and
+	// P2P transfer must have copied the cache file to the migrated backend and
 	// registered its meta + ring entry there.
 	waitFor(t, 5*time.Second, func() bool {
 		_, err := os.Stat(filepath.Join(dir2, hitKey))
@@ -514,7 +517,7 @@ func TestCacheHitQueueLimitFallbackP2P(t *testing.T) {
 		t.Errorf("no meta written for transferred key on backend %s", be2)
 	}
 	if got := proxycache.GetSlotManager().Get(be2).GetRingSize(); got != 1 {
-		t.Errorf("fallback backend ring size = %d, want 1", got)
+		t.Errorf("migrated backend ring size = %d, want 1", got)
 	}
 	if got := proxycache.GetDispatcher().QueueDepth(be1); got != 0 {
 		t.Errorf("hit backend queue depth after drain = %d, want 0", got)
@@ -538,11 +541,14 @@ func withMigrationAfter(t *testing.T, seconds float64) {
 	t.Cleanup(func() { proxycache.QueueMigrationAfter = old })
 }
 
-// TestQueueMigrationToIdleBackend verifies the queue-migration monitor: a
-// request with a disk cache hit gets queued on its (busy) hit backend; once it
-// has waited past QUEUE_MIGRATION_AFTER and another backend serving the model
-// is fully idle, the dispatcher moves it there and transfers the disk cache —
-// so it runs on the idle backend instead of waiting out the backlog.
+// TestQueueMigrationToIdleBackend verifies the stale-queue migration monitor:
+// a request with a disk cache hit gets queued on its (busy) hit backend while
+// no idle backend exists; once another backend serving the model comes up
+// fully idle and the request has waited past QUEUE_MIGRATION_AFTER, the
+// dispatcher moves it there and transfers the disk cache — so it runs on the
+// idle backend instead of waiting out the backlog. (When the idle backend
+// already exists at arrival, the request is migrated immediately instead — see
+// TestImmediateMigrationToIdleBackend.)
 func TestQueueMigrationToIdleBackend(t *testing.T) {
 	withTempMetaDir(t)
 	withMigrationAfter(t, 1.0)
@@ -561,7 +567,8 @@ func TestQueueMigrationToIdleBackend(t *testing.T) {
 	markBackendsUp(bm)
 	injectModels(bm, dm("mig-model", 32768, beA, beB))
 
-	// Keep B down so the warmup and the busy request route deterministically to A.
+	// Keep B down for the warmup, the busy request, and R's arrival so they
+	// route deterministically to A and R's arrival finds no idle backend.
 	bm.Mu.Lock()
 	bm.BackendState[beB] = false
 	bm.Mu.Unlock()
@@ -585,15 +592,20 @@ func TestQueueMigrationToIdleBackend(t *testing.T) {
 	}()
 	waitFor(t, 5*time.Second, func() bool { return mA.chatCount() >= 1 })
 
-	// R: disk hit on A while A is busy -> queued on A, then migrated to idle B.
+	// R: disk hit on A while A is busy and B is still down -> queued on A
+	// (no immediate migration: no idle backend at arrival).
 	mA.tokens = tokensP
-	bm.Mu.Lock()
-	bm.BackendState[beB] = true
-	bm.Mu.Unlock()
 	doneR := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		doneR <- postChat(t, `{"model": "mig-model", "messages": [{"role": "user", "content": "hit"}]}`)
 	}()
+	waitFor(t, 5*time.Second, func() bool { return proxycache.GetDispatcher().QueueDepth(beA) >= 1 })
+
+	// B comes up fully idle while R waits; the monitor migrates R there once
+	// its wait exceeds QUEUE_MIGRATION_AFTER, transferring the disk cache.
+	bm.Mu.Lock()
+	bm.BackendState[beB] = true
+	bm.Mu.Unlock()
 
 	wR := <-doneR
 	wA1 := <-doneA1
@@ -754,6 +766,236 @@ func TestQueueMigrationRescansTargetDisk(t *testing.T) {
 	mA.mu.Unlock()
 	if restores < 1 {
 		t.Error("migrated request did not restore the target's local disk cache")
+	}
+}
+
+// TestImmediateMigrationToIdleBackend verifies the selection-time migration:
+// a cache-hit request arrives while its hit backend is slot-busy and another
+// backend is fully idle — the request is routed to the idle backend at arrival
+// (no QUEUE_MIGRATION_AFTER wait) and its disk cache is P2P-transferred over,
+// so it restores there instead of waiting out the backlog.
+func TestImmediateMigrationToIdleBackend(t *testing.T) {
+	withTempMetaDir(t)
+	withMigrationAfter(t, 300) // any migration within this test must be immediate
+	tokensP := seq(800)        // content with a disk cache on A
+	tokensQ := offsetSeq(400, 100000)
+	mA := newMockLlama(t, "immd-model", 32768, tokensP, 1)
+	mB := newMockLlama(t, "immd-model", 32768, tokensP, 1)
+	beA := backendKeyFromURL(mA.srv.URL)
+	beB := backendKeyFromURL(mB.srv.URL)
+	dirA, dirB := t.TempDir(), t.TempDir()
+	withTestBackend(t, []map[string]any{
+		{"url": mA.srv.URL, "cache_dir": dirA},
+		{"url": mB.srv.URL, "cache_dir": dirB},
+	})
+	bm := proxycache.GetBackendManager()
+	markBackendsUp(bm)
+	injectModels(bm, dm("immd-model", 32768, beA, beB))
+
+	// Keep B down for the warmup and the busy request so they route to A (B
+	// must be idle, not busy, when R arrives).
+	bm.Mu.Lock()
+	bm.BackendState[beB] = false
+	bm.Mu.Unlock()
+
+	// Warmup: establishes a disk cache for tokensP on A (meta + dummy file —
+	// the mock never writes physical cache files itself).
+	if w := postChat(t, `{"model": "immd-model", "messages": [{"role": "user", "content": "warm"}]}`); w.Code != http.StatusOK {
+		t.Fatalf("warmup status = %d, want 200", w.Code)
+	}
+	keyP := proxycache.MetaKey("immd-model", tokensP)
+	if err := os.WriteFile(filepath.Join(dirA, keyP), []byte("warm-cache-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A1: holds A's only slot for 2s (no cache match).
+	mA.tokens = tokensQ
+	mA.chatDelay = 2 * time.Second
+	doneA1 := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		doneA1 <- postChat(t, `{"model": "immd-model", "messages": [{"role": "user", "content": "busy"}]}`)
+	}()
+	waitFor(t, 5*time.Second, func() bool { return mA.chatCount() >= 1 })
+
+	// R: disk hit on A while A is busy and B is up and idle -> sent to B at
+	// arrival.
+	mA.tokens = tokensP
+	bm.Mu.Lock()
+	bm.BackendState[beB] = true
+	bm.Mu.Unlock()
+	doneR := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		doneR <- postChat(t, `{"model": "immd-model", "messages": [{"role": "user", "content": "hit"}]}`)
+	}()
+
+	// R must start on B quickly — long before QUEUE_MIGRATION_AFTER (300s).
+	waitFor(t, 2*time.Second, func() bool { return mB.chatCount() >= 1 })
+
+	wR := <-doneR
+	wA1 := <-doneA1
+	if wR.Code != http.StatusOK || wA1.Code != http.StatusOK {
+		t.Fatalf("statuses: R=%d A1=%d, want 200/200", wR.Code, wA1.Code)
+	}
+	if got := mA.chatCount(); got != 2 {
+		t.Errorf("A chat count = %d, want 2 (warmup + busy request; R should have gone to B)", got)
+	}
+	if got := mB.chatCount(); got != 1 {
+		t.Errorf("B chat count = %d, want 1 (the immediately migrated request)", got)
+	}
+	mB.mu.Lock()
+	restores := len(mB.restores)
+	mB.mu.Unlock()
+	if restores < 1 {
+		t.Error("migrated request did not restore its transferred disk cache on B")
+	}
+	if _, err := os.Stat(filepath.Join(dirB, keyP)); err != nil {
+		t.Errorf("transferred cache file missing on B: %v", err)
+	}
+}
+
+// TestNoImmediateMigrationForPendingOnlyHit verifies the immediate-migration
+// gate: a request whose only hit is a pending (warm-slot) one has no
+// transferable disk cache, so it is NOT sent to a fully idle backend at
+// arrival — migrating it would trade the warm slot's cheap restore for an
+// immediate full recompute. It stays queued on the hit backend and is served
+// there once the slot frees (the doubled stale-queue timer remains the only
+// migration path for it).
+func TestNoImmediateMigrationForPendingOnlyHit(t *testing.T) {
+	withTempMetaDir(t)
+	withMigrationAfter(t, 300) // the doubled timer (600s) never fires in-test
+	tokensR := seq(800)        // shared content: A1's slot becomes R's pending hit
+	mA := newMockLlama(t, "pendimmd-model", 32768, tokensR, 1)
+	mB := newMockLlama(t, "pendimmd-model", 32768, tokensR, 1)
+	beA := backendKeyFromURL(mA.srv.URL)
+	beB := backendKeyFromURL(mB.srv.URL)
+	withTestBackend(t, []map[string]any{
+		{"url": mA.srv.URL, "cache_dir": t.TempDir()},
+		{"url": mB.srv.URL, "cache_dir": t.TempDir()},
+	})
+	bm := proxycache.GetBackendManager()
+	// B is live and idle from the start: the only reason R must not go there
+	// is the pending-only gate.
+	markBackendsUp(bm)
+	injectModels(bm, dm("pendimmd-model", 32768, beA, beB))
+
+	// A1: cold, takes A's only slot (RR picks A first) and holds it for 1.5s;
+	// its slot's KV state becomes the pending hit for R (same content).
+	mA.chatDelay = 1500 * time.Millisecond
+	doneA1 := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		doneA1 <- postChat(t, `{"model": "pendimmd-model", "messages": [{"role": "user", "content": "busy"}]}`)
+	}()
+	// A1's chat call starting means its worker has dispatched and tracked the
+	// slot's KV state — R's pending hit exists from here on.
+	waitFor(t, 5*time.Second, func() bool { return mA.chatCount() >= 1 })
+
+	// R: pending-slot hit on A (no disk cache anywhere) while A is busy.
+	doneR := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		doneR <- postChat(t, `{"model": "pendimmd-model", "messages": [{"role": "user", "content": "same"}]}`)
+	}()
+	// R must queue on A — not be sent to the idle B.
+	waitFor(t, 5*time.Second, func() bool { return proxycache.GetDispatcher().QueueDepth(beA) >= 1 })
+
+	wR := <-doneR
+	wA1 := <-doneA1
+	if wR.Code != http.StatusOK || wA1.Code != http.StatusOK {
+		t.Fatalf("statuses: R=%d A1=%d, want 200/200", wR.Code, wA1.Code)
+	}
+	if got := mA.chatCount(); got != 2 {
+		t.Errorf("A chat count = %d, want 2 (pending-only request must wait for its slot, not migrate)", got)
+	}
+	if got := mB.chatCount(); got != 0 {
+		t.Errorf("B chat count = %d, want 0 (idle backend must not take a pending-only request)", got)
+	}
+}
+
+// TestImmediateMigrationConversationHit verifies that the immediate-migration
+// rule applies to conversation hits too: a request carrying a conversation_id
+// whose conversation cache lives on a slot-busy backend is sent to a fully
+// idle backend at arrival, with the conversation's disk entry transferred, so
+// it restores there instead of waiting out the busy backend's backlog.
+func TestImmediateMigrationConversationHit(t *testing.T) {
+	withTempMetaDir(t)
+	withMigrationAfter(t, 300) // any migration within this test must be immediate
+	reqTokens := seq(800)      // 8 blocks
+	tokensQ := offsetSeq(400, 100000)
+	mA := newMockLlama(t, "convimmd-model", 32768, reqTokens, 1)
+	mB := newMockLlama(t, "convimmd-model", 32768, reqTokens, 1)
+	beA := backendKeyFromURL(mA.srv.URL)
+	beB := backendKeyFromURL(mB.srv.URL)
+	dirA, dirB := t.TempDir(), t.TempDir()
+	withTestBackend(t, []map[string]any{
+		{"url": mA.srv.URL, "cache_dir": dirA},
+		{"url": mB.srv.URL, "cache_dir": dirB},
+	})
+	bm := proxycache.GetBackendManager()
+	markBackendsUp(bm)
+	injectModels(bm, dm("convimmd-model", 32768, beA, beB))
+
+	// Keep B down while A1 takes the slot (deterministic routing to A).
+	bm.Mu.Lock()
+	bm.BackendState[beB] = false
+	bm.Mu.Unlock()
+
+	// A holds conversation conv-123's previous turn: 4 of 8 blocks match
+	// (ratio 0.5).
+	candTokens := append(append([]int{}, seq(400)...), offsetSeq(400, 10000)...)
+	candBlocks := proxycache.BlockHashesFromTokens(candTokens, proxycache.WordsPerBlock)
+	keyC := proxycache.MetaKey("convimmd-model", candTokens)
+	proxycache.GetKVMeta().WriteMeta(keyC, 800, candBlocks, proxycache.WordsPerBlock, "convimmd-model", beA, "conv-123", 2048)
+	if err := os.WriteFile(filepath.Join(dirA, keyC), []byte("conv-cache-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A1: holds A's only slot for 2s (no cache match).
+	mA.tokens = tokensQ
+	mA.chatDelay = 2 * time.Second
+	doneA1 := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		doneA1 <- postChat(t, `{"model": "convimmd-model", "messages": [{"role": "user", "content": "busy"}]}`)
+	}()
+	waitFor(t, 5*time.Second, func() bool { return mA.chatCount() >= 1 })
+
+	// R: conversation conv-123 while A is busy and B is up and idle ->
+	// conversation hit on A, immediately migrated to B with the entry.
+	mA.tokens = reqTokens
+	bm.Mu.Lock()
+	bm.BackendState[beB] = true
+	bm.Mu.Unlock()
+	doneR := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		doneR <- postChat(t, `{"model": "convimmd-model", "messages": [{"role": "user", "content": "hello"}], "conversation_id": "conv-123"}`)
+	}()
+
+	// R must start on B quickly — long before QUEUE_MIGRATION_AFTER (300s).
+	waitFor(t, 2*time.Second, func() bool { return mB.chatCount() >= 1 })
+
+	wR := <-doneR
+	wA1 := <-doneA1
+	if wR.Code != http.StatusOK || wA1.Code != http.StatusOK {
+		t.Fatalf("statuses: R=%d A1=%d, want 200/200", wR.Code, wA1.Code)
+	}
+	if got := mA.chatCount(); got != 1 {
+		t.Errorf("A chat count = %d, want 1 (busy request only; R should have gone to B)", got)
+	}
+	if got := mB.chatCount(); got != 1 {
+		t.Errorf("B chat count = %d, want 1 (the migrated conversation request)", got)
+	}
+	mB.mu.Lock()
+	restores := len(mB.restores)
+	mB.mu.Unlock()
+	if restores < 1 {
+		t.Error("migrated request did not restore the transferred conversation entry on B")
+	}
+	// The post-response save establishes the conversation on B (tagged) — and
+	// supersedes the previous entry on both backends, so the new key must
+	// exist on B.
+	keyNew := proxycache.MetaKey("convimmd-model", reqTokens)
+	if meta := proxycache.GetKVMeta().ReadMeta(keyNew, beB); meta == nil {
+		t.Error("new conversation save missing on B")
+	} else if meta["conversation_id"] != "conv-123" {
+		t.Errorf("new save conversation_id = %v, want conv-123", meta["conversation_id"])
 	}
 }
 

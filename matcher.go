@@ -26,6 +26,13 @@
 // otherwise it is distributed round-robin across the other matching backends
 // (starting after the hit backend), which triggers an async P2P cache transfer
 // to the chosen backend.
+//
+// Immediate idle migration: when the chosen hit/conversation backend is
+// slot-busy (in-flight work, no free slot) and a fully idle live
+// cache-enabled backend serves the model, a request with a transferable disk
+// cache is sent to that idle backend at arrival instead of queueing on the hit
+// backend — its disk cache is P2P-transferred over, so it restores there
+// rather than waiting QueueMigrationAfter for the stale-queue monitor.
 
 package proxycache
 
@@ -395,7 +402,10 @@ func (d *RequestDispatcher) drainOverflow() {
 // QueueMigrationAfter to a fully idle backend (empty queue, no in-flight work)
 // that serves the same model, so they start immediately instead of waiting out
 // the source's backlog. Runs on the dispatcher goroutine after every overflow
-// drain and on each tick. Guard rails:
+// drain and on each tick. Requests with a transferable disk cache are normally
+// migrated at arrival instead (immediateMigrationTarget); this monitor covers
+// the rest — idle capacity that appeared only after arrival, and requests
+// without a disk hit. Guard rails:
 //   - only requests older than QueueMigrationAfter are eligible; a request
 //     whose hit is not a transferable disk key (pending-slot-only, or no cache
 //     at all) needs twice that age — for it, migrating trades a cheap future
@@ -511,6 +521,59 @@ func (d *RequestDispatcher) migrateStale() {
 	if moved > 0 {
 		logInfo("matcher", "Queue migration: moved %d stale request(s) to idle backends", moved)
 	}
+}
+
+// immediateMigrationTarget returns a fully idle live cache-enabled backend
+// that serves the selected model, when the selected backend is slot-busy
+// (in-flight work, no free slot for the model) and would therefore make the
+// request wait in its queue. It is the selection-time counterpart of
+// migrateStale's idle scan: instead of queueing on the hit backend and waiting
+// QueueMigrationAfter for the monitor to move the request, the request is
+// routed to the idle backend at arrival and its disk cache is P2P-transferred
+// there. Returns "" when the selected backend can dispatch the request right
+// away or no eligible idle backend exists. Runs on the dispatcher goroutine.
+func (d *RequestDispatcher) immediateMigrationTarget(dec *RouteDecision) string {
+	sel := dec.selected.BackendID
+	model := dec.selected.ModelName
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	busy := false
+	if w := d.workers[sel]; w != nil && len(w.inFlight) > 0 {
+		// The pump dispatches a queued request only when it can acquire a
+		// slot: GetPool lists ALL of the model's slot IDs (free ones tracked
+		// separately in inUse), so the pool "existing" is not the same as a
+		// slot being available. Busy = pool exists but every slot is held.
+		beSm := slotManager.Get(sel)
+		busy = beSm.GetPool(model) != nil && !beSm.HasFreeSlot(model)
+	}
+	if !busy {
+		return ""
+	}
+	// Idle targets come from the backend registry, not d.workers — a backend
+	// that has never been enqueued to has no worker entry yet.
+	bm := backendManager
+	bm.Mu.RLock()
+	beIDs := make([]string, len(bm.KeyOrder))
+	copy(beIDs, bm.KeyOrder)
+	states := make(map[string]bool, len(bm.BackendState))
+	for k, v := range bm.BackendState {
+		states[k] = v
+	}
+	bm.Mu.RUnlock()
+	for _, beID := range beIDs {
+		if beID == sel || !states[beID] {
+			continue
+		}
+		if w := d.workers[beID]; w != nil && (len(w.queue) > 0 || len(w.inFlight) > 0) {
+			continue
+		}
+		// The transferred disk cache must be able to land on the target.
+		if !bm.CacheEnabled(beID) || !bm.ServesModel(model, beID) {
+			continue
+		}
+		return beID
+	}
+	return ""
 }
 
 // rescanMigratedTarget re-checks the migration target's disk cache for a
@@ -950,6 +1013,42 @@ func (d *RequestDispatcher) match(req *ProcRequest) (*RouteDecision, bool) {
 	d.mu.Unlock()
 	decision.selected = cands[idx]
 	decision.selectionReason = reason
+	// Immediate idle migration: a request routed to the backend that holds
+	// its cache (or conversation) would sit in that backend's queue while
+	// in-flight work drains. If the selected backend is slot-busy right now
+	// and a fully idle live cache-enabled backend serves the model, send the
+	// request there instead — the P2P trigger below ships the disk cache
+	// over and the target worker restores after its bounded transfer wait —
+	// rather than letting it wait QueueMigrationAfter for migrateStale. Only
+	// requests with a transferable disk cache qualify: pending-slot-only or
+	// cold requests would trade a cheap future restore for an immediate full
+	// recompute on the target, so they keep the timer.
+	if (reason == "cache_hit" || reason == "conversation_hit") && decision.diskRestoreKey != "" {
+		if target := d.immediateMigrationTarget(decision); target != "" {
+			newIdx := -1
+			for i, c := range cands {
+				if c.BackendID != target {
+					continue
+				}
+				if c.ModelName == decision.selected.ModelName {
+					newIdx = i
+					break
+				}
+				if newIdx == -1 {
+					newIdx = i
+				}
+			}
+			if newIdx != -1 {
+				src := cands[idx].BackendID
+				idx = newIdx
+				decision.selected = cands[idx]
+				decision.selectionReason = reason + "_idle_migration"
+				req.migratedFrom = src
+				logInfo("matcher", "Immediate migration: request %s sent to idle backend '%s' instead of slot-busy hit backend '%s' (key=%s)",
+					req.requestID, cands[idx].BackendID, src, key16(decision.diskRestoreKey))
+			}
+		}
+	}
 	if reason == "conversation_hit" {
 		if ce := decision.convEntries[cands[idx].BackendID]; ce != nil {
 			decision.bestRatio = ce.Ratio

@@ -177,6 +177,20 @@ func (b *BackendSlotManager) TryAcquire(modelName string) int {
 	return slotID
 }
 
+// HasFreeSlot reports whether the model's pool has at least one slot that is
+// not in use. A model with no pool returns false (nothing can be acquired
+// until discovery creates the pool).
+func (b *BackendSlotManager) HasFreeSlot(modelName string) bool {
+	b.PoolMu.Lock()
+	defer b.PoolMu.Unlock()
+	for _, s := range b.slotPools[modelName] {
+		if !b.inUse[s] {
+			return true
+		}
+	}
+	return false
+}
+
 // Release marks a slot free and updates the slot-occupancy duration EMA.
 // Returns (duration, ok).
 func (b *BackendSlotManager) Release(slotID int) (float64, bool) {
